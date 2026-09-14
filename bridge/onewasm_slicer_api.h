@@ -141,6 +141,55 @@ onewasm_status_t onewasm_get_last_statistics(
     uint32_t* out_len
 );
 
+/* Draft 0.3 project surface. */
+onewasm_status_t onewasm_project_set_objects(
+    onewasm_session_t session,
+    const uint8_t* object_blob,
+    uint32_t object_blob_len,
+    const uint8_t* manifest_json,
+    uint32_t manifest_len
+);
+
+onewasm_status_t onewasm_project_get_manifest(
+    onewasm_session_t session,
+    uint8_t** out_json,
+    uint32_t* out_len
+);
+
+onewasm_status_t onewasm_project_prepare(
+    onewasm_session_t session,
+    const uint8_t* request_json,
+    uint32_t request_len,
+    uint8_t** out_manifest_json,
+    uint32_t* out_len
+);
+
+onewasm_status_t onewasm_project_slice(
+    onewasm_session_t session,
+    const uint8_t* request_json,
+    uint32_t request_len,
+    uint8_t** out_result_json,
+    uint32_t* out_len
+);
+
+onewasm_status_t onewasm_project_get_asset(
+    onewasm_session_t session,
+    const char* asset_id_utf8,
+    uint32_t asset_id_len,
+    uint8_t** out_data,
+    uint32_t* out_len
+);
+
+onewasm_status_t onewasm_project_export(
+    onewasm_session_t session,
+    const char* format_utf8,
+    uint32_t format_len,
+    const uint8_t* options_json,
+    uint32_t options_len,
+    uint8_t** out_result_json,
+    uint32_t* out_len
+);
+
 const char* onewasm_last_error(onewasm_session_t session);
 void onewasm_free(void* ptr);
 

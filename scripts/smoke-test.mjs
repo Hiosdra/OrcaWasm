@@ -31,7 +31,8 @@ import { readFileSync } from 'node:fs'
 import {
   sphereStl, loadModule, writeBytes, decodeError,
   initSession, sliceOnce, sliceMultiOnce, preparePlateOnce, encodeObjectTransforms,
-  checkedMalloc, free,
+  projectSetObjectsOnce, projectGetManifestOnce, projectPrepareOnce,
+  projectSliceOnce, projectGetAssetOnce, projectExportOnce, checkedMalloc, free,
 } from './lib/engine-harness.mjs'
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
@@ -167,6 +168,158 @@ function read3mfOnce(module, mfBytes) {
 // Binary STL: 80-byte header + uint32 triangle count + N * 50 bytes.
 function stlTriangleCount(bytes) {
   return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(80, true)
+}
+
+function stlBounds(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const triangles = view.getUint32(80, true)
+  const bounds = {
+    min: [Infinity, Infinity, Infinity],
+    max: [-Infinity, -Infinity, -Infinity],
+  }
+  for (let triangle = 0; triangle < triangles; triangle++) {
+    const triangleOffset = 84 + triangle * 50
+    for (let vertex = 0; vertex < 3; vertex++) {
+      const vertexOffset = triangleOffset + 12 + vertex * 12
+      for (let axis = 0; axis < 3; axis++) {
+        const value = view.getFloat32(vertexOffset + axis * 4, true)
+        bounds.min[axis] = Math.min(bounds.min[axis], value)
+        bounds.max[axis] = Math.max(bounds.max[axis], value)
+      }
+    }
+  }
+  return bounds
+}
+
+// Small stored ZIP writer used only for a deterministic parser regression. It
+// keeps the smoke test dependency-free (the CI job intentionally does not run
+// npm install) while exercising the real 3MF component graph in both engines.
+function crc32(bytes) {
+  let crc = 0xffffffff
+  for (const byte of bytes) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc & 1) ? ((crc >>> 1) ^ 0xedb88320) >>> 0 : crc >>> 1
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function makeStoredZip(entries) {
+  const encoder = new TextEncoder()
+  const records = entries.map(({ name, data }) => ({
+    name: encoder.encode(name),
+    data: typeof data === 'string' ? encoder.encode(data) : new Uint8Array(data),
+  }))
+  const localSize = records.reduce((sum, record) => sum + 30 + record.name.length + record.data.length, 0)
+  const centralSize = records.reduce((sum, record) => sum + 46 + record.name.length, 0)
+  const centralOffset = localSize
+  const bytes = new Uint8Array(localSize + centralSize + 22)
+  const view = new DataView(bytes.buffer)
+  let position = 0
+  const localOffsets = []
+  for (const record of records) {
+    localOffsets.push(position)
+    view.setUint32(position, 0x04034b50, true)
+    view.setUint16(position + 4, 20, true)
+    view.setUint16(position + 6, 0x800, true) // UTF-8 names
+    view.setUint16(position + 8, 0, true) // stored, not deflated
+    view.setUint32(position + 10, 0, true)
+    view.setUint32(position + 14, crc32(record.data), true)
+    view.setUint32(position + 18, record.data.length, true)
+    view.setUint32(position + 22, record.data.length, true)
+    view.setUint16(position + 26, record.name.length, true)
+    view.setUint16(position + 28, 0, true)
+    bytes.set(record.name, position + 30)
+    bytes.set(record.data, position + 30 + record.name.length)
+    position += 30 + record.name.length + record.data.length
+  }
+  const centralStart = position
+  records.forEach((record, index) => {
+    view.setUint32(position, 0x02014b50, true)
+    view.setUint16(position + 4, 20, true)
+    view.setUint16(position + 6, 20, true)
+    view.setUint16(position + 8, 0x800, true)
+    view.setUint16(position + 10, 0, true)
+    view.setUint32(position + 12, 0, true)
+    view.setUint32(position + 16, crc32(record.data), true)
+    view.setUint32(position + 20, record.data.length, true)
+    view.setUint32(position + 24, record.data.length, true)
+    view.setUint16(position + 28, record.name.length, true)
+    view.setUint16(position + 30, 0, true)
+    view.setUint16(position + 32, 0, true)
+    view.setUint16(position + 34, 0, true)
+    view.setUint16(position + 36, 0, true)
+    view.setUint32(position + 38, 0, true)
+    view.setUint32(position + 42, localOffsets[index], true)
+    bytes.set(record.name, position + 46)
+    position += 46 + record.name.length
+  })
+  if (position !== centralStart + centralSize) throw new Error('component ZIP central directory size mismatch')
+  view.setUint32(position, 0x06054b50, true)
+  view.setUint16(position + 4, 0, true)
+  view.setUint16(position + 6, 0, true)
+  view.setUint16(position + 8, records.length, true)
+  view.setUint16(position + 10, records.length, true)
+  view.setUint32(position + 12, centralSize, true)
+  view.setUint32(position + 16, centralOffset, true)
+  view.setUint16(position + 20, 0, true)
+  return bytes
+}
+
+function makeComponent3mf() {
+  const model = `<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <resources>
+    <object id="1" type="model">
+      <mesh>
+        <vertices>
+          <vertex x="0" y="0" z="0"/>
+          <vertex x="1" y="0" z="0"/>
+          <vertex x="0" y="1" z="0"/>
+        </vertices>
+        <triangles><triangle v1="0" v2="1" v3="2"/></triangles>
+      </mesh>
+    </object>
+    <object id="2" type="model">
+      <components>
+        <component objectid="1" transform="1 0 0 5 0 1 0 0 0 0 1 0"/>
+      </components>
+    </object>
+  </resources>
+  <build><item objectid="2" transform="1 0 0 10 0 1 0 0 0 0 1 0"/></build>
+</model>`
+  return makeStoredZip([
+    {
+      name: '[Content_Types].xml',
+      data: `<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/3D/3dmodel.model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+</Types>`,
+    },
+    {
+      name: '_rels/.rels',
+      data: `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" Target="3D/3dmodel.model"/>
+</Relationships>`,
+    },
+    { name: '3D/3dmodel.model', data: model },
+  ])
+}
+
+function assertComponent3mfRead(module) {
+  const label = 'component 3MF read (nested transform graph)'
+  const stl = read3mfOnce(module, makeComponent3mf())
+  if (stlTriangleCount(stl) !== 1) {
+    throw new Error(`${label}: expected one flattened triangle, got ${stlTriangleCount(stl)}`)
+  }
+  const bounds = stlBounds(stl)
+  if (Math.abs(bounds.min[0] - 15) > 0.01 || Math.abs(bounds.max[0] - 16) > 0.01
+    || Math.abs(bounds.min[1]) > 0.01 || Math.abs(bounds.max[1] - 1) > 0.01) {
+    throw new Error(`${label}: composed component/build transform was not applied: ${JSON.stringify(bounds)}`)
+  }
 }
 
 // Minimal ZIP central-directory reader — deliberately hand-rolled rather than
@@ -486,6 +639,128 @@ function collectMeshes(fixture) {
   return [{ label: 'synthetic icosphere (~5120 tris)', bytes: generateTortureStl() }]
 }
 
+function projectMatrix(tx, ty, tz = 0, shearXByY = 0) {
+  // one-wasm-slicer-api 0.3 uses row-major matrices with column vectors.
+  return [
+    1, shearXByY, 0, tx,
+    0, 1, 0, ty,
+    0, 0, 1, tz,
+    0, 0, 0, 1,
+  ]
+}
+
+function makeProjectFixture(meshBytes) {
+  return {
+    blob: new Uint8Array(meshBytes),
+    manifest: {
+      schemaVersion: '0.3',
+      plates: [
+        { id: 'plate-0', label: 'Plate 0', index: 0 },
+        { id: 'plate-1', label: 'Plate 1', index: 1 },
+      ],
+      meshes: [{
+        id: 'mesh-0',
+        format: 'stl',
+        dataRange: { offset: 0, length: meshBytes.length },
+      }],
+      objects: [{ id: 'object-0', meshId: 'mesh-0', extruderId: 0 }],
+      instances: [
+        { id: 'instance-0', objectId: 'object-0', plateId: 'plate-0', transform: { matrix: projectMatrix(128, 128) } },
+        { id: 'instance-1', objectId: 'object-0', plateId: 'plate-1', transform: { matrix: projectMatrix(128, 128) } },
+      ],
+    },
+  }
+}
+
+function assertProjectManifest(manifest, label) {
+  if (manifest?.schemaVersion !== '0.3') throw new Error(`${label}: invalid project manifest schema version`)
+  if (!Array.isArray(manifest.plates) || manifest.plates.length !== 2) throw new Error(`${label}: expected two plates`)
+  if (!Array.isArray(manifest.instances) || manifest.instances.length !== 2) throw new Error(`${label}: expected two instances`)
+  for (const instance of manifest.instances) {
+    const matrix = instance.transform?.matrix
+    if (!Array.isArray(matrix) || matrix.length !== 16 || !matrix.every(Number.isFinite)) {
+      throw new Error(`${label}: instance has an invalid affine matrix`)
+    }
+  }
+}
+
+function assertProjectSlice(module, session, result, expectedPlateIds, label) {
+  if (result?.schemaVersion !== '0.3') throw new Error(`${label}: invalid project result schema version`)
+  if (!Array.isArray(result.plateResults) || result.plateResults.length !== expectedPlateIds.length) {
+    throw new Error(`${label}: unexpected plate result count`)
+  }
+  for (let index = 0; index < expectedPlateIds.length; index++) {
+    const plateResult = result.plateResults[index]
+    if (plateResult.plateId !== expectedPlateIds[index]) throw new Error(`${label}: plate result order/id mismatch`)
+    if (!Array.isArray(plateResult.assets) || plateResult.assets.length !== 1) {
+      throw new Error(`${label}: expected one G-code asset for ${plateResult.plateId}`)
+    }
+    const asset = plateResult.assets[0]
+    if (asset.kind !== 'gcode' || asset.id !== `gcode:${plateResult.plateId}`) {
+      throw new Error(`${label}: invalid G-code asset descriptor`)
+    }
+    const bytes = projectGetAssetOnce(module, session, asset.id)
+    if (bytes.length !== asset.byteLength) throw new Error(`${label}: asset byte length mismatch`)
+    assertSaneGcode(new TextDecoder().decode(bytes), `${label} ${plateResult.plateId}`)
+    if (plateResult.statistics?.schemaVersion !== '0.3') {
+      throw new Error(`${label}: statistics are not attached to ${plateResult.plateId}`)
+    }
+  }
+}
+
+function runProjectSmoke(module, session, meshBytes) {
+  const project = makeProjectFixture(meshBytes)
+  projectSetObjectsOnce(module, session, project.blob, project.manifest)
+  assertProjectManifest(projectGetManifestOnce(module, session), 'project_set_objects/get_manifest')
+
+  const prepared = projectPrepareOnce(module, session, {
+    schemaVersion: '0.3',
+    operation: 'arrange',
+  })
+  assertProjectManifest(prepared, 'project_prepare')
+
+  // Arrange intentionally consumes the legacy decomposable transform shape.
+  // Re-upload a valid full-affine manifest for slicing so this test also pins
+  // the 0.3 direct-matrix path (including a shear) independently of arrange.
+  const slicedManifest = JSON.parse(JSON.stringify(project.manifest))
+  slicedManifest.instances[1].transform.matrix = projectMatrix(128, 128, 0, 0.1)
+  projectSetObjectsOnce(module, session, project.blob, slicedManifest)
+
+  const allResult = projectSliceOnce(module, session, {
+    schemaVersion: '0.3',
+    plateSelection: 'all',
+    includeGcode: true,
+    includeStatistics: true,
+  })
+  assertProjectSlice(module, session, allResult, ['plate-0', 'plate-1'], 'project_slice all')
+
+  const selectedResult = projectSliceOnce(module, session, {
+    schemaVersion: '0.3',
+    plateSelection: 'selected',
+    plateIds: ['plate-1'],
+    includeGcode: true,
+    includeStatistics: true,
+  })
+  assertProjectSlice(module, session, selectedResult, ['plate-1'], 'project_slice selected')
+
+  const exportResult = projectExportOnce(module, session, 'project.3mf', {
+    schemaVersion: '0.3',
+    preservation: 'best-effort',
+    includeSliceArtifacts: false,
+  })
+  if (exportResult?.schemaVersion !== '0.3'
+    || exportResult.asset?.id !== 'project:export'
+    || exportResult.asset.kind !== 'project'
+    || exportResult.asset.mimeType !== 'model/3mf') {
+    throw new Error('project_export returned an unexpected result descriptor')
+  }
+  const exported = projectGetAssetOnce(module, session, 'project:export')
+  if (exported.length !== exportResult.asset.byteLength) {
+    throw new Error('project_export asset byte length mismatch')
+  }
+  assertValid3mf(exported, 'project_export')
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -504,6 +779,18 @@ async function main() {
   const supportsPlateActions = typeof module._onewasm_prepare_plate === 'function'
   if (!supportsPlateActions) {
     console.warn('[smoke-test] WARN: loaded engine has no _onewasm_prepare_plate export — skipping current-plate action scenarios')
+  }
+  const projectExports = [
+    '_onewasm_project_set_objects',
+    '_onewasm_project_get_manifest',
+    '_onewasm_project_prepare',
+    '_onewasm_project_slice',
+    '_onewasm_project_get_asset',
+    '_onewasm_project_export',
+  ]
+  const supportsProjectApi = projectExports.every((name) => typeof module[name] === 'function')
+  if (!supportsProjectApi) {
+    console.warn('[smoke-test] WARN: loaded engine has no complete draft 0.3 project surface — skipping project scenarios')
   }
 
   const session = module._onewasm_session_create()
@@ -537,6 +824,17 @@ async function main() {
   ]
 
   let failures = 0
+  const componentLabel = '[3MF] component graph with composed transforms'
+  process.stdout.write(`[smoke-test] ${componentLabel} ... `)
+  try {
+    assertComponent3mfRead(module)
+    console.log('PASS (one flattened triangle at x=15..16)')
+  } catch (err) {
+    failures++
+    console.log('FAIL')
+    console.error(`  ${err.message}`)
+  }
+
   for (const mesh of meshes) {
     for (const scenario of scenarios) {
       const label = `[${mesh.label}] ${scenario.name}`
@@ -761,6 +1059,23 @@ async function main() {
       assertSaneGcode(gcode, arrangeLabel)
       assertRestsOnBed(gcode, arrangeLabel, BASE_CONFIG.initial_layer_print_height)
       console.log(`PASS (${transforms.length} transforms)`)
+    } catch (err) {
+      failures++
+      console.log('FAIL')
+      console.error(`  ${err.message}`)
+    }
+  }
+
+  if (supportsProjectApi) {
+    const projectLabel = '[draft 0.3] project manifest, prepare, all/selected plate slicing'
+    process.stdout.write(`[smoke-test] ${projectLabel} ... `)
+    try {
+      initSession(module, session, JSON.stringify(BASE_CONFIG))
+      // Keep this optional draft probe cheap: the regular smoke cases already
+      // exercise the larger torture mesh. The project path itself still uses
+      // two real native slices, one per logical plate.
+      runProjectSmoke(module, session, sphereStl(1, 5))
+      console.log('PASS')
     } catch (err) {
       failures++
       console.log('FAIL')

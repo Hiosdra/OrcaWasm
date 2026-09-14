@@ -314,3 +314,105 @@ export function preparePlateOnce(module, session, stlBytesArr, operation, transf
     } finally { free(module, offsetsPtr) }
   } finally { free(module, dataPtr) }
 }
+
+export function projectSetObjectsOnce(module, session, objectBlob, manifest) {
+  const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest))
+  const blobPtr = writeBytes(module, objectBlob)
+  const manifestPtr = writeBytes(module, manifestBytes)
+  try {
+    const rc = module._onewasm_project_set_objects(
+      session, blobPtr, objectBlob.length, manifestPtr, manifestBytes.length,
+    )
+    if (rc !== 0) throw new Error(`onewasm_project_set_objects failed (${rc}): ${decodeError(module, session)}`)
+  } finally {
+    free(module, manifestPtr)
+    free(module, blobPtr)
+  }
+}
+
+function readOwnedOutput(module, session, functionName, ...args) {
+  const outPtrPtr = checkedMalloc(module, 4, `${functionName} output pointer`)
+  try {
+    const outLenPtr = checkedMalloc(module, 4, `${functionName} output length`)
+    try {
+      const rc = module[functionName](session, ...args, outPtrPtr, outLenPtr)
+      if (rc !== 0) throw new Error(`${functionName} failed (${rc}): ${decodeError(module, session)}`)
+      const dataPtr = module.getValue(outPtrPtr, 'i32')
+      const dataLen = module.getValue(outLenPtr, 'i32')
+      try {
+        return module.HEAPU8.slice(dataPtr, dataPtr + dataLen)
+      } finally {
+        module._onewasm_free(dataPtr)
+      }
+    } finally {
+      module._free(outLenPtr)
+    }
+  } finally {
+    module._free(outPtrPtr)
+  }
+}
+
+export function projectGetManifestOnce(module, session) {
+  const bytes = readOwnedOutput(module, session, '_onewasm_project_get_manifest')
+  return JSON.parse(new TextDecoder().decode(bytes))
+}
+
+export function projectPrepareOnce(module, session, request) {
+  const requestBytes = new TextEncoder().encode(JSON.stringify(request))
+  const requestPtr = writeBytes(module, requestBytes)
+  try {
+    const bytes = readOwnedOutput(
+      module, session, '_onewasm_project_prepare', requestPtr, requestBytes.length,
+    )
+    return JSON.parse(new TextDecoder().decode(bytes))
+  } finally {
+    free(module, requestPtr)
+  }
+}
+
+export function projectSliceOnce(module, session, request) {
+  const requestBytes = new TextEncoder().encode(JSON.stringify(request))
+  const requestPtr = writeBytes(module, requestBytes)
+  try {
+    const bytes = readOwnedOutput(
+      module, session, '_onewasm_project_slice', requestPtr, requestBytes.length,
+    )
+    return JSON.parse(new TextDecoder().decode(bytes))
+  } finally {
+    free(module, requestPtr)
+  }
+}
+
+export function projectGetAssetOnce(module, session, assetId) {
+  const assetBytes = new TextEncoder().encode(assetId)
+  const assetPtr = writeBytes(module, assetBytes)
+  try {
+    return readOwnedOutput(
+      module, session, '_onewasm_project_get_asset', assetPtr, assetBytes.length,
+    )
+  } finally {
+    free(module, assetPtr)
+  }
+}
+
+export function projectExportOnce(module, session, format, options) {
+  const formatBytes = new TextEncoder().encode(format)
+  const optionsBytes = new TextEncoder().encode(JSON.stringify(options))
+  const formatPtr = writeBytes(module, formatBytes)
+  const optionsPtr = writeBytes(module, optionsBytes)
+  try {
+    const bytes = readOwnedOutput(
+      module,
+      session,
+      '_onewasm_project_export',
+      formatPtr,
+      formatBytes.length,
+      optionsPtr,
+      optionsBytes.length,
+    )
+    return JSON.parse(new TextDecoder().decode(bytes))
+  } finally {
+    free(module, optionsPtr)
+    free(module, formatPtr)
+  }
+}

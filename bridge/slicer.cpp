@@ -44,11 +44,15 @@
 #include "onewasm_slicer_api.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <stdexcept>
 #include <memory>
@@ -56,7 +60,9 @@
 #include <mutex>
 #include <new>
 #include <limits>
+#include <set>
 #include <utility>
+#include <vector>
 #include <sys/stat.h>
 
 #include <emscripten.h>
@@ -78,6 +84,7 @@
 #include "libslic3r/Format/OBJ.hpp"
 #include "libslic3r/Format/STEP.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/miniz_extension.hpp"
 #include "libslic3r/GCode.hpp"
 #include "libslic3r/GCode/WipeTower.hpp"
 #include "libslic3r/Exception.hpp"
@@ -110,6 +117,7 @@ static struct DisableBoostLogOnInit {
 // Read-only template of OrcaSlicer's built-in defaults — constructed once,
 // never mutated afterwards, so it's safe to share across every session.
 static Slic3r::FullPrintConfig g_defaults;
+static std::atomic<std::uint64_t> g_next_session_id{1};
 
 // Per-session engine state, behind an opaque handle instead of process-wide
 // statics. Today the JS side still creates exactly one session per worker
@@ -118,6 +126,7 @@ static Slic3r::FullPrintConfig g_defaults;
 // caller (a Node CLI batch-processing many jobs, or a worker pool) to hold
 // more than one independent slicer session in the same WASM instance.
 struct OrcSession {
+    const std::uint64_t id = g_next_session_id.fetch_add(1, std::memory_order_relaxed);
     Slic3r::DynamicPrintConfig config;
     bool initialized = false;
     std::string last_error;
@@ -156,7 +165,78 @@ struct OrcSession {
     std::shared_ptr<struct ActiveSlice> active_slice;
     std::string last_statistics_json;
     bool has_last_statistics = false;
+    // Draft 0.3 project state. The host-provided mesh blob is copied into the
+    // session; the manifest is neutral and never escapes as Orca types.
+    nlohmann::json project_manifest;
+    std::vector<std::uint8_t> project_object_blob;
+    std::map<std::string, std::string> project_assets;
+    // The original native project is retained for a lossless clean export.
+    // Once the neutral manifest is mutated, preservation=require must fail
+    // instead of quietly dropping Orca-specific ZIP entries.
+    std::vector<std::uint8_t> native_project_blob;
+    bool native_project_dirty = false;
+    int progress_base = 0;
+    int progress_span = 100;
+    // A project slice may call the legacy single-plate entry point several
+    // times. Keep cancellation intent across the small gaps between those
+    // calls; the active native operation is still cancelled through
+    // ActiveSlice when one exists.
+    std::atomic<bool> project_cancel_requested{false};
 };
+
+struct ProjectMeshInput {
+    std::string id;
+    bool has_data_range = false;
+    std::uint32_t offset = 0;
+    std::uint32_t length = 0;
+};
+
+struct ProjectObjectInput {
+    std::string id;
+    std::string mesh_id;
+    std::string label;
+    int extruder_id = 0;
+};
+
+struct ProjectInstanceInput {
+    std::string id;
+    std::string object_id;
+    std::string plate_id;
+    std::array<double, 16> matrix{};
+};
+
+struct ProjectManifestInput {
+    std::vector<std::string> plate_ids;
+    std::vector<ProjectMeshInput> meshes;
+    std::vector<ProjectObjectInput> objects;
+    std::vector<ProjectInstanceInput> instances;
+};
+
+static nlohmann::json empty_project_manifest() {
+    return nlohmann::json{
+        {"schemaVersion", "0.3"},
+        {"plates", nlohmann::json::array()},
+        {"meshes", nlohmann::json::array()},
+        {"objects", nlohmann::json::array()},
+        {"instances", nlohmann::json::array()},
+    };
+}
+
+static void clear_project_outputs(OrcSession& session) {
+    std::lock_guard<std::mutex> lock(session.control_mutex);
+    session.project_assets.clear();
+    session.last_statistics_json.clear();
+    session.has_last_statistics = false;
+}
+
+static void reset_project(OrcSession& session) {
+    session.project_manifest = empty_project_manifest();
+    session.project_object_blob.clear();
+    session.native_project_blob.clear();
+    session.native_project_dirty = false;
+    session.project_cancel_requested.store(false, std::memory_order_release);
+    clear_project_outputs(session);
+}
 
 // The native PrintBase cancellation flag is atomic, but the pointer to the
 // active Print is not. Keep both behind one small operation object so a cancel
@@ -233,6 +313,23 @@ struct ActivePrintGuard {
     ~ActivePrintGuard() { operation.detach(); }
 };
 
+struct ProgressWindow {
+    ProgressWindow(OrcSession& session, int base, int span)
+        : session(session), old_base(session.progress_base), old_span(session.progress_span) {
+        session.progress_base = base;
+        session.progress_span = span;
+    }
+
+    ~ProgressWindow() {
+        session.progress_base = old_base;
+        session.progress_span = old_span;
+    }
+
+    OrcSession& session;
+    int old_base;
+    int old_span;
+};
+
 // Slicing blocks the worker's event loop. MAIN_THREAD_EM_ASM delivers this
 // from both the single-threaded engine and a pthread back to that worker,
 // where postMessage reaches the host's main thread immediately.
@@ -277,11 +374,26 @@ static void attach_progress_callback(Slic3r::Print& print, OrcSession& session) 
             }
         }
         if (should_emit) {
+            const int mapped_percent = session.progress_base + static_cast<int>(std::lround(
+                static_cast<double>(percent) * static_cast<double>(session.progress_span) / 100.0
+            ));
             if (session.progress_callback)
-                session.progress_callback(percent, status.text.c_str(), session.progress_user_data);
-            post_slice_progress(percent, status.text);
+                session.progress_callback(mapped_percent, status.text.c_str(), session.progress_user_data);
+            post_slice_progress(mapped_percent, status.text);
         }
     });
+}
+
+static void emit_project_progress(OrcSession& session, int local_percent,
+                                  const char* stage) {
+    const int clamped = std::max(0, std::min(local_percent, 100));
+    const int mapped_percent = session.progress_base + static_cast<int>(std::lround(
+        static_cast<double>(clamped) * static_cast<double>(session.progress_span) / 100.0
+    ));
+    const char* safe_stage = stage ? stage : "";
+    if (session.progress_callback)
+        session.progress_callback(mapped_percent, safe_stage, session.progress_user_data);
+    post_slice_progress(mapped_percent, safe_stage);
 }
 
 static OrcSession* as_session(void* ptr) { return static_cast<OrcSession*>(ptr); }
@@ -297,6 +409,304 @@ static void record_error(OrcSession& s, const std::string& str) { s.last_error =
 static std::string g_conversion_last_error;
 static void record_error(const char* msg) { g_conversion_last_error = msg ? msg : "unknown error"; }
 static void record_error(const std::string& str) { g_conversion_last_error = str; }
+
+static bool valid_project_id(const nlohmann::json& value, std::string& result,
+                             const char* field, std::string& error) {
+    if (!value.is_string()) {
+        error = std::string(field) + " must be a string";
+        return false;
+    }
+    result = value.get<std::string>();
+    if (result.empty() || result.size() > 256) {
+        error = std::string(field) + " must contain 1..256 characters";
+        return false;
+    }
+    for (const unsigned char character : result) {
+        if (!(std::isalnum(character) || character == '.' || character == '_'
+              || character == ':' || character == '-')) {
+            error = std::string(field) + " contains an unsupported character";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool reject_unknown_keys(const nlohmann::json& value,
+                                std::initializer_list<const char*> allowed,
+                                const char* field, std::string& error) {
+    if (!value.is_object())
+        return true;
+    for (const auto& [key, ignored] : value.items()) {
+        if (std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
+            error = std::string(field) + " contains unsupported field " + key;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool project_uint32(const nlohmann::json& value, std::uint32_t& result,
+                           const char* field, std::string& error) {
+    if (value.is_number_unsigned()) {
+        const auto number = value.get<std::uint64_t>();
+        if (number <= UINT32_MAX) {
+            result = static_cast<std::uint32_t>(number);
+            return true;
+        }
+    } else if (value.is_number_integer()) {
+        const auto number = value.get<std::int64_t>();
+        if (number >= 0 && number <= UINT32_MAX) {
+            result = static_cast<std::uint32_t>(number);
+            return true;
+        }
+    }
+    error = std::string(field) + " must be a non-negative 32-bit integer";
+    return false;
+}
+
+static bool project_number(const nlohmann::json& value, double& result,
+                           const char* field, std::string& error) {
+    if (!value.is_number()) {
+        error = std::string(field) + " must be a number";
+        return false;
+    }
+    result = value.get<double>();
+    if (!std::isfinite(result)) {
+        error = std::string(field) + " must be finite";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_project_matrix(const nlohmann::json& value,
+                                 std::array<double, 16>& result,
+                                 const char* field, std::string& error) {
+    if (!value.is_array() || value.size() != result.size()) {
+        error = std::string(field) + " must contain exactly 16 numbers";
+        return false;
+    }
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        if (!project_number(value[index], result[index], field, error))
+            return false;
+    }
+    if (std::abs(result[12]) > 1e-9 || std::abs(result[13]) > 1e-9
+        || std::abs(result[14]) > 1e-9 || std::abs(result[15] - 1.) > 1e-9) {
+        error = std::string(field) + " must be an affine matrix with [0,0,0,1] as its last row";
+        return false;
+    }
+    const double determinant =
+        result[0] * (result[5] * result[10] - result[6] * result[9])
+        - result[1] * (result[4] * result[10] - result[6] * result[8])
+        + result[2] * (result[4] * result[9] - result[5] * result[8]);
+    if (std::abs(determinant) < 1e-12) {
+        error = std::string(field) + " must have a non-singular 3D transform";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_project_manifest(const uint8_t* manifest_data,
+                                   std::uint32_t manifest_len,
+                                   std::uint32_t object_blob_len,
+                                   bool require_data_ranges,
+                                   ProjectManifestInput& result,
+                                   nlohmann::json& normalized_manifest,
+                                   std::string& error) {
+    if (!manifest_data || manifest_len == 0) {
+        error = "project manifest is empty";
+        return false;
+    }
+    nlohmann::json root;
+    try {
+        root = nlohmann::json::parse(std::string(
+            reinterpret_cast<const char*>(manifest_data), static_cast<std::size_t>(manifest_len)));
+    } catch (const std::exception& exception) {
+        error = std::string("project manifest is not valid JSON: ") + exception.what();
+        return false;
+    }
+    if (!root.is_object() || !root.contains("schemaVersion")
+        || !root.at("schemaVersion").is_string()
+        || root.at("schemaVersion").get<std::string>() != "0.3") {
+        error = "project manifest schemaVersion must be 0.3";
+        return false;
+    }
+    if (!reject_unknown_keys(root, {"schemaVersion", "plates", "meshes", "objects", "instances"},
+                             "project manifest", error))
+        return false;
+    const char* arrays[] = {"plates", "meshes", "objects", "instances"};
+    for (const char* name : arrays) {
+        if (!root.contains(name) || !root.at(name).is_array()) {
+            error = std::string("project manifest field ") + name + " must be an array";
+            return false;
+        }
+    }
+
+    std::set<std::string> plate_ids;
+    for (const auto& plate : root.at("plates")) {
+        if (!plate.is_object() || !plate.contains("id")) {
+            error = "project plate must be an object with an id";
+            return false;
+        }
+        if (!reject_unknown_keys(plate, {"id", "label", "index"}, "project plate", error))
+            return false;
+        std::string id;
+        if (!valid_project_id(plate.at("id"), id, "plate.id", error))
+            return false;
+        if (plate.contains("label")
+            && (!plate.at("label").is_string() || plate.at("label").get<std::string>().size() > 256)) {
+            error = "project plate label must be a string of at most 256 characters";
+            return false;
+        }
+        if (plate.contains("index")) {
+            std::uint32_t index = 0;
+            if (!project_uint32(plate.at("index"), index, "plate.index", error))
+                return false;
+        }
+        if (!plate_ids.insert(id).second) {
+            error = "project manifest contains a duplicate plate id: " + id;
+            return false;
+        }
+        result.plate_ids.push_back(std::move(id));
+    }
+
+    std::set<std::string> mesh_ids;
+    for (const auto& mesh : root.at("meshes")) {
+        if (!mesh.is_object() || !mesh.contains("id") || !mesh.contains("format")) {
+            error = "project mesh must contain id and format";
+            return false;
+        }
+        if (!reject_unknown_keys(mesh, {"id", "format", "dataRange"}, "project mesh", error))
+            return false;
+        ProjectMeshInput parsed;
+        if (!valid_project_id(mesh.at("id"), parsed.id, "mesh.id", error))
+            return false;
+        if (!mesh.at("format").is_string() || mesh.at("format").get<std::string>() != "stl") {
+            error = "project mesh format must be stl";
+            return false;
+        }
+        if (!mesh_ids.insert(parsed.id).second) {
+            error = "project manifest contains a duplicate mesh id: " + parsed.id;
+            return false;
+        }
+        if (!mesh.contains("dataRange")) {
+            if (require_data_ranges) {
+                error = "project mesh " + parsed.id + " must contain dataRange for project_set_objects";
+                return false;
+            }
+        } else {
+            const auto& data_range = mesh.at("dataRange");
+            if (!data_range.is_object()
+                || !reject_unknown_keys(data_range, {"offset", "length"}, "mesh.dataRange", error)
+                || !data_range.contains("offset") || !data_range.contains("length")) {
+                error = "project mesh " + parsed.id + " dataRange must contain offset and length";
+                return false;
+            }
+            if (!project_uint32(data_range.at("offset"), parsed.offset,
+                                "mesh.dataRange.offset", error)
+                || !project_uint32(data_range.at("length"), parsed.length,
+                                   "mesh.dataRange.length", error)) {
+                return false;
+            }
+            if (parsed.length == 0
+                || static_cast<std::uint64_t>(parsed.offset) + parsed.length > object_blob_len) {
+                error = "project mesh " + parsed.id + " dataRange is outside object_blob";
+                return false;
+            }
+            parsed.has_data_range = true;
+        }
+        result.meshes.push_back(std::move(parsed));
+    }
+
+    std::set<std::string> object_ids;
+    for (const auto& object : root.at("objects")) {
+        if (!object.is_object() || !object.contains("id") || !object.contains("meshId")) {
+            error = "project object must contain id and meshId";
+            return false;
+        }
+        if (!reject_unknown_keys(object, {"id", "meshId", "label", "extruderId"}, "project object", error))
+            return false;
+        ProjectObjectInput parsed;
+        if (!valid_project_id(object.at("id"), parsed.id, "object.id", error)
+            || !valid_project_id(object.at("meshId"), parsed.mesh_id, "object.meshId", error)) {
+            return false;
+        }
+        if (!object_ids.insert(parsed.id).second) {
+            error = "project manifest contains a duplicate object id: " + parsed.id;
+            return false;
+        }
+        if (std::none_of(result.meshes.begin(), result.meshes.end(), [&parsed](const auto& mesh) {
+                return mesh.id == parsed.mesh_id;
+            })) {
+            error = "project object " + parsed.id + " refers to an unknown mesh: " + parsed.mesh_id;
+            return false;
+        }
+        if (object.contains("label")) {
+            if (!object.at("label").is_string() || object.at("label").get<std::string>().size() > 256) {
+                error = "project object label must be a string of at most 256 characters";
+                return false;
+            }
+            parsed.label = object.at("label").get<std::string>();
+        }
+        if (object.contains("extruderId")) {
+            std::uint32_t extruder_id = 0;
+            if (!project_uint32(object.at("extruderId"), extruder_id, "object.extruderId", error))
+                return false;
+            if (extruder_id > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+                error = "object.extruderId is too large for the native engine";
+                return false;
+            }
+            parsed.extruder_id = static_cast<int>(extruder_id);
+        }
+        result.objects.push_back(std::move(parsed));
+    }
+
+    std::set<std::string> instance_ids;
+    for (const auto& instance : root.at("instances")) {
+        if (!instance.is_object() || !instance.contains("id") || !instance.contains("objectId")
+            || !instance.contains("plateId") || !instance.contains("transform")) {
+            error = "project instance must contain id, objectId, plateId, and transform";
+            return false;
+        }
+        if (!reject_unknown_keys(instance, {"id", "objectId", "plateId", "transform"},
+                                 "project instance", error))
+            return false;
+        ProjectInstanceInput parsed;
+        if (!valid_project_id(instance.at("id"), parsed.id, "instance.id", error)
+            || !valid_project_id(instance.at("objectId"), parsed.object_id, "instance.objectId", error)
+            || !valid_project_id(instance.at("plateId"), parsed.plate_id, "instance.plateId", error)) {
+            return false;
+        }
+        if (!instance_ids.insert(parsed.id).second) {
+            error = "project manifest contains a duplicate instance id: " + parsed.id;
+            return false;
+        }
+        if (std::none_of(result.objects.begin(), result.objects.end(), [&parsed](const auto& object) {
+                return object.id == parsed.object_id;
+            })) {
+            error = "project instance " + parsed.id + " refers to an unknown object: " + parsed.object_id;
+            return false;
+        }
+        if (plate_ids.find(parsed.plate_id) == plate_ids.end()) {
+            error = "project instance " + parsed.id + " refers to an unknown plate: " + parsed.plate_id;
+            return false;
+        }
+        if (!instance.at("transform").is_object()
+            || !reject_unknown_keys(instance.at("transform"), {"matrix"}, "instance.transform", error)
+            || !instance.at("transform").contains("matrix")
+            || !parse_project_matrix(instance.at("transform").at("matrix"), parsed.matrix,
+                                     "instance.transform.matrix", error)) {
+            return false;
+        }
+        result.instances.push_back(std::move(parsed));
+    }
+
+    if (result.plate_ids.empty() || result.instances.empty()) {
+        error = "project manifest must contain at least one plate and one instance";
+        return false;
+    }
+    normalized_manifest = std::move(root);
+    return true;
+}
 
 // Unconditionally removes a MEMFS temp file on scope exit (success, early
 // return, or C++ exception alike). Without this, a throw from do_export()
@@ -388,6 +798,59 @@ static char* read_file_to_buffer(const char* path, long* out_len, const char** o
     }
     *out_len = sz;
     return buf;
+}
+
+struct ProjectZipReaderGuard {
+    Slic3r::MZ_Archive archive;
+    bool opened = false;
+
+    ~ProjectZipReaderGuard() {
+        if (opened)
+            Slic3r::close_zip_reader(&archive.arch);
+    }
+};
+
+static bool list_project_zip_entries(
+    OrcSession& session,
+    const std::vector<std::uint8_t>& archive_data,
+    std::vector<std::string>& entries,
+    std::string& error
+) {
+    if (archive_data.empty() || archive_data.size() > UINT32_MAX) {
+        error = "native project archive is empty or oversized";
+        return false;
+    }
+    const std::string path = "/tmp/ow-project-entries-" + std::to_string(session.id) + ".3mf";
+    TempFileGuard file_guard(path);
+    FILE* file = std::fopen(path.c_str(), "wb");
+    if (!file) {
+        error = "unable to stage native project archive";
+        return false;
+    }
+    const std::size_t written = std::fwrite(archive_data.data(), 1, archive_data.size(), file);
+    std::fclose(file);
+    if (written != archive_data.size()) {
+        error = "unable to stage complete native project archive";
+        return false;
+    }
+
+    ProjectZipReaderGuard reader;
+    if (!Slic3r::open_zip_reader(&reader.archive.arch, path)) {
+        error = "native project archive is not a readable ZIP/3MF archive";
+        return false;
+    }
+    reader.opened = true;
+    const mz_uint count = mz_zip_reader_get_num_files(&reader.archive.arch);
+    entries.reserve(count);
+    for (mz_uint index = 0; index < count; ++index) {
+        mz_zip_archive_file_stat stat{};
+        if (!mz_zip_reader_file_stat(&reader.archive.arch, index, &stat)) {
+            error = "unable to inspect a native project ZIP entry";
+            return false;
+        }
+        entries.emplace_back(stat.m_filename);
+    }
+    return true;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -666,6 +1129,862 @@ static int write_transform_json(OrcSession& session, const Slic3r::Model& model,
     *out_transforms = reinterpret_cast<uint8_t*>(buffer);
     *out_len = static_cast<uint32_t>(json.size());
     return 0;
+}
+
+static const ProjectMeshInput* find_project_mesh(const ProjectManifestInput& manifest,
+                                                 const std::string& id) {
+    const auto found = std::find_if(manifest.meshes.begin(), manifest.meshes.end(), [&id](const auto& mesh) {
+        return mesh.id == id;
+    });
+    return found == manifest.meshes.end() ? nullptr : &*found;
+}
+
+static const ProjectObjectInput* find_project_object(const ProjectManifestInput& manifest,
+                                                     const std::string& id) {
+    const auto found = std::find_if(manifest.objects.begin(), manifest.objects.end(), [&id](const auto& object) {
+        return object.id == id;
+    });
+    return found == manifest.objects.end() ? nullptr : &*found;
+}
+
+static bool project_matrix_to_legacy_transform(const std::array<double, 16>& values,
+                                               const OrcSession& session,
+                                               ObjectTransformInput& result,
+                                               std::string& error) {
+    Slic3r::Transform3d matrix = Slic3r::Transform3d::Identity();
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column)
+            matrix.matrix()(row, column) = values[static_cast<std::size_t>(row * 4 + column)];
+    }
+    Slic3r::Geometry::Transformation transformation(matrix);
+    if (transformation.has_skew()) {
+        error = "OrcaSlicer arrange does not support a skewed project transform";
+        return false;
+    }
+    const auto offset = transformation.get_offset();
+    if (std::abs(offset.z()) > 1e-6) {
+        error = "OrcaSlicer arrange requires project transforms to be on the bed plane";
+        return false;
+    }
+    result.scale = transformation.get_scaling_factor();
+    result.rotation = transformation.get_rotation();
+    result.mirror = transformation.get_mirror();
+    result.has_offset = true;
+    result.offset_x = offset.x() - session.bed_cx;
+    result.offset_y = offset.y() - session.bed_cy;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(result.scale[axis]) || result.scale[axis] <= 0.) {
+            error = "project transform scale must be finite and greater than zero";
+            return false;
+        }
+        if (result.mirror[axis] != 1. && result.mirror[axis] != -1.) {
+            error = "project transform mirror values must be 1 or -1";
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::array<double, 16> legacy_transform_to_project_matrix(
+    const ObjectTransformInput& input, const OrcSession& session) {
+    Slic3r::Geometry::Transformation transformation;
+    transformation.set_scaling_factor(input.scale);
+    transformation.set_rotation(input.rotation);
+    transformation.set_mirror(input.mirror);
+    const double x = input.has_offset ? session.bed_cx + input.offset_x : session.bed_cx;
+    const double y = input.has_offset ? session.bed_cy + input.offset_y : session.bed_cy;
+    transformation.set_offset(Slic3r::Vec3d(x, y, 0.));
+
+    std::array<double, 16> result{};
+    const auto& matrix = transformation.get_matrix().matrix();
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column)
+            result[static_cast<std::size_t>(row * 4 + column)] = matrix(row, column);
+    }
+    return result;
+}
+
+static nlohmann::json project_matrix_json(const std::array<double, 16>& matrix) {
+    nlohmann::json result = nlohmann::json::array();
+    for (const double value : matrix)
+        result.push_back(value);
+    return result;
+}
+
+static bool append_native_model_project(
+    OrcSession& session,
+    Slic3r::Model& model,
+    const Slic3r::PlateDataPtrs& plate_data_list,
+    nlohmann::json& manifest,
+    std::vector<std::uint8_t>& object_blob,
+    std::string& error
+) {
+    manifest = empty_project_manifest();
+    object_blob.clear();
+
+    std::vector<std::string> object_ids(model.objects.size());
+    std::vector<bool> usable_objects(model.objects.size(), false);
+    for (std::size_t object_index = 0; object_index < model.objects.size(); ++object_index) {
+        auto* object = model.objects[object_index];
+        if (!object)
+            continue;
+        Slic3r::TriangleMesh mesh = object->raw_mesh();
+        if (mesh.empty())
+            continue;
+
+        const std::string path = "/tmp/ow-native-project-"
+            + std::to_string(session.id) + "-" + std::to_string(object_index) + ".stl";
+        TempFileGuard file_guard(path);
+        if (!Slic3r::store_stl(path.c_str(), &mesh, true)) {
+            error = "OrcaSlicer could not serialize a native project object";
+            return false;
+        }
+        long size = 0;
+        const char* read_error = nullptr;
+        bool out_of_memory = false;
+        char* bytes = read_file_to_buffer(path.c_str(), &size, &read_error, &out_of_memory);
+        if (!bytes) {
+            error = std::string{"unable to retain native project geometry: "}
+                + (read_error ? read_error : "read failed");
+            return false;
+        }
+        const std::size_t byte_count = static_cast<std::size_t>(size);
+        if (object_blob.size() > UINT32_MAX || byte_count > UINT32_MAX - object_blob.size()) {
+            std::free(bytes);
+            error = "OrcaSlicer native project geometry exceeds the C ABI length limit";
+            return false;
+        }
+        const std::uint32_t offset = static_cast<std::uint32_t>(object_blob.size());
+        object_blob.insert(
+            object_blob.end(),
+            reinterpret_cast<const std::uint8_t*>(bytes),
+            reinterpret_cast<const std::uint8_t*>(bytes) + byte_count
+        );
+        std::free(bytes);
+
+        const std::string object_id = "native-object-" + std::to_string(object_index);
+        const std::string mesh_id = "native-mesh-" + std::to_string(object_index);
+        object_ids[object_index] = object_id;
+        usable_objects[object_index] = true;
+        nlohmann::json object_entry = {
+            {"id", object_id},
+            {"meshId", mesh_id},
+        };
+        if (!object->name.empty())
+            object_entry["label"] = object->name.substr(0, 256);
+        manifest["meshes"].push_back({
+            {"id", mesh_id},
+            {"format", "stl"},
+            {"dataRange", {
+                {"offset", offset},
+                {"length", static_cast<std::uint32_t>(byte_count)},
+            }},
+        });
+        manifest["objects"].push_back(std::move(object_entry));
+    }
+
+    std::vector<std::pair<std::string, const Slic3r::PlateData*>> plates;
+    for (const auto* plate : plate_data_list) {
+        if (!plate)
+            continue;
+        const int index = plate->plate_index >= 0
+            ? plate->plate_index
+            : static_cast<int>(plates.size());
+        const std::string id = "plate-" + std::to_string(index);
+        plates.emplace_back(id, plate);
+        manifest["plates"].push_back({
+            {"id", id},
+            {"label", plate->plate_name.empty()
+                ? "Plate " + std::to_string(index + 1)
+                : plate->plate_name.substr(0, 256)},
+            {"index", index},
+        });
+    }
+    if (plates.empty()) {
+        plates.emplace_back("plate-0", nullptr);
+        manifest["plates"].push_back({
+            {"id", "plate-0"},
+            {"label", "OrcaSlicer project"},
+            {"index", 0},
+        });
+    }
+
+    auto project_matrix = [](const Slic3r::ModelInstance& instance) {
+        std::array<double, 16> matrix{};
+        const auto& native = instance.get_matrix().matrix();
+        for (int row = 0; row < 4; ++row)
+            for (int column = 0; column < 4; ++column)
+                matrix[static_cast<std::size_t>(row * 4 + column)] = native(row, column);
+        return matrix;
+    };
+    std::set<std::pair<std::size_t, std::size_t>> emitted;
+    std::size_t instance_ordinal = 0;
+    auto append_instance = [&](const std::string& plate_id,
+        const std::size_t object_index,
+                               const std::size_t instance_index) {
+        if (object_index >= model.objects.size()
+            || !usable_objects[object_index]
+            || !model.objects[object_index]
+            || instance_index >= model.objects[object_index]->instances.size()
+            || !emitted.emplace(object_index, instance_index).second)
+            return false;
+        const auto* instance = model.objects[object_index]->instances[instance_index];
+        if (!instance)
+            return false;
+        manifest["instances"].push_back({
+            {"id", "native-instance-" + std::to_string(instance_ordinal++)},
+            {"objectId", object_ids[object_index]},
+            {"plateId", plate_id},
+            {"transform", {{"matrix", project_matrix(*instance)}}},
+        });
+        return true;
+    };
+
+    for (const auto& [plate_id, plate] : plates) {
+        if (!plate)
+            continue;
+        for (const auto& [native_object_id, instance_info] : plate->obj_inst_map) {
+            std::size_t object_index = model.objects.size();
+            std::size_t instance_index = static_cast<std::size_t>(std::max(0, instance_info.first));
+            for (std::size_t candidate = 0; candidate < model.objects.size(); ++candidate) {
+                if (!model.objects[candidate])
+                    continue;
+                if (model.objects[candidate]->id().id == native_object_id) {
+                    object_index = candidate;
+                    break;
+                }
+                for (std::size_t candidate_instance = 0;
+                     candidate_instance < model.objects[candidate]->instances.size();
+                     ++candidate_instance) {
+                    const auto* candidate_instance_ptr =
+                        model.objects[candidate]->instances[candidate_instance];
+                    if (candidate_instance_ptr
+                        && candidate_instance_ptr->loaded_id
+                        == instance_info.second) {
+                        object_index = candidate;
+                        instance_index = candidate_instance;
+                        break;
+                    }
+                }
+                if (object_index != model.objects.size())
+                    break;
+            }
+            append_instance(plate_id, object_index, instance_index);
+        }
+    }
+
+    // Standard 3MF files do not carry Orca's plate metadata. In that case,
+    // retain every native instance on the first logical plate instead of
+    // returning a manifest that silently loses geometry.
+    for (std::size_t object_index = 0; object_index < model.objects.size(); ++object_index) {
+        if (!model.objects[object_index])
+            continue;
+        for (std::size_t instance_index = 0;
+             instance_index < model.objects[object_index]->instances.size();
+             ++instance_index)
+            append_instance(plates.front().first, object_index, instance_index);
+    }
+
+    if (manifest["instances"].empty()) {
+        manifest = empty_project_manifest();
+        object_blob.clear();
+    }
+    return true;
+}
+
+static bool collect_project_plate_inputs(
+    OrcSession& session,
+    const ProjectManifestInput& manifest,
+    const std::string& plate_id,
+    std::vector<std::uint8_t>& blob,
+    std::vector<std::uint32_t>& offsets,
+    std::vector<std::int32_t>& extruders,
+    std::vector<float>& transforms,
+    std::vector<std::size_t>& manifest_indices,
+    bool preserve_offsets,
+    std::string& error) {
+    std::size_t manifest_index = 0;
+    for (const auto& instance : manifest.instances) {
+        if (instance.plate_id != plate_id) {
+            ++manifest_index;
+            continue;
+        }
+        const auto* object = find_project_object(manifest, instance.object_id);
+        const auto* mesh = object ? find_project_mesh(manifest, object->mesh_id) : nullptr;
+        if (!object || !mesh) {
+            error = "project plate contains an instance with an unresolved mesh";
+            return false;
+        }
+        if (!mesh->has_data_range
+            || static_cast<std::uint64_t>(mesh->offset) + mesh->length > session.project_object_blob.size()) {
+            error = "selected project uses native geometry that the bridge could not materialize as STL";
+            return false;
+        }
+        if (blob.size() > UINT32_MAX || mesh->length > UINT32_MAX - blob.size()) {
+            error = "project plate object blob exceeds the C ABI length limit";
+            return false;
+        }
+        const auto begin = session.project_object_blob.begin() + mesh->offset;
+        const auto end = begin + mesh->length;
+        const auto start = static_cast<std::uint32_t>(blob.size());
+        blob.insert(blob.end(), begin, end);
+        offsets.push_back(start);
+        offsets.push_back(static_cast<std::uint32_t>(blob.size()));
+        extruders.push_back(static_cast<std::int32_t>(object->extruder_id));
+
+        ObjectTransformInput transform;
+        if (!project_matrix_to_legacy_transform(instance.matrix, session, transform, error))
+            return false;
+        transforms.push_back(static_cast<float>(transform.scale.x()));
+        transforms.push_back(static_cast<float>(transform.scale.y()));
+        transforms.push_back(static_cast<float>(transform.scale.z()));
+        transforms.push_back(static_cast<float>(transform.rotation.x()));
+        transforms.push_back(static_cast<float>(transform.rotation.y()));
+        transforms.push_back(static_cast<float>(transform.rotation.z()));
+        transforms.push_back(static_cast<float>(transform.mirror.x()));
+        transforms.push_back(static_cast<float>(transform.mirror.y()));
+        transforms.push_back(static_cast<float>(transform.mirror.z()));
+        if (preserve_offsets) {
+            transforms.push_back(static_cast<float>(transform.offset_x));
+            transforms.push_back(static_cast<float>(transform.offset_y));
+        } else {
+            transforms.push_back(std::numeric_limits<float>::quiet_NaN());
+            transforms.push_back(std::numeric_limits<float>::quiet_NaN());
+        }
+        manifest_indices.push_back(manifest_index);
+        ++manifest_index;
+    }
+    if (offsets.empty()) {
+        error = "selected project plate contains no objects";
+        return false;
+    }
+    return true;
+}
+
+struct ProjectExportOptions {
+    std::string preservation;
+    bool include_slice_artifacts = false;
+};
+
+static bool parse_project_export_options(
+    const uint8_t* options_data,
+    const uint32_t options_len,
+    ProjectExportOptions& result,
+    std::string& error
+) {
+    if (!options_data || options_len == 0) {
+        error = "project export options are empty";
+        return false;
+    }
+    nlohmann::json options;
+    try {
+        options = nlohmann::json::parse(std::string(
+            reinterpret_cast<const char*>(options_data), static_cast<std::size_t>(options_len)));
+    } catch (const std::exception& exception) {
+        error = std::string("project export options are not valid JSON: ") + exception.what();
+        return false;
+    }
+    if (!options.is_object() || !options.contains("schemaVersion")
+        || !options.at("schemaVersion").is_string()
+        || options.at("schemaVersion").get<std::string>() != "0.3") {
+        error = "project export options schemaVersion must be 0.3";
+        return false;
+    }
+    if (!reject_unknown_keys(
+            options,
+            {"schemaVersion", "preservation", "includeSliceArtifacts"},
+            "project export options",
+            error
+        ))
+        return false;
+    if (!options.contains("preservation") || !options.at("preservation").is_string()) {
+        error = "project export options preservation must be a string";
+        return false;
+    }
+    result.preservation = options.at("preservation").get<std::string>();
+    if (result.preservation != "require"
+        && result.preservation != "best-effort"
+        && result.preservation != "portable") {
+        error = "project export options preservation must be require, best-effort, or portable";
+        return false;
+    }
+    if (!options.contains("includeSliceArtifacts")
+        || !options.at("includeSliceArtifacts").is_boolean()) {
+        error = "project export options includeSliceArtifacts must be a boolean";
+        return false;
+    }
+    result.include_slice_artifacts = options.at("includeSliceArtifacts").get<bool>();
+    return true;
+}
+
+static bool build_project_export_mesh(
+    OrcSession& session,
+    const ProjectManifestInput& manifest,
+    Slic3r::TriangleMesh& output,
+    std::string& error
+) {
+    std::size_t instance_index = 0;
+    for (const auto& instance : manifest.instances) {
+        const auto* object = find_project_object(manifest, instance.object_id);
+        const auto* mesh = object ? find_project_mesh(manifest, object->mesh_id) : nullptr;
+        if (!object || !mesh || !mesh->has_data_range) {
+            error = "project export requires host-owned STL data for every instance";
+            return false;
+        }
+        if (static_cast<std::uint64_t>(mesh->offset) + mesh->length > session.project_object_blob.size()) {
+            error = "project export mesh dataRange is outside object_blob";
+            return false;
+        }
+
+        const std::string path = "/tmp/ow-project-export-"
+            + std::to_string(session.id) + "-" + std::to_string(instance_index++) + ".stl";
+        TempFileGuard input_guard(path);
+        FILE* file = std::fopen(path.c_str(), "wb");
+        if (!file) {
+            error = "unable to stage project export STL";
+            return false;
+        }
+        const std::size_t written = std::fwrite(
+            session.project_object_blob.data() + mesh->offset,
+            1,
+            mesh->length,
+            file
+        );
+        std::fclose(file);
+        if (written != mesh->length) {
+            error = "unable to stage complete project export STL";
+            return false;
+        }
+
+        Slic3r::Model loaded;
+        if (!Slic3r::load_stl(path.c_str(), &loaded, "project-export")) {
+            error = "unable to load project export STL";
+            return false;
+        }
+        Slic3r::Transform3d transform = Slic3r::Transform3d::Identity();
+        for (int row = 0; row < 4; ++row)
+            for (int column = 0; column < 4; ++column)
+                transform.matrix()(row, column) = instance.matrix[
+                    static_cast<std::size_t>(row * 4 + column)
+                ];
+        for (const auto* loaded_object : loaded.objects) {
+            if (!loaded_object)
+                continue;
+            Slic3r::TriangleMesh mesh_value = loaded_object->raw_mesh();
+            mesh_value.transform(transform, true);
+            if (output.empty())
+                output = std::move(mesh_value);
+            else
+                output.merge(mesh_value);
+        }
+    }
+    if (output.empty()) {
+        error = "project contains no printable geometry";
+        return false;
+    }
+    return true;
+}
+
+// The project adapter is defined before the legacy slice entry points, while
+// these native-print helpers are shared with those entry points below.
+static void zero_plate_origin(Slic3r::Print& print);
+static void set_is_bbl_printer(
+    Slic3r::Print& print,
+    const Slic3r::DynamicPrintConfig& config
+);
+static void throw_if_cancelled(const ActiveSliceGuard& operation);
+static std::string serialize_slice_statistics(
+    const Slic3r::Print& print,
+    const Slic3r::GCodeProcessorResult& processor_result
+);
+static void publish_slice_statistics(OrcSession& session, std::string statistics_json);
+static void apply_adaptive_layer_height(Slic3r::Print& print, float quality_factor);
+static void clamp_wipe_tower_to_bed(
+    Slic3r::DynamicPrintConfig& config,
+    const Slic3r::Model& model,
+    double bed_x,
+    double bed_y
+);
+
+// The released 0.2 multi-object entry point intentionally exposes the older
+// decomposed transform table. The 0.3 project manifest is different: its
+// matrix is the source-of-truth affine transform and may contain a valid
+// shear or a non-zero Z translation. Build the native model directly for the
+// project path so the common API does not inherit the legacy transform limit.
+static onewasm_status_t build_project_plate_model(
+    OrcSession& session,
+    const ProjectManifestInput& manifest,
+    const std::string& plate_id,
+    Slic3r::Model& model,
+    std::string& error
+) {
+    std::size_t instance_index = 0;
+    for (const auto& instance : manifest.instances) {
+        if (instance.plate_id != plate_id)
+            continue;
+
+        const auto* object_input = find_project_object(manifest, instance.object_id);
+        const auto* mesh_input = object_input
+            ? find_project_mesh(manifest, object_input->mesh_id) : nullptr;
+        if (!object_input || !mesh_input) {
+            error = "project instance contains an unresolved object or mesh";
+            return ONEWASM_ERR_VALIDATION;
+        }
+        if (!mesh_input->has_data_range
+            || static_cast<std::uint64_t>(mesh_input->offset) + mesh_input->length
+                > session.project_object_blob.size()) {
+            error = "selected project uses engine-owned geometry; Orca project slicing needs a host-readable mesh asset";
+            return ONEWASM_ERR_UNSUPPORTED;
+        }
+
+        const std::string path = "/tmp/ow-project-slice-"
+            + std::to_string(session.id) + "-" + std::to_string(instance_index++) + ".stl";
+        TempFileGuard input_guard(path);
+        FILE* file = std::fopen(path.c_str(), "wb");
+        if (!file) {
+            error = "unable to stage project slice STL";
+            return ONEWASM_ERR_INPUT_IO;
+        }
+        const std::size_t written = std::fwrite(
+            session.project_object_blob.data() + mesh_input->offset,
+            1,
+            mesh_input->length,
+            file
+        );
+        std::fclose(file);
+        if (written != mesh_input->length) {
+            error = "unable to stage complete project slice STL";
+            return ONEWASM_ERR_INPUT_IO;
+        }
+
+        const std::size_t first_object = model.objects.size();
+        if (!Slic3r::load_stl(path.c_str(), &model, object_input->id.c_str())) {
+            error = "OrcaSlicer could not load project mesh " + mesh_input->id;
+            return ONEWASM_ERR_INPUT_FORMAT;
+        }
+        if (model.objects.size() == first_object) {
+            error = "project mesh contains no printable objects: " + mesh_input->id;
+            return ONEWASM_ERR_EMPTY_INPUT;
+        }
+
+        Slic3r::Transform3d matrix = Slic3r::Transform3d::Identity();
+        for (int row = 0; row < 4; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                matrix.matrix()(row, column) = instance.matrix[
+                    static_cast<std::size_t>(row * 4 + column)
+                ];
+            }
+        }
+        const Slic3r::Geometry::Transformation transformation(matrix);
+        for (std::size_t object_index = first_object;
+             object_index < model.objects.size(); ++object_index) {
+            auto* object = model.objects[object_index];
+            if (!object)
+                continue;
+            if (!object_input->label.empty())
+                object->name = object_input->label;
+            auto* native_instance = object->add_instance();
+            if (!native_instance) {
+                error = "OrcaSlicer could not allocate a project instance";
+                return ONEWASM_ERR_OUTPUT;
+            }
+            native_instance->set_transformation(transformation);
+            if (object_input->extruder_id > 0)
+                object->config.set("extruder", object_input->extruder_id);
+        }
+    }
+
+    if (model.objects.empty()) {
+        error = "selected project plate contains no objects";
+        return ONEWASM_ERR_EMPTY_INPUT;
+    }
+    return ONEWASM_OK;
+}
+
+static onewasm_status_t slice_project_model(
+    OrcSession& session,
+    Slic3r::Model& model,
+    ActiveSliceGuard& operation,
+    uint8_t** out_gcode,
+    uint32_t* out_len
+) {
+    try {
+        throw_if_cancelled(operation);
+        clamp_wipe_tower_to_bed(
+            session.config,
+            model,
+            2.0 * session.bed_cx,
+            2.0 * session.bed_cy
+        );
+        Slic3r::Print print;
+        operation.attach(print);
+        ActivePrintGuard print_guard(operation);
+        print.apply(model, session.config);
+        zero_plate_origin(print);
+        set_is_bbl_printer(print, session.config);
+        if (session.remove_mixed_temp_restriction)
+            print.set_check_multi_filaments_compatibility(false);
+        if (session.adaptive_layer_height)
+            apply_adaptive_layer_height(print, session.adaptive_layer_height_quality);
+        attach_progress_callback(print, session);
+
+        Slic3r::StringObjectException warning;
+        Slic3r::StringObjectException validation_error = print.validate(&warning);
+        if (!validation_error.string.empty()) {
+            record_error(session, validation_error.string);
+            return ONEWASM_ERR_VALIDATION;
+        }
+
+        try {
+            throw_if_cancelled(operation);
+            print.process();
+            throw_if_cancelled(operation);
+        } catch (const Slic3r::CanceledException&) {
+            record_error(session, "slice cancelled");
+            return ONEWASM_ERR_CANCELLED;
+        } catch (const Slic3r::SlicingError& exception) {
+            record_error(session, exception.what());
+            return ONEWASM_ERR_SLICE;
+        }
+
+        TempFileGuard output_guard("/tmp/ow_out.gcode");
+        Slic3r::GCodeProcessorResult processor_result;
+        {
+            Slic3r::GCode gcode;
+            gcode.do_export(&print, "/tmp/ow_out.gcode", &processor_result, nullptr);
+        }
+        throw_if_cancelled(operation);
+        const std::string statistics_json = serialize_slice_statistics(print, processor_result);
+
+        FILE* file = std::fopen("/tmp/ow_out.gcode", "rb");
+        if (!file) {
+            record_error(session, "gcode export produced no output");
+            return ONEWASM_ERR_OUTPUT;
+        }
+        if (std::fseek(file, 0, SEEK_END) != 0) {
+            std::fclose(file);
+            record_error(session, "unable to seek G-code output");
+            return ONEWASM_ERR_OUTPUT;
+        }
+        const long size = std::ftell(file);
+        if (size < 0 || static_cast<unsigned long long>(size) > UINT32_MAX) {
+            std::fclose(file);
+            record_error(session, "G-code output exceeds the C ABI length limit");
+            return ONEWASM_ERR_OUTPUT;
+        }
+        std::rewind(file);
+        auto* buffer = static_cast<uint8_t*>(std::malloc(std::max<long>(1, size)));
+        if (!buffer) {
+            std::fclose(file);
+            record_error(session, "out of memory");
+            return ONEWASM_ERR_OUTPUT;
+        }
+        const std::size_t read = std::fread(buffer, 1, static_cast<std::size_t>(size), file);
+        std::fclose(file);
+        if (read != static_cast<std::size_t>(size)) {
+            std::free(buffer);
+            record_error(session, "unable to read complete G-code output");
+            return ONEWASM_ERR_OUTPUT;
+        }
+        *out_gcode = buffer;
+        *out_len = static_cast<uint32_t>(size);
+        publish_slice_statistics(session, statistics_json);
+        return ONEWASM_OK;
+    } catch (const Slic3r::CanceledException&) {
+        record_error(session, "slice cancelled");
+        return ONEWASM_ERR_CANCELLED;
+    } catch (const std::exception& exception) {
+        record_error(session, exception.what());
+        return ONEWASM_ERR_INTERNAL;
+    }
+}
+
+struct ProjectOutputFailureGuard {
+    OrcSession& session;
+    bool committed{false};
+
+    ~ProjectOutputFailureGuard() {
+        if (!committed)
+            clear_project_outputs(session);
+    }
+};
+
+struct ProjectSliceRequest {
+    std::vector<std::string> plate_ids;
+    bool include_gcode = true;
+    bool include_statistics = true;
+};
+
+static bool parse_project_slice_request(const uint8_t* request_data,
+                                        std::uint32_t request_len,
+                                        const ProjectManifestInput& manifest,
+                                        ProjectSliceRequest& result,
+                                        std::string& error) {
+    if (!request_data || request_len == 0) {
+        error = "project slice request is empty";
+        return false;
+    }
+    nlohmann::json request;
+    try {
+        request = nlohmann::json::parse(std::string(
+            reinterpret_cast<const char*>(request_data), static_cast<std::size_t>(request_len)));
+    } catch (const std::exception& exception) {
+        error = std::string("project slice request is not valid JSON: ") + exception.what();
+        return false;
+    }
+    if (!request.is_object() || !request.contains("schemaVersion")
+        || !request.at("schemaVersion").is_string()
+        || request.at("schemaVersion").get<std::string>() != "0.3") {
+        error = "project slice request schemaVersion must be 0.3";
+        return false;
+    }
+    if (!reject_unknown_keys(
+            request,
+            {"schemaVersion", "plateSelection", "plateIds", "includeGcode", "includeStatistics"},
+            "project slice request",
+            error))
+        return false;
+    if (!request.contains("plateSelection") || !request.at("plateSelection").is_string()) {
+        error = "plateSelection must be a string";
+        return false;
+    }
+    const std::string selection = request.at("plateSelection").get<std::string>();
+    if (selection == "all") {
+        if (request.contains("plateIds")) {
+            error = "plateIds must be omitted when plateSelection is all";
+            return false;
+        }
+        result.plate_ids = manifest.plate_ids;
+    } else if (selection == "selected") {
+        if (!request.contains("plateIds") || !request.at("plateIds").is_array()
+            || request.at("plateIds").empty()) {
+            error = "plateIds must be a non-empty array for selected plate slicing";
+            return false;
+        }
+        std::set<std::string> unique_ids;
+        for (const auto& value : request.at("plateIds")) {
+            std::string id;
+            if (!valid_project_id(value, id, "plateIds[]", error))
+                return false;
+            if (!unique_ids.insert(id).second) {
+                error = "plateIds contains a duplicate id: " + id;
+                return false;
+            }
+            if (std::find(manifest.plate_ids.begin(), manifest.plate_ids.end(), id)
+                == manifest.plate_ids.end()) {
+                error = "plateIds contains an unknown plate: " + id;
+                return false;
+            }
+            result.plate_ids.push_back(std::move(id));
+        }
+    } else {
+        error = "plateSelection must be all or selected";
+        return false;
+    }
+    if (result.plate_ids.empty()) {
+        error = "project contains no selectable plates";
+        return false;
+    }
+    if (request.contains("includeGcode") && !request.at("includeGcode").is_boolean()) {
+        error = "includeGcode must be a boolean";
+        return false;
+    }
+    if (request.contains("includeStatistics") && !request.at("includeStatistics").is_boolean()) {
+        error = "includeStatistics must be a boolean";
+        return false;
+    }
+    result.include_gcode = request.value("includeGcode", true);
+    result.include_statistics = request.value("includeStatistics", true);
+    return true;
+}
+
+static bool parse_prepared_transform(const nlohmann::json& value,
+                                     ObjectTransformInput& result,
+                                     std::string& error) {
+    if (!value.is_object() || !value.contains("scale") || !value.contains("rotation")
+        || !value.contains("mirror") || !value.contains("offset")) {
+        error = "OrcaSlicer returned an invalid project transform";
+        return false;
+    }
+
+    const auto read_vector = [&error](const nlohmann::json& source,
+                                      const char* name,
+                                      Slic3r::Vec3d& target) {
+        if (!source.is_array() || source.size() != 3) {
+            error = std::string("prepared transform ") + name
+                + " must contain three numbers";
+            return false;
+        }
+        for (std::size_t index = 0; index < 3; ++index) {
+            double number = 0.;
+            if (!project_number(source[index], number, name, error))
+                return false;
+            target[static_cast<int>(index)] = number;
+        }
+        return true;
+    };
+
+    if (!read_vector(value.at("scale"), "scale", result.scale)
+        || !read_vector(value.at("rotation"), "rotation", result.rotation)
+        || !read_vector(value.at("mirror"), "mirror", result.mirror)) {
+        return false;
+    }
+    if (result.scale.x() <= 0. || result.scale.y() <= 0. || result.scale.z() <= 0.) {
+        error = "prepared transform scale must be greater than zero";
+        return false;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        if (result.mirror[axis] != 1. && result.mirror[axis] != -1.) {
+            error = "prepared transform mirror values must be 1 or -1";
+            return false;
+        }
+    }
+
+    const auto& offset = value.at("offset");
+    if (offset.is_null()) {
+        result.has_offset = false;
+        result.offset_x = 0.;
+        result.offset_y = 0.;
+        return true;
+    }
+    if (!offset.is_array() || offset.size() != 2) {
+        error = "prepared transform offset must be null or contain two numbers";
+        return false;
+    }
+    if (!project_number(offset[0], result.offset_x, "offset", error)
+        || !project_number(offset[1], result.offset_y, "offset", error)) {
+        return false;
+    }
+    result.has_offset = true;
+    return true;
+}
+
+static bool set_project_output(const std::string& value,
+                               uint8_t** out_data,
+                               uint32_t* out_len,
+                               std::string& error) {
+    if (value.size() > UINT32_MAX) {
+        error = "project output exceeds the C ABI length limit";
+        return false;
+    }
+    auto* buffer = static_cast<uint8_t*>(std::malloc(std::max<std::size_t>(1, value.size())));
+    if (!buffer) {
+        error = "out of memory";
+        return false;
+    }
+    if (!value.empty())
+        std::memcpy(buffer, value.data(), value.size());
+    *out_data = buffer;
+    *out_len = static_cast<uint32_t>(value.size());
+    return true;
+}
+
+static bool project_plate_has_instances(const ProjectManifestInput& manifest,
+                                        const std::string& plate_id) {
+    return std::any_of(manifest.instances.begin(), manifest.instances.end(),
+                       [&plate_id](const auto& instance) {
+                           return instance.plate_id == plate_id;
+                       });
 }
 
 // Print::m_origin (the plate offset, read via get_plate_origin()) has no
@@ -971,7 +2290,15 @@ extern "C" {
 /** Allocate a new engine session. Returns 0 (null) on allocation failure. */
 EMSCRIPTEN_KEEPALIVE
 onewasm_session_t onewasm_session_create() {
-    return new (std::nothrow) OrcSession();
+    try {
+        std::unique_ptr<OrcSession> session(new (std::nothrow) OrcSession());
+        if (!session)
+            return nullptr;
+        reset_project(*session);
+        return session.release();
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 /** Free a session created by onewasm_session_create(). Safe to call with null. */
@@ -1012,6 +2339,9 @@ onewasm_status_t onewasm_init(onewasm_session_t session_ptr, const uint8_t* conf
     if (!session) return -1;
     session->last_error.clear();
     session->initialized = false;
+    session->last_statistics_json.clear();
+    session->has_last_statistics = false;
+    reset_project(*session);
     ensure_nozzle_info_json();
     if (!config_data || config_len == 0) {
         record_error(*session, "config data is empty");
@@ -1125,6 +2455,9 @@ onewasm_status_t onewasm_init_profile(
     if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
     session->initialized = false;
+    session->last_statistics_json.clear();
+    session->has_last_statistics = false;
+    reset_project(*session);
     if (!format_utf8 || format_len == 0 || !profile_data || profile_len == 0) {
         record_error(*session, "profile format or data is empty");
         return ONEWASM_ERR_INVALID_ARGUMENT;
@@ -1180,6 +2513,24 @@ onewasm_status_t onewasm_init_profile(
         session->remove_mixed_temp_restriction = false;
         session->adaptive_layer_height = false;
         session->adaptive_layer_height_quality = 0.5f;
+        nlohmann::json native_manifest;
+        std::vector<std::uint8_t> native_object_blob;
+        std::string project_error;
+        if (!append_native_model_project(
+                *session,
+                model,
+                plate_data_list,
+                native_manifest,
+                native_object_blob,
+                project_error
+            )) {
+            record_error(*session, project_error);
+            return ONEWASM_ERR_INPUT_FORMAT;
+        }
+        session->project_manifest = std::move(native_manifest);
+        session->project_object_blob = std::move(native_object_blob);
+        session->native_project_blob.assign(profile_data, profile_data + profile_len);
+        session->native_project_dirty = false;
         session->initialized = true;
         return ONEWASM_OK;
     } catch (const std::exception& e) {
@@ -1207,6 +2558,8 @@ EMSCRIPTEN_KEEPALIVE
 onewasm_status_t onewasm_cancel(onewasm_session_t session_ptr) {
     OrcSession* session = as_session(session_ptr);
     if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+
+    session->project_cancel_requested.store(true, std::memory_order_release);
 
     std::shared_ptr<ActiveSlice> operation;
     {
@@ -1287,6 +2640,645 @@ onewasm_status_t onewasm_get_last_statistics(
     *out_json = buffer;
     *out_len = static_cast<uint32_t>(session->last_statistics_json.size());
     return ONEWASM_OK;
+}
+
+EMSCRIPTEN_KEEPALIVE
+onewasm_status_t onewasm_project_set_objects(
+    onewasm_session_t session_ptr,
+    const uint8_t* object_blob,
+    uint32_t object_blob_len,
+    const uint8_t* manifest_json,
+    uint32_t manifest_len
+) {
+    OrcSession* session = as_session(session_ptr);
+    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    session->last_error.clear();
+    clear_project_outputs(*session);
+    if (!session->initialized) {
+        record_error(*session, "call onewasm_init or onewasm_init_profile first");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+    if (!object_blob || object_blob_len == 0) {
+        record_error(*session, "project object blob is empty");
+        return ONEWASM_ERR_EMPTY_INPUT;
+    }
+
+    ProjectManifestInput parsed;
+    nlohmann::json normalized;
+    std::string error;
+    if (!parse_project_manifest(manifest_json, manifest_len, object_blob_len, true,
+                                parsed, normalized, error)) {
+        record_error(*session, error);
+        return ONEWASM_ERR_VALIDATION;
+    }
+
+    try {
+        std::vector<std::uint8_t> retained_blob(object_blob, object_blob + object_blob_len);
+        session->project_object_blob = std::move(retained_blob);
+        session->project_manifest = std::move(normalized);
+        session->native_project_blob.clear();
+        session->native_project_dirty = false;
+        session->project_cancel_requested.store(false, std::memory_order_release);
+        return ONEWASM_OK;
+    } catch (const std::bad_alloc&) {
+        record_error(*session, "unable to retain the project object blob");
+        return ONEWASM_ERR_OUTPUT;
+    } catch (const std::exception& exception) {
+        record_error(*session, std::string("project state update failed: ") + exception.what());
+        return ONEWASM_ERR_INTERNAL;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+onewasm_status_t onewasm_project_get_manifest(
+    onewasm_session_t session_ptr,
+    uint8_t** out_json,
+    uint32_t* out_len
+) {
+    OrcSession* session = as_session(session_ptr);
+    if (out_json) *out_json = nullptr;
+    if (out_len) *out_len = 0;
+    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    session->last_error.clear();
+    if (!out_json || !out_len) {
+        record_error(*session, "manifest output pointers must not be null");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+
+    const nlohmann::json manifest = session->project_manifest.is_null()
+        ? empty_project_manifest() : session->project_manifest;
+    const std::string output = manifest.dump();
+    if (!set_project_output(output, out_json, out_len, session->last_error))
+        return ONEWASM_ERR_OUTPUT;
+    return ONEWASM_OK;
+}
+
+EMSCRIPTEN_KEEPALIVE
+onewasm_status_t onewasm_project_prepare(
+    onewasm_session_t session_ptr,
+    const uint8_t* request_json,
+    uint32_t request_len,
+    uint8_t** out_manifest_json,
+    uint32_t* out_len
+) {
+    OrcSession* session = as_session(session_ptr);
+    if (out_manifest_json) *out_manifest_json = nullptr;
+    if (out_len) *out_len = 0;
+    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    session->last_error.clear();
+    if (!session->initialized) {
+        record_error(*session, "call onewasm_init or onewasm_init_profile first");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+    if (!out_manifest_json || !out_len || !request_json || request_len == 0) {
+        record_error(*session, "project prepare request and output pointers must not be empty");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+
+    clear_project_outputs(*session);
+    session->project_cancel_requested.store(false, std::memory_order_release);
+
+    nlohmann::json request;
+    try {
+        request = nlohmann::json::parse(std::string(
+            reinterpret_cast<const char*>(request_json), static_cast<std::size_t>(request_len)));
+    } catch (const std::exception& exception) {
+        record_error(*session, std::string("project prepare request is not valid JSON: ")
+            + exception.what());
+        return ONEWASM_ERR_VALIDATION;
+    }
+    if (!request.is_object() || !request.contains("schemaVersion")
+        || !request.at("schemaVersion").is_string()
+        || request.at("schemaVersion").get<std::string>() != "0.3") {
+        record_error(*session, "project prepare request schemaVersion must be 0.3");
+        return ONEWASM_ERR_VALIDATION;
+    }
+    std::string request_error;
+    if (!reject_unknown_keys(request, {"schemaVersion", "operation"},
+                             "project prepare request", request_error)) {
+        record_error(*session, request_error);
+        return ONEWASM_ERR_VALIDATION;
+    }
+    const std::string operation_name = request.value("operation", "");
+    const int operation = operation_name == "auto-orient"
+        ? ONEWASM_PLATE_AUTO_ORIENT
+        : operation_name == "arrange" ? ONEWASM_PLATE_ARRANGE : 0;
+    if (operation == 0) {
+        record_error(*session, "project prepare operation must be auto-orient or arrange");
+        return ONEWASM_ERR_VALIDATION;
+    }
+
+    const std::string manifest_text = session->project_manifest.dump();
+    if (manifest_text.size() > UINT32_MAX) {
+        record_error(*session, "project manifest exceeds the C ABI length limit");
+        return ONEWASM_ERR_OUTPUT;
+    }
+    ProjectManifestInput manifest;
+    nlohmann::json normalized;
+    std::string error;
+    if (!parse_project_manifest(
+            reinterpret_cast<const uint8_t*>(manifest_text.data()),
+            static_cast<std::uint32_t>(manifest_text.size()),
+            static_cast<std::uint32_t>(session->project_object_blob.size()),
+            false,
+            manifest, normalized, error)) {
+        record_error(*session, error);
+        return ONEWASM_ERR_VALIDATION;
+    }
+
+    nlohmann::json updated = session->project_manifest;
+    try {
+        for (const auto& plate_id : manifest.plate_ids) {
+            if (!project_plate_has_instances(manifest, plate_id))
+                continue;
+
+            std::vector<std::uint8_t> blob;
+            std::vector<std::uint32_t> offsets;
+            std::vector<std::int32_t> extruders;
+            std::vector<float> transforms;
+            std::vector<std::size_t> manifest_indices;
+            if (!collect_project_plate_inputs(
+                    *session, manifest, plate_id, blob, offsets, extruders,
+                    transforms, manifest_indices,
+                    operation == ONEWASM_PLATE_AUTO_ORIENT, error)) {
+                record_error(*session, error);
+                return ONEWASM_ERR_VALIDATION;
+            }
+            if (manifest_indices.size() > UINT32_MAX) {
+                record_error(*session, "project plate contains too many objects");
+                return ONEWASM_ERR_INPUT_FORMAT;
+            }
+
+            uint8_t* prepared_data = nullptr;
+            uint32_t prepared_len = 0;
+            const auto status = onewasm_prepare_plate(
+                session_ptr, blob.data(), static_cast<std::uint32_t>(blob.size()),
+                offsets.data(), static_cast<std::uint32_t>(manifest_indices.size()),
+                transforms.data(), operation, &prepared_data, &prepared_len);
+            if (status != ONEWASM_OK) {
+                std::free(prepared_data);
+                return status;
+            }
+
+            nlohmann::json prepared;
+            try {
+                prepared = nlohmann::json::parse(std::string(
+                    reinterpret_cast<const char*>(prepared_data),
+                    static_cast<std::size_t>(prepared_len)));
+            } catch (const std::exception& exception) {
+                std::free(prepared_data);
+                record_error(*session, std::string("OrcaSlicer returned invalid transforms: ")
+                    + exception.what());
+                return ONEWASM_ERR_INTERNAL;
+            }
+            std::free(prepared_data);
+            if (!prepared.is_array() || prepared.size() != manifest_indices.size()) {
+                record_error(*session, "OrcaSlicer returned an incomplete project transform list");
+                return ONEWASM_ERR_INTERNAL;
+            }
+
+            for (std::size_t index = 0; index < manifest_indices.size(); ++index) {
+                ObjectTransformInput transform;
+                if (!parse_prepared_transform(prepared[index], transform, error)) {
+                    record_error(*session, error);
+                    return ONEWASM_ERR_INTERNAL;
+                }
+                updated["instances"][manifest_indices[index]]["transform"]["matrix"] =
+                    project_matrix_json(legacy_transform_to_project_matrix(transform, *session));
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        record_error(*session, "unable to retain the prepared project manifest");
+        return ONEWASM_ERR_OUTPUT;
+    } catch (const std::exception& exception) {
+        record_error(*session, std::string("OrcaSlicer project preparation failed: ")
+            + exception.what());
+        return ONEWASM_ERR_INTERNAL;
+    }
+
+    const std::string output = updated.dump();
+    if (!set_project_output(output, out_manifest_json, out_len, session->last_error))
+        return ONEWASM_ERR_OUTPUT;
+    session->project_manifest = std::move(updated);
+    if (!session->native_project_blob.empty())
+        session->native_project_dirty = true;
+    return ONEWASM_OK;
+}
+
+EMSCRIPTEN_KEEPALIVE
+onewasm_status_t onewasm_project_slice(
+    onewasm_session_t session_ptr,
+    const uint8_t* request_json,
+    uint32_t request_len,
+    uint8_t** out_result_json,
+    uint32_t* out_len
+) {
+    OrcSession* session = as_session(session_ptr);
+    if (out_result_json) *out_result_json = nullptr;
+    if (out_len) *out_len = 0;
+    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    session->last_error.clear();
+    if (!session->initialized) {
+        record_error(*session, "call onewasm_init or onewasm_init_profile first");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+    if (!out_result_json || !out_len) {
+        record_error(*session, "slice result output pointers must not be null");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+
+    // A new project slice invalidates all assets from the previous operation,
+    // including when request validation fails. This keeps get_asset from
+    // exposing stale output after a failed call.
+    clear_project_outputs(*session);
+    session->project_cancel_requested.store(false, std::memory_order_release);
+
+    const std::string manifest_text = session->project_manifest.dump();
+    if (manifest_text.size() > UINT32_MAX
+        || session->project_object_blob.size() > UINT32_MAX) {
+        record_error(*session, "project input exceeds the C ABI length limit");
+        return ONEWASM_ERR_INPUT_FORMAT;
+    }
+    ProjectManifestInput manifest;
+    nlohmann::json normalized;
+    std::string error;
+    if (!parse_project_manifest(
+            reinterpret_cast<const uint8_t*>(manifest_text.data()),
+            static_cast<std::uint32_t>(manifest_text.size()),
+            static_cast<std::uint32_t>(session->project_object_blob.size()),
+            false,
+            manifest, normalized, error)) {
+        record_error(*session, error);
+        return ONEWASM_ERR_VALIDATION;
+    }
+
+    ProjectSliceRequest request;
+    if (!parse_project_slice_request(request_json, request_len, manifest, request, error)) {
+        record_error(*session, error);
+        return ONEWASM_ERR_VALIDATION;
+    }
+
+    ActiveSliceGuard operation(*session);
+    if (!operation) {
+        record_error(*session, "session already has an active operation");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+    ProjectOutputFailureGuard output_guard{*session};
+    std::map<std::string, std::string> new_assets;
+    nlohmann::json result = {
+        {"schemaVersion", "0.3"},
+        {"plateResults", nlohmann::json::array()},
+        {"warnings", nlohmann::json::array()},
+    };
+
+    try {
+        for (std::size_t plate_index = 0; plate_index < request.plate_ids.size(); ++plate_index) {
+            if (session->project_cancel_requested.load(std::memory_order_acquire)) {
+                record_error(*session, "project slice cancelled");
+                return ONEWASM_ERR_CANCELLED;
+            }
+            const int base = static_cast<int>((100 * plate_index) / request.plate_ids.size());
+            const int end = static_cast<int>((100 * (plate_index + 1)) / request.plate_ids.size());
+            ProgressWindow progress_window(*session, base, std::max(1, end - base));
+            emit_project_progress(*session, 0, "Loading project plate");
+
+            nlohmann::json plate_result = {
+                {"plateId", request.plate_ids[plate_index]},
+                {"assets", nlohmann::json::array()},
+                {"statistics", nullptr},
+                {"warnings", nlohmann::json::array()},
+            };
+
+            if (!project_plate_has_instances(manifest, request.plate_ids[plate_index])) {
+                plate_result["warnings"].push_back({
+                    {"code", "empty-plate"},
+                    {"message", "selected project plate contains no objects"},
+                });
+                result["plateResults"].push_back(std::move(plate_result));
+                emit_project_progress(*session, 100, "Finished empty project plate");
+                continue;
+            }
+
+            Slic3r::Model model;
+            const auto build_status = build_project_plate_model(
+                *session,
+                manifest,
+                request.plate_ids[plate_index],
+                model,
+                error
+            );
+            if (build_status != ONEWASM_OK) {
+                record_error(*session, error);
+                return build_status;
+            }
+
+            uint8_t* gcode_data = nullptr;
+            uint32_t gcode_len = 0;
+            const auto slice_status = slice_project_model(
+                *session, model, operation, &gcode_data, &gcode_len
+            );
+            if (slice_status != ONEWASM_OK) {
+                std::free(gcode_data);
+                return slice_status;
+            }
+
+            if (request.include_gcode) {
+                const std::string asset_id = "gcode:" + request.plate_ids[plate_index];
+                new_assets.emplace(asset_id, std::string(
+                    reinterpret_cast<const char*>(gcode_data), static_cast<std::size_t>(gcode_len)));
+                plate_result["assets"].push_back({
+                    {"id", asset_id},
+                    {"kind", "gcode"},
+                    {"mimeType", "text/x-gcode"},
+                    {"byteLength", new_assets.at(asset_id).size()},
+                });
+            }
+            std::free(gcode_data);
+
+            if (request.include_statistics) {
+                uint8_t* statistics_data = nullptr;
+                uint32_t statistics_len = 0;
+                const auto statistics_status = onewasm_get_last_statistics(
+                    session_ptr, &statistics_data, &statistics_len);
+                if (statistics_status != ONEWASM_OK) {
+                    std::free(statistics_data);
+                    return statistics_status;
+                }
+                try {
+                    nlohmann::json statistics = nlohmann::json::parse(std::string(
+                        reinterpret_cast<const char*>(statistics_data),
+                        static_cast<std::size_t>(statistics_len)));
+                    std::free(statistics_data);
+                    if (!statistics.is_object()) {
+                        record_error(*session, "OrcaSlicer returned invalid slice statistics");
+                        return ONEWASM_ERR_INTERNAL;
+                    }
+                    statistics["schemaVersion"] = "0.3";
+                    plate_result["statistics"] = std::move(statistics);
+                } catch (const std::exception& exception) {
+                    std::free(statistics_data);
+                    record_error(*session, std::string("OrcaSlicer returned invalid slice statistics: ")
+                        + exception.what());
+                    return ONEWASM_ERR_INTERNAL;
+                }
+            }
+            result["plateResults"].push_back(std::move(plate_result));
+        }
+        if (session->project_cancel_requested.load(std::memory_order_acquire)) {
+            record_error(*session, "project slice cancelled");
+            return ONEWASM_ERR_CANCELLED;
+        }
+        emit_project_progress(*session, 100, "Finished project");
+    } catch (const std::bad_alloc&) {
+        record_error(*session, "unable to retain project slice results");
+        return ONEWASM_ERR_OUTPUT;
+    } catch (const std::exception& exception) {
+        record_error(*session, std::string("OrcaSlicer project slice failed: ")
+            + exception.what());
+        return ONEWASM_ERR_INTERNAL;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(session->control_mutex);
+        session->project_assets = std::move(new_assets);
+    }
+    const std::string result_text = result.dump();
+    if (!set_project_output(result_text, out_result_json, out_len, session->last_error))
+        return ONEWASM_ERR_OUTPUT;
+    output_guard.committed = true;
+    return ONEWASM_OK;
+}
+
+EMSCRIPTEN_KEEPALIVE
+onewasm_status_t onewasm_project_get_asset(
+    onewasm_session_t session_ptr,
+    const char* asset_id_utf8,
+    uint32_t asset_id_len,
+    uint8_t** out_data,
+    uint32_t* out_len
+) {
+    OrcSession* session = as_session(session_ptr);
+    if (out_data) *out_data = nullptr;
+    if (out_len) *out_len = 0;
+    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    session->last_error.clear();
+    if (!asset_id_utf8 || asset_id_len == 0 || !out_data || !out_len) {
+        record_error(*session, "project asset id and output pointers must not be empty");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+
+    const std::string asset_id(asset_id_utf8, asset_id_utf8 + asset_id_len);
+    std::string asset;
+    {
+        std::lock_guard<std::mutex> lock(session->control_mutex);
+        const auto found = session->project_assets.find(asset_id);
+        if (found == session->project_assets.end()) {
+            record_error(*session, "project asset is not available: " + asset_id);
+            return ONEWASM_ERR_NO_DATA;
+        }
+        asset = found->second;
+    }
+    if (!set_project_output(asset, out_data, out_len, session->last_error))
+        return ONEWASM_ERR_OUTPUT;
+    return ONEWASM_OK;
+}
+
+EMSCRIPTEN_KEEPALIVE
+onewasm_status_t onewasm_project_export(
+    onewasm_session_t session_ptr,
+    const char* format_utf8,
+    uint32_t format_len,
+    const uint8_t* options_json,
+    uint32_t options_len,
+    uint8_t** out_result_json,
+    uint32_t* out_len
+) {
+    OrcSession* session = as_session(session_ptr);
+    if (out_result_json) *out_result_json = nullptr;
+    if (out_len) *out_len = 0;
+    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    session->last_error.clear();
+    if (!session->initialized) {
+        record_error(*session, "call onewasm_init or onewasm_init_profile first");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+    if (!format_utf8 || format_len == 0 || !out_result_json || !out_len) {
+        record_error(*session, "project export format and output pointers must not be empty");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+    clear_project_outputs(*session);
+    const std::string format(format_utf8, format_utf8 + format_len);
+    if (format != "project.3mf") {
+        record_error(*session, "unsupported OrcaSlicer project export format: " + format);
+        return ONEWASM_ERR_UNSUPPORTED;
+    }
+
+    ProjectExportOptions options;
+    std::string error;
+    if (!parse_project_export_options(options_json, options_len, options, error)) {
+        record_error(*session, error);
+        return ONEWASM_ERR_VALIDATION;
+    }
+    if (options.include_slice_artifacts) {
+        record_error(*session, "OrcaWasm project export does not yet write slice artifacts into native 3MF");
+        return ONEWASM_ERR_UNSUPPORTED;
+    }
+
+    ProjectOutputFailureGuard output_guard{*session};
+    nlohmann::json warnings = nlohmann::json::array();
+    nlohmann::json omitted_opaque_entries = nlohmann::json::array();
+    std::string package;
+    try {
+        const bool can_passthrough = !session->native_project_blob.empty()
+            && !session->native_project_dirty
+            && options.preservation != "portable";
+        if (can_passthrough) {
+            package.assign(
+                reinterpret_cast<const char*>(session->native_project_blob.data()),
+                session->native_project_blob.size()
+            );
+        } else {
+            if (!session->native_project_blob.empty()) {
+                std::vector<std::string> source_entries;
+                if (!list_project_zip_entries(*session, session->native_project_blob, source_entries, error)) {
+                    record_error(*session, error);
+                    return ONEWASM_ERR_INPUT_FORMAT;
+                }
+                // These are the entries emitted by the headless
+                // onewasm_write_3mf path. Do not classify every Metadata/*
+                // file as regenerated: plate artifacts, thumbnails, embedded
+                // presets, painting data, and custom per-layer data are not
+                // retained by this adapter and must be reported as opaque
+                // omissions under the 0.3 policy.
+                const std::set<std::string> regenerated_entries{
+                    "[Content_Types].xml",
+                    "_rels/.rels",
+                    "3D/3dmodel.model",
+                    "3D/_rels/3dmodel.model.rels",
+                    "Metadata/project_settings.config",
+                    "Metadata/model_settings.config",
+                    "Metadata/slice_info.config",
+                };
+                for (const std::string& entry : source_entries) {
+                    if (regenerated_entries.find(entry) != regenerated_entries.end())
+                        continue;
+                    omitted_opaque_entries.push_back(entry);
+                    warnings.push_back({
+                        {"code", "opaque-entry-omitted"},
+                        {"message", "native project entry was not regenerated: " + entry},
+                    });
+                }
+                if (options.preservation == "require" && !omitted_opaque_entries.empty()) {
+                    record_error(*session, "project export cannot satisfy preservation=require; native opaque entries would be omitted");
+                    return ONEWASM_ERR_UNSUPPORTED;
+                }
+            }
+
+            const std::string manifest_text = session->project_manifest.dump();
+            if (manifest_text.size() > UINT32_MAX || session->project_object_blob.size() > UINT32_MAX) {
+                record_error(*session, "project export input exceeds the C ABI length limit");
+                return ONEWASM_ERR_INPUT_FORMAT;
+            }
+            ProjectManifestInput manifest;
+            nlohmann::json normalized;
+            if (!parse_project_manifest(
+                    reinterpret_cast<const uint8_t*>(manifest_text.data()),
+                    static_cast<uint32_t>(manifest_text.size()),
+                    static_cast<uint32_t>(session->project_object_blob.size()),
+                    true,
+                    manifest,
+                    normalized,
+                    error
+                )) {
+                record_error(*session, error);
+                return ONEWASM_ERR_VALIDATION;
+            }
+            if (manifest.plate_ids.size() > 1) {
+                if (options.preservation == "require") {
+                    record_error(*session, "OrcaWasm portable project export cannot preserve multiple logical plates");
+                    return ONEWASM_ERR_UNSUPPORTED;
+                }
+                warnings.push_back({
+                    {"code", "logical-plates-flattened"},
+                    {"message", "portable OrcaSlicer 3MF export flattens logical plates into one build"},
+                });
+            }
+            if (options.preservation == "portable") {
+                warnings.push_back({
+                    {"code", "portable-export"},
+                    {"message", "export contains geometry and current OrcaSlicer configuration only"},
+                });
+            }
+
+            Slic3r::TriangleMesh mesh;
+            if (!build_project_export_mesh(*session, manifest, mesh, error)) {
+                record_error(*session, error);
+                return ONEWASM_ERR_UNSUPPORTED;
+            }
+            const std::string stl_path = "/tmp/ow-project-export-"
+                + std::to_string(session->id) + ".stl";
+            TempFileGuard stl_guard(stl_path);
+            if (!Slic3r::store_stl(stl_path.c_str(), &mesh, true)) {
+                record_error(*session, "OrcaSlicer could not serialize the project export mesh");
+                return ONEWASM_ERR_OUTPUT;
+            }
+            long stl_size = 0;
+            const char* read_error = nullptr;
+            bool out_of_memory = false;
+            char* stl_data = read_file_to_buffer(stl_path.c_str(), &stl_size, &read_error, &out_of_memory);
+            if (!stl_data) {
+                record_error(*session, std::string{"unable to read project export mesh: "}
+                    + (read_error ? read_error : "read failed"));
+                return out_of_memory ? ONEWASM_ERR_OUTPUT : ONEWASM_ERR_INPUT_IO;
+            }
+            uint8_t* exported_data = nullptr;
+            uint32_t exported_len = 0;
+            const auto export_status = onewasm_write_3mf(
+                reinterpret_cast<onewasm_session_t>(session),
+                reinterpret_cast<const uint8_t*>(stl_data),
+                static_cast<uint32_t>(stl_size),
+                &exported_data,
+                &exported_len
+            );
+            std::free(stl_data);
+            if (export_status != ONEWASM_OK) {
+                std::free(exported_data);
+                return export_status;
+            }
+            package.assign(reinterpret_cast<const char*>(exported_data), exported_len);
+            onewasm_free(exported_data);
+        }
+
+        if (package.empty() || package.size() > UINT32_MAX) {
+            record_error(*session, "project export produced an invalid or oversized package");
+            return ONEWASM_ERR_OUTPUT;
+        }
+        nlohmann::json result = {
+            {"schemaVersion", "0.3"},
+            {"asset", {
+                {"id", "project:export"},
+                {"kind", "project"},
+                {"mimeType", "model/3mf"},
+                {"byteLength", package.size()},
+            }},
+            {"warnings", std::move(warnings)},
+            {"omittedOpaqueEntries", std::move(omitted_opaque_entries)},
+        };
+        {
+            std::lock_guard<std::mutex> lock(session->control_mutex);
+            session->project_assets["project:export"] = std::move(package);
+        }
+        if (!set_project_output(result.dump(), out_result_json, out_len, session->last_error))
+            return ONEWASM_ERR_OUTPUT;
+        output_guard.committed = true;
+        return ONEWASM_OK;
+    } catch (const std::bad_alloc&) {
+        record_error(*session, "unable to retain the project export package");
+        return ONEWASM_ERR_OUTPUT;
+    } catch (const std::exception& exception) {
+        record_error(*session, std::string{"OrcaSlicer project export failed: "} + exception.what());
+        return ONEWASM_ERR_INTERNAL;
+    }
 }
 
 /**
