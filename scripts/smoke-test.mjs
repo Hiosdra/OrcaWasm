@@ -813,7 +813,11 @@ async function main() {
       try {
         if (!stableExportedProject) throw new Error('project export did not produce a 3MF package')
         const stl = read3mfOnce(module, stableExportedProject)
-        const expectedTris = stlTriangleCount(mesh.bytes)
+        // The project fixture deliberately contains one instance on each of
+        // two logical plates. project_export flattens those plates into one
+        // native build, and read_3mf returns the merged geometry of every
+        // exported build item.
+        const expectedTris = stlTriangleCount(mesh.bytes) * 2
         const actualTris = stlTriangleCount(stl)
         if (actualTris !== expectedTris) {
           throw new Error(`triangle count mismatch: expected ${expectedTris}, got ${actualTris}`)
