@@ -2,7 +2,7 @@
 /**
  * ST vs MT G-code equivalence check.
  *
- * Slices a fixed set of meshes through both engine variants — slicer.js
+ * Slices a fixed set of project manifests through both engine variants — slicer.js
  * (single-threaded, wasm/shims/ header stubs) and slicer-mt.js
  * (multithreaded, real oneTBB + Emscripten pthreads) — with identical
  * configs, and compares the resulting G-code. Real parallelism can reorder
@@ -22,8 +22,8 @@
  */
 
 import {
-  trianglesToStl, sphereStl, loadModule, writeBytes, decodeError,
-  initSession, sliceOnce, sliceMultiOnce,
+  trianglesToStl, sphereStl, loadModule, checkedMalloc, free, decodeError,
+  initSession, projectSetObjectsOnce, projectSliceOnce, projectGetAssetOnce,
 } from './lib/engine-harness.mjs'
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
@@ -38,8 +38,8 @@ function parseArgs(argv) {
 }
 
 // ── test meshes ──────────────────────────────────────────────────────────────
-// A fixed set of STLs (small cube, a >100k-triangle organic mesh, a
-// multi-object plate through onewasm_slice_stl_multi).
+// A fixed set of meshes (small cube, a >100k-triangle organic mesh, and a
+// multi-object project plate through the 0.3 project surface).
 // sphereStl()/trianglesToStl() live in ./lib/engine-harness.mjs.
 
 function cubeStl(sizeMm) {
@@ -68,6 +68,98 @@ const MESHES = {
 
 // ── engine harness ──────────────────────────────────────────────────────────
 // loadModule() + onewasm_* heap marshaling live in ./lib/engine-harness.mjs.
+
+function assertCapabilities(module, label) {
+  const outPtrPtr = checkedMalloc(module, 4, `${label} capability output pointer`)
+  const outLenPtr = checkedMalloc(module, 4, `${label} capability output length`)
+  try {
+    const rc = module._onewasm_get_capabilities(outPtrPtr, outLenPtr)
+    if (rc !== 0) throw new Error(`${label}: get_capabilities failed (${rc}): ${decodeError(module, 0)}`)
+    const ptr = module.getValue(outPtrPtr, 'i32')
+    const len = module.getValue(outLenPtr, 'i32')
+    try {
+      const capabilities = JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len)))
+      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.3.0') {
+        throw new Error(`${label}: artifact does not identify one-wasm-slicer-api 0.3.0`)
+      }
+      for (const feature of ['project.manifest', 'project.slice', 'project.slice.multiPlate', 'project.slice.assets']) {
+        if (capabilities.features?.[feature] !== 'supported') {
+          throw new Error(`${label}: capability ${feature} is not supported`)
+        }
+      }
+      return capabilities
+    } finally {
+      module._onewasm_free(ptr)
+    }
+  } finally {
+    free(module, outLenPtr)
+    free(module, outPtrPtr)
+  }
+}
+
+function projectMatrix(tx, ty) {
+  return [
+    1, 0, 0, tx,
+    0, 1, 0, ty,
+    0, 0, 1, 0,
+    0, 0, 0, 1,
+  ]
+}
+
+function projectForMeshes(meshes) {
+  const blobLength = meshes.reduce((sum, mesh) => sum + mesh.length, 0)
+  const blob = new Uint8Array(blobLength)
+  const manifestMeshes = []
+  const objects = []
+  const instances = []
+  let offset = 0
+  meshes.forEach((mesh, index) => {
+    blob.set(mesh, offset)
+    manifestMeshes.push({
+      id: `mesh-${index}`,
+      format: 'stl',
+      dataRange: { offset, length: mesh.length },
+    })
+    objects.push({ id: `object-${index}`, meshId: `mesh-${index}`, extruderId: 0 })
+    instances.push({
+      id: `instance-${index}`,
+      objectId: `object-${index}`,
+      plateId: 'plate-0',
+      transform: { matrix: projectMatrix(100 + index * 45, 100) },
+    })
+    offset += mesh.length
+  })
+  return {
+    blob,
+    manifest: {
+      schemaVersion: '0.3',
+      plates: [{ id: 'plate-0', label: 'Comparison plate', index: 0 }],
+      meshes: manifestMeshes,
+      objects,
+      instances,
+    },
+  }
+}
+
+function projectSliceGcode(module, session, meshes) {
+  const project = projectForMeshes(meshes)
+  projectSetObjectsOnce(module, session, project.blob, project.manifest)
+  const result = projectSliceOnce(module, session, {
+    schemaVersion: '0.3',
+    plateSelection: 'all',
+    includeGcode: true,
+    includeStatistics: true,
+  })
+  if (result?.schemaVersion !== '0.3' || result.plateResults?.length !== 1) {
+    throw new Error('project_slice returned an unexpected 0.3 result')
+  }
+  const plate = result.plateResults[0]
+  const asset = plate.assets?.find((entry) => entry.kind === 'gcode')
+  if (!asset || asset.id !== 'gcode:plate-0' || plate.statistics?.schemaVersion !== '0.3') {
+    throw new Error('project_slice did not return the expected G-code/statistics assets')
+  }
+  return new TextDecoder().decode(projectGetAssetOnce(module, session, asset.id))
+}
 
 function layerCount(gcode) {
   const m = gcode.match(/;\s*total layers count\s*=\s*(\d+)/i)
@@ -169,20 +261,51 @@ async function main() {
   const mt = await loadModule(wasmDir, 'slicer-mt')
   console.log('[compare-st-mt] both engines loaded')
 
+  const stCapabilities = assertCapabilities(st, 'st')
+  const mtCapabilities = assertCapabilities(mt, 'mt')
+  console.log(`[compare-st-mt] API 0.3: ${stCapabilities.engine?.family ?? 'unknown'} / ${mtCapabilities.engine?.family ?? 'unknown'}`)
+
   const stSession = st._onewasm_session_create()
   const mtSession = mt._onewasm_session_create()
   if (!stSession || !mtSession) throw new Error('onewasm_session_create failed (allocation failure)')
 
   let failures = 0
+  try {
+    if (st._onewasm_cancel(stSession) !== 0 || mt._onewasm_cancel(mtSession) !== 0) {
+      throw new Error('idle onewasm_cancel was not a no-op')
+    }
 
-  for (const [label, makeStl] of Object.entries(MESHES)) {
-    const stlBytes = makeStl()
-    process.stdout.write(`[compare-st-mt] ${label} (${stlBytes.length} bytes) ... `)
+    for (const [label, makeStl] of Object.entries(MESHES)) {
+      const stlBytes = makeStl()
+      process.stdout.write(`[compare-st-mt] ${label} via project_slice (${stlBytes.length} bytes) ... `)
+      try {
+        initSession(st, stSession, JSON.stringify(BASE_CONFIG))
+        initSession(mt, mtSession, JSON.stringify(BASE_CONFIG))
+        const stGcode = projectSliceGcode(st, stSession, [stlBytes])
+        const mtGcode = projectSliceGcode(mt, mtSession, [stlBytes])
+        const result = compareGcode(stGcode, mtGcode, tolerance)
+        if (typeof result === 'string') {
+          failures++
+          console.log('FAIL')
+          console.error(`  ${result}`)
+        } else {
+          console.log(`PASS (${result.layers} layers, ${result.moves} moves, max delta ${result.maxDelta.toFixed(5)}mm)`)
+        }
+      } catch (err) {
+        failures++
+        console.log('FAIL')
+        console.error(`  ${err.message}`)
+      }
+    }
+
+    const cube = cubeStl(20)
+    const plateLabel = 'plate: 2x small cube via project_slice'
+    process.stdout.write(`[compare-st-mt] ${plateLabel} ... `)
     try {
       initSession(st, stSession, JSON.stringify(BASE_CONFIG))
       initSession(mt, mtSession, JSON.stringify(BASE_CONFIG))
-      const stGcode = sliceOnce(st, stSession, stlBytes)
-      const mtGcode = sliceOnce(mt, mtSession, stlBytes)
+      const stGcode = projectSliceGcode(st, stSession, [cube, cube])
+      const mtGcode = projectSliceGcode(mt, mtSession, [cube, cube])
       const result = compareGcode(stGcode, mtGcode, tolerance)
       if (typeof result === 'string') {
         failures++
@@ -196,33 +319,10 @@ async function main() {
       console.log('FAIL')
       console.error(`  ${err.message}`)
     }
+  } finally {
+    st._onewasm_session_destroy(stSession)
+    mt._onewasm_session_destroy(mtSession)
   }
-
-  // Multi-object plate through onewasm_slice_stl_multi (Phase 4 item 1's third case).
-  const plateLabel = 'plate: 2x small cube via onewasm_slice_stl_multi'
-  process.stdout.write(`[compare-st-mt] ${plateLabel} ... `)
-  try {
-    const cube = cubeStl(20)
-    initSession(st, stSession, JSON.stringify(BASE_CONFIG))
-    initSession(mt, mtSession, JSON.stringify(BASE_CONFIG))
-    const stGcode = sliceMultiOnce(st, stSession, [cube, cube])
-    const mtGcode = sliceMultiOnce(mt, mtSession, [cube, cube])
-    const result = compareGcode(stGcode, mtGcode, tolerance)
-    if (typeof result === 'string') {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${result}`)
-    } else {
-      console.log(`PASS (${result.layers} layers, ${result.moves} moves, max delta ${result.maxDelta.toFixed(5)}mm)`)
-    }
-  } catch (err) {
-    failures++
-    console.log('FAIL')
-    console.error(`  ${err.message}`)
-  }
-
-  st._onewasm_session_destroy(stSession)
-  mt._onewasm_session_destroy(mtSession)
 
   if (failures > 0) {
     console.error(`\n[compare-st-mt] ${failures} scenario(s) diverged`)

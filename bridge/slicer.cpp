@@ -2,28 +2,23 @@
  * orca-wasm WASM bridge — clean-room implementation.
  *
  * Exports C-linkage symbols consumed by the JavaScript runtime:
- *   onewasm_session_create()                                      → opaque session handle (0 = alloc failed)
- *   onewasm_session_destroy(session)
- *   onewasm_init(session, config, len)                             → 0 = ok
- *   onewasm_slice_stl(session, stl, stlLen, outPtr, outLen)        → 0 = ok
- *   onewasm_slice_stl_multi(session, all, allLen, offsets, n,
- *                           extruderIds, transforms, out, outLen)  → 0 = ok
- *   onewasm_prepare_plate(session, all, allLen, offsets, n,
- *                         transforms, operation, out, outLen)     → 0 = ok
- *   onewasm_obj_to_stl(obj, objLen, outPtr, outLen)                → 0 = ok
- *   onewasm_cad_to_stl(cad, cadLen, outPtr, outLen)                → 0 = ok (STEP)
- *   onewasm_write_3mf(session, stl, stlLen, outPtr, outLen)        → 0 = ok
- *   onewasm_read_3mf(mf, mfLen, outStl, outStlLen)                 → 0 = ok
- *   onewasm_get_capabilities(outJson, outLen)
- *   onewasm_get_last_statistics(session, outJson, outLen)
+ *   onewasm_session_create/destroy(session)
+ *   onewasm_init/init_profile(session, native payload)
+ *   onewasm_set_progress_callback(session, callback, userData)
  *   onewasm_cancel(session)
+ *   onewasm_project_set_objects/get_manifest(session, project)
+ *   onewasm_project_prepare/slice/get_asset(session, request)
+ *   onewasm_project_export(session, native format, options)
+ *   onewasm_obj_to_stl / onewasm_cad_to_stl(input, output)
+ *   onewasm_read_3mf(input, output)                                → engine-specific geometry helper
+ *   onewasm_get_capabilities(outJson, outLen)
  *   onewasm_free(ptr)
  *   onewasm_last_error(session)                                   → null-terminated UTF-8 string
  *
  * onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_read_3mf are pure format conversions
  * — they never touch slicer config state, so they take no session handle.
  *
- * Error codes for the session-bound operations follow one-wasm-slicer-api 0.2:
+ * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.3:
  *   -1  invalid / uninitialized state (includes a null/invalid session handle)
  *   -2  JSON parse failure
  *   -3  STL write to MEMFS failed
@@ -31,7 +26,7 @@
  *   -5  empty model
  *   -6  print validation failed
  *   -7  slicing error
- *   -8  gcode export failed (or, for onewasm_write_3mf, 3MF export failed)
+ *   -8  output export failed
  *   -9  unexpected C++ exception
  *   -11 active operation was cancelled
  *   -12 no optional result is available
@@ -42,6 +37,7 @@
  */
 
 #include "onewasm_slicer_api.h"
+#include "onewasm_slicer_legacy.h"
 
 #include <algorithm>
 #include <array>
@@ -139,12 +135,12 @@ struct OrcSession {
     // Opt-in override of the engine's mixed-nozzle-temperature guard, matching
     // desktop OrcaSlicer's "Remove mixed temperature restriction" preference.
     // Off by default (the guard exists to prevent nozzle clogging / damage);
-    // when set, onewasm_slice_stl / onewasm_slice_stl_multi call
+    // when set, the private legacy slice adapters call
     // Print::set_check_multi_filaments_compatibility(false) before validate().
     // See issue #164.
     bool remove_mixed_temp_restriction = false;
     // Variable (adaptive) layer height, matching desktop OrcaSlicer's Adaptive
-    // tool: when on, onewasm_slice_stl / onewasm_slice_stl_multi compute a per-object layer
+    // tool: when on, the private legacy slice adapters compute a per-object layer
     // height profile from the mesh geometry (layer_height_profile_adaptive)
     // before slicing, so detailed regions get thinner layers and flat regions
     // thicker ones. Off by default (a fixed layer height is the engine default
@@ -768,7 +764,7 @@ struct Loaded3mfResourcesGuard {
 // still pick their own record_error() overload (session-aware vs. the
 // conversion-functions' shared slot) and error code, since those differ
 // per call site — this only owns the mechanical fopen/fseek/malloc/fread
-// sequence that onewasm_write_3mf and onewasm_read_3mf both need to read back the
+// sequence that the private legacy 3MF writer and the geometry reader both need to read back the
 // file they just asked OrcaSlicer to produce.
 static char* read_file_to_buffer(const char* path, long* out_len, const char** out_err, bool* out_oom) {
     *out_oom = false;
@@ -2589,11 +2585,12 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
     constexpr const char* requires_sab = "false";
 #endif
     const std::string json = std::string(R"({
-  "api":{"name":"one-wasm-slicer-api","version":"0.2.0"},
+  "api":{"name":"one-wasm-slicer-api","version":"0.3.0"},
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"]},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","slice.stl.single":"supported","slice.stl.multi":"supported","slice.transforms":"supported","plate.autoOrient":"supported","plate.arrange":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.3mf.read":"supported","format.3mf.write":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.statistics":"supported","runtime.errors":"supported","runtime.memory":"supported"}
+  "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"unsupported"},
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","project.manifest":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported","runtime.memory":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
@@ -2610,8 +2607,7 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
     return ONEWASM_OK;
 }
 
-EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_get_last_statistics(
+static onewasm_status_t legacy_get_last_statistics(
     onewasm_session_t session_ptr,
     uint8_t** out_json,
     uint32_t* out_len
@@ -2811,7 +2807,7 @@ onewasm_status_t onewasm_project_prepare(
 
             uint8_t* prepared_data = nullptr;
             uint32_t prepared_len = 0;
-            const auto status = onewasm_prepare_plate(
+            const auto status = legacy_prepare_plate(
                 session_ptr, blob.data(), static_cast<std::uint32_t>(blob.size()),
                 offsets.data(), static_cast<std::uint32_t>(manifest_indices.size()),
                 transforms.data(), operation, &prepared_data, &prepared_len);
@@ -2998,7 +2994,7 @@ onewasm_status_t onewasm_project_slice(
             if (request.include_statistics) {
                 uint8_t* statistics_data = nullptr;
                 uint32_t statistics_len = 0;
-                const auto statistics_status = onewasm_get_last_statistics(
+                const auto statistics_status = legacy_get_last_statistics(
                     session_ptr, &statistics_data, &statistics_len);
                 if (statistics_status != ONEWASM_OK) {
                     std::free(statistics_data);
@@ -3145,7 +3141,7 @@ onewasm_status_t onewasm_project_export(
                     return ONEWASM_ERR_INPUT_FORMAT;
                 }
                 // These are the entries emitted by the headless
-                // onewasm_write_3mf path. Do not classify every Metadata/*
+                // private 3MF writer path. Do not classify every Metadata/*
                 // file as regenerated: plate artifacts, thumbnails, embedded
                 // presets, painting data, and custom per-layer data are not
                 // retained by this adapter and must be reported as opaque
@@ -3233,7 +3229,7 @@ onewasm_status_t onewasm_project_export(
             }
             uint8_t* exported_data = nullptr;
             uint32_t exported_len = 0;
-            const auto export_status = onewasm_write_3mf(
+            const auto export_status = legacy_write_3mf(
                 reinterpret_cast<onewasm_session_t>(session),
                 reinterpret_cast<const uint8_t*>(stl_data),
                 static_cast<uint32_t>(stl_size),
@@ -3287,8 +3283,7 @@ onewasm_status_t onewasm_project_export(
  * and *out_len contains its byte length (excluding the null terminator).
  * Caller must free the buffer with onewasm_free().
  */
-EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_slice_stl(
+static onewasm_status_t legacy_slice_stl(
     onewasm_session_t session_ptr,
     const uint8_t* stl_data,
     uint32_t stl_len,
@@ -3449,8 +3444,7 @@ onewasm_status_t onewasm_slice_stl(
  * means identity transforms. In the arrange operation finite input offsets
  * are pinned and NaN offsets remain movable.
  */
-EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_prepare_plate(
+static onewasm_status_t legacy_prepare_plate(
     onewasm_session_t session_ptr,
     const uint8_t* all_stl, uint32_t all_stl_len,
     const uint32_t* offsets, uint32_t n_files,
@@ -3675,10 +3669,9 @@ onewasm_status_t onewasm_obj_to_stl(
  *              rotation xyz (radians), mirror xyz, and X/Y offset in mm
  *              relative to bed centre. NaN X/Y delegates placement to arrange.
  *
- * Error codes: same convention as onewasm_slice_stl.
+ * Internal adapter used by the 0.3 project implementation.
  */
-EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_slice_stl_multi(
+static onewasm_status_t legacy_slice_stl_multi(
     onewasm_session_t session_ptr,
     const uint8_t* all_stl, uint32_t all_stl_len,
     const uint32_t* offsets, uint32_t n_files,
@@ -3839,11 +3832,11 @@ onewasm_status_t onewasm_slice_stl_multi(
         print.apply(model, session->config);
         zero_plate_origin(print);
         set_is_bbl_printer(print, session->config);
-        // See onewasm_slice_stl: opt-in override of the mixed-nozzle-temperature guard
+        // See the private single-object adapter: opt-in override of the mixed-nozzle-temperature guard
         // for single-nozzle multi-material plates (issue #164).
         if (session->remove_mixed_temp_restriction)
             print.set_check_multi_filaments_compatibility(false);
-        // Variable (adaptive) layer height (issue #138); see onewasm_slice_stl. With a
+        // Variable (adaptive) layer height (issue #138); see the private single-object adapter. With a
         // multi-object plate the engine requires all objects share the same
         // layering when a prime tower is on (Print::validate), so an adaptive
         // multi-material plate with a tower surfaces that as a -6 validation
@@ -3854,7 +3847,7 @@ onewasm_status_t onewasm_slice_stl_multi(
 
         {
             // `warning` absorbs the non-fatal mixed-temperature notice when the
-            // guard above is off; see onewasm_slice_stl for why the pointer is required.
+            // guard above is off; see the private single-object adapter for why the pointer is required.
             Slic3r::StringObjectException warning;
             Slic3r::StringObjectException err = print.validate(&warning);
             if (!err.string.empty()) { record_error(*session, err.string); return -6; }
@@ -4063,11 +4056,10 @@ onewasm_status_t onewasm_cad_to_stl(
  * length, never a NUL-terminated string read). Caller must free with
  * onewasm_free().
  *
- * Error codes: same convention as onewasm_slice_stl, with -8 meaning the 3MF export
+ * Internal adapter used by the 0.3 project implementation; -8 means the 3MF export
  * itself (store_bbs_3mf) failed rather than gcode export.
  */
-EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_write_3mf(
+static onewasm_status_t legacy_write_3mf(
     onewasm_session_t session_ptr,
     const uint8_t* stl_data,
     uint32_t stl_len,
@@ -4111,7 +4103,7 @@ onewasm_status_t onewasm_write_3mf(
             return -5;
         }
 
-        // Same placement convention as onewasm_slice_stl, so the mesh lands back in
+        // Same placement convention as the private single-object adapter, so the mesh lands back in
         // the same spot on re-import instead of at the model-space origin.
         for (auto* obj : model.objects) {
             center_object_xy_only(obj);
@@ -4228,7 +4220,7 @@ onewasm_status_t onewasm_read_3mf(
         // Constructed before load_bbs_3mf() runs, so its destructor (the
         // get_backup_path()/"Auxiliaries" dir cleanup that call lazily
         // triggers) still fires even if load_bbs_3mf throws instead of
-        // returning false — same rationale as onewasm_write_3mf's backup_guard.
+        // returning false — same rationale as the private 3MF writer's backup_guard.
         ModelBackupPathGuard backup_guard(model);
         Slic3r::DynamicPrintConfig config;
         // EnableSilent: substitute unknown/incompatible option values with
@@ -4304,7 +4296,7 @@ onewasm_status_t onewasm_read_3mf(
     }
 }
 
-/** Free a buffer returned by onewasm_slice_stl, onewasm_slice_stl_multi, onewasm_obj_to_stl, onewasm_cad_to_stl, onewasm_write_3mf, or onewasm_read_3mf. */
+/** Free a buffer returned by a bridge output operation. */
 EMSCRIPTEN_KEEPALIVE
 void onewasm_free(void* ptr) {
     std::free(ptr);
@@ -4315,7 +4307,7 @@ void onewasm_free(void* ptr) {
  * The pointer is valid until the next onewasm_* call on the same session (or,
  * for a null session, the next onewasm_obj_to_stl / onewasm_cad_to_stl call).
  *
- * Pass the session used for the failing onewasm_init / onewasm_slice_stl / onewasm_slice_stl_multi
+ * Pass the session used for the failing session-bound operation
  * call. Pass 0/null after a failing onewasm_obj_to_stl / onewasm_cad_to_stl call
  * (those take no session) — this is also why the parameter used to be
  * documented as "unused" and JS always passed literal 0: that call pattern

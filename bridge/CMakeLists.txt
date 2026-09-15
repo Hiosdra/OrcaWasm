@@ -37,7 +37,7 @@ target_compile_definitions(orca_web_bridge PUBLIC
 
 # Set (via -DSLIC3R_WASM_MT=ON on the cmake command line) for the
 # multithreaded build variant. Flips the one threading-aware line in
-# slicer.cpp's onewasm_slice_stl_multi (auto-arrange); everything else is
+# slicer.cpp's private legacy multi-object adapter (auto-arrange); everything else is
 # unaffected — real parallelism lives entirely inside libslic3r via the real
 # oneTBB library selected through _SHIM_DIR/FindTBB.cmake above (built from
 # source in CI).

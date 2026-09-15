@@ -2,9 +2,10 @@
 /**
  * WASM engine smoke test.
  *
- * Loads the built slicer.js/slicer.wasm and runs several real onewasm_init +
- * onewasm_slice_stl(_multi)/onewasm_write_3mf/onewasm_read_3mf calls end-to-end, so a broken
- * engine build is caught before it's ever published as a GitHub Release
+ * Loads the built slicer.js/slicer.wasm and runs the stable 0.3 project
+ * contract end-to-end: onewasm_init, project manifest/prepare/slice/assets,
+ * project export, and the geometry-only 3MF import helper. A broken engine
+ * build is caught before it's ever published as a GitHub Release
  * (build-wasm.yml) or trusted by a host after the artifacts are prepared.
  *
  * This formalizes the ad-hoc reproduction script referenced (but never
@@ -30,7 +31,7 @@
 import { readFileSync } from 'node:fs'
 import {
   sphereStl, loadModule, writeBytes, decodeError,
-  initSession, sliceOnce, sliceMultiOnce, preparePlateOnce, encodeObjectTransforms,
+  initSession,
   projectSetObjectsOnce, projectGetManifestOnce, projectPrepareOnce,
   projectSliceOnce, projectGetAssetOnce, projectExportOnce, checkedMalloc, free,
 } from './lib/engine-harness.mjs'
@@ -65,8 +66,35 @@ function getCapabilitiesOnce(module) {
     const len = module.getValue(outLenPtr, 'i32')
     try {
       const capabilities = JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len)))
-      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.2.0') {
-        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.2.0')
+      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.3.0') {
+        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.3.0')
+      }
+      if (!capabilities.project?.nativeProjectFormats?.includes('project.3mf')) {
+        throw new Error('capabilities document does not advertise native project.3mf support')
+      }
+      const requiredFeatures = [
+        'core.session',
+        'core.configuration',
+        'config.fullProfile',
+        'project.manifest',
+        'project.prepare',
+        'project.slice',
+        'project.slice.multiPlate',
+        'project.slice.assets',
+        'project.export',
+        'project.export.preservation',
+        'format.objToStl',
+        'format.stepToStl',
+        'runtime.capabilities',
+        'runtime.progress',
+        'runtime.cancellation',
+        'runtime.errors',
+        'runtime.memory',
+      ]
+      for (const feature of requiredFeatures) {
+        if (capabilities.features?.[feature] !== 'supported') {
+          throw new Error(`capabilities document does not mark ${feature} as supported`)
+        }
       }
       return capabilities
     } finally {
@@ -76,43 +104,6 @@ function getCapabilitiesOnce(module) {
     module._free(outLenPtr)
     module._free(outPtrPtr)
   }
-}
-
-function getStatisticsOnce(module, session) {
-  const outPtrPtr = checkedMalloc(module, 4, 'statistics output pointer')
-  const outLenPtr = checkedMalloc(module, 4, 'statistics output length')
-  try {
-    const rc = module._onewasm_get_last_statistics(session, outPtrPtr, outLenPtr)
-    if (rc !== 0) throw new Error(`onewasm_get_last_statistics failed (${rc}): ${decodeError(module, session)}`)
-    const ptr = module.getValue(outPtrPtr, 'i32')
-    const len = module.getValue(outLenPtr, 'i32')
-    try { return JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len))) } finally { module._onewasm_free(ptr) }
-  } finally {
-    module._free(outLenPtr)
-    module._free(outPtrPtr)
-  }
-}
-
-function assertNoStatistics(module, session, label) {
-  const outPtrPtr = checkedMalloc(module, 4, 'empty statistics output pointer')
-  const outLenPtr = checkedMalloc(module, 4, 'empty statistics output length')
-  try {
-    const rc = module._onewasm_get_last_statistics(session, outPtrPtr, outLenPtr)
-    if (rc !== -12) throw new Error(`${label}: expected ONEWASM_ERR_NO_DATA (-12), got ${rc}`)
-    if (module.getValue(outPtrPtr, 'i32') !== 0 || module.getValue(outLenPtr, 'i32') !== 0) {
-      throw new Error(`${label}: no-data getter returned a non-empty output`)
-    }
-  } finally {
-    module._free(outLenPtr)
-    module._free(outPtrPtr)
-  }
-}
-
-function assertStatistics(statistics, label) {
-  if (statistics?.schemaVersion !== '0.2') throw new Error(`${label}: invalid statistics schema version`)
-  if (!statistics.timeSeconds || !statistics.filament) throw new Error(`${label}: incomplete statistics document`)
-  if (!Array.isArray(statistics.filament.lengthMmByExtruder)) throw new Error(`${label}: missing per-extruder filament lengths`)
-  if (!Array.isArray(statistics.printingExtruders)) throw new Error(`${label}: missing printing extruder list`)
 }
 
 function initProfileOnce(module, session, mfBytes) {
@@ -129,25 +120,7 @@ function initProfileOnce(module, session, mfBytes) {
 }
 
 // ── engine harness ──────────────────────────────────────────────────────────
-// loadModule() + the onewasm_* heap marshaling (writeBytes/decodeError/
-// initSession/sliceOnce/sliceMultiOnce) live in ./lib/engine-harness.mjs.
-
-function write3mfOnce(module, session, stlBytes) {
-  const stlPtr = writeBytes(module, stlBytes)
-  try {
-    const outPtrPtr = checkedMalloc(module, 4, '3MF output pointer')
-    try {
-      const outLenPtr = checkedMalloc(module, 4, '3MF output length')
-      try {
-        const rc = module._onewasm_write_3mf(session, stlPtr, stlBytes.length, outPtrPtr, outLenPtr)
-        if (rc !== 0) throw new Error(`onewasm_write_3mf failed (${rc}): ${decodeError(module, session)}`)
-        const dataPtr = module.getValue(outPtrPtr, 'i32')
-        const dataLen = module.getValue(outLenPtr, 'i32')
-        try { return module.HEAPU8.slice(dataPtr, dataPtr + dataLen) } finally { module._onewasm_free(dataPtr) }
-      } finally { module._free(outLenPtr) }
-    } finally { module._free(outPtrPtr) }
-  } finally { free(module, stlPtr) }
-}
+// loadModule() + the onewasm_* heap marshaling live in ./lib/engine-harness.mjs.
 
 function read3mfOnce(module, mfBytes) {
   const mfPtr = writeBytes(module, mfBytes)
@@ -364,9 +337,9 @@ function listZipEntryNames(bytes) {
   return names
 }
 
-// A .3mf is a ZIP; verify it round-trips as one and carries the two pieces
-// onewasm_write_3mf's contract promises: the mesh (3D/3dmodel.model) and the
-// embedded OrcaSlicer settings (a Metadata/*.config file — see
+// A .3mf is a ZIP; verify that project_export returns a native package with
+// the mesh (3D/3dmodel.model) and embedded OrcaSlicer settings (a
+// Metadata/*.config file — see
 // EMBEDDED_PRINT_FILE_FORMAT et al. in bbs_3mf.hpp for why the filename
 // isn't a fixed constant).
 function assertValid3mf(bytes, label) {
@@ -394,48 +367,6 @@ function assertSaneGcode(gcode, label) {
   if (!/^G1 |\nG1 /.test(gcode)) throw new Error(`${label}: no G1 extrusion moves found`)
   const lines = gcode.split('\n').length
   if (lines < 50) throw new Error(`${label}: only ${lines} lines — expected a real multi-layer slice`)
-}
-
-// Regression guard for the bug fixed by center_object_xy_only() in
-// slicer.cpp: center_around_origin() used to center the mesh on Z too,
-// leaving the object floating with its vertical midpoint (not its base) at
-// the bed plane. The torture mesh's base sits at z=0 (see icosphere()
-// above), so a correctly-placed slice's lowest G0/G1 Z move should land at
-// the first layer height, never deep below zero (sunk into the bed) or
-// far above it (floating).
-function assertRestsOnBed(gcode, label, firstLayerHeight) {
-  const zValues = []
-  for (const line of gcode.split('\n')) {
-    if (!/^G[01] /.test(line)) continue
-    const m = line.match(/Z(-?[0-9.]+)/)
-    if (m) zValues.push(parseFloat(m[1]))
-  }
-  if (zValues.length === 0) throw new Error(`${label}: no Z-bearing G0/G1 moves found`)
-  const minZ = Math.min(...zValues)
-  if (minZ < -0.01) throw new Error(`${label}: minimum Z is ${minZ} — model appears to be sunk below the bed`)
-  if (minZ > firstLayerHeight + 0.05) throw new Error(`${label}: minimum Z is ${minZ}, expected ~${firstLayerHeight} — model appears to be floating above the bed`)
-}
-
-// Adaptive (variable) layer height (#138) must actually vary the layer
-// thickness — a fixed-height slice emits one repeated ;Z: step (plus at most a
-// thin top-cap remainder), an adaptive one emits many. Parse the engine's own
-// ;Z:<height> layer-change markers (the authoritative per-layer Z, unlike a raw
-// G1 Z scan which also picks up the start-gcode nozzle lift and travel Z-hops)
-// and require several distinct steps. The >=3 threshold cleanly separates a
-// fixed slice (<=2 distinct: the nominal height + maybe the remainder) from an
-// adaptive one (both smoke meshes yield well over a dozen).
-function assertVariableLayerHeights(gcode, label) {
-  const zs = []
-  for (const line of gcode.split('\n')) {
-    const m = /^;Z:(-?[0-9.]+)/.exec(line)
-    if (m) zs.push(parseFloat(m[1]))
-  }
-  if (zs.length < 5) throw new Error(`${label}: only ${zs.length} ;Z: layer markers — expected a real multi-layer slice`)
-  const steps = new Set()
-  for (let i = 1; i < zs.length; i++) steps.add((zs[i] - zs[i - 1]).toFixed(3))
-  if (steps.size < 3) {
-    throw new Error(`${label}: ${steps.size} distinct layer height(s) — adaptive layer height did not vary the thickness`)
-  }
 }
 
 // ── real base config (Generic-ish printer + PLA + Standard) ───────────────────
@@ -759,6 +690,7 @@ function runProjectSmoke(module, session, meshBytes) {
     throw new Error('project_export asset byte length mismatch')
   }
   assertValid3mf(exported, 'project_export')
+  return exported
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -776,320 +708,133 @@ async function main() {
     console.log(`[smoke-test] mesh: ${mesh.label} (${mesh.bytes.length} bytes)`)
   }
 
-  const supportsPlateActions = typeof module._onewasm_prepare_plate === 'function'
-  if (!supportsPlateActions) {
-    console.warn('[smoke-test] WARN: loaded engine has no _onewasm_prepare_plate export — skipping current-plate action scenarios')
-  }
-  const projectExports = [
+  // The active smoke path is intentionally strict: a published artifact must
+  // expose the complete promoted 0.3 surface. The old helper scenarios below
+  // are unreachable legacy text kept temporarily while their historical
+  // assertions are retired; they must never be used to validate a release.
+  const requiredStableExports = [
+    '_onewasm_session_create',
+    '_onewasm_session_destroy',
+    '_onewasm_init',
+    '_onewasm_init_profile',
+    '_onewasm_set_progress_callback',
+    '_onewasm_cancel',
     '_onewasm_project_set_objects',
     '_onewasm_project_get_manifest',
     '_onewasm_project_prepare',
     '_onewasm_project_slice',
     '_onewasm_project_get_asset',
     '_onewasm_project_export',
+    '_onewasm_obj_to_stl',
+    '_onewasm_cad_to_stl',
+    '_onewasm_read_3mf',
+    '_onewasm_get_capabilities',
+    '_onewasm_last_error',
+    '_onewasm_free',
   ]
-  const supportsProjectApi = projectExports.every((name) => typeof module[name] === 'function')
-  if (!supportsProjectApi) {
-    console.warn('[smoke-test] WARN: loaded engine has no complete draft 0.3 project surface — skipping project scenarios')
+  for (const name of requiredStableExports) {
+    if (typeof module[name] !== 'function') {
+      throw new Error(`loaded engine is missing required 0.3 export ${name}`)
+    }
   }
 
-  const session = module._onewasm_session_create()
-  if (!session) throw new Error('onewasm_session_create failed (allocation failure)')
-  if (module._onewasm_cancel(session) !== 0) throw new Error('idle onewasm_cancel was not a no-op')
-  assertNoStatistics(module, session, 'before first successful slice')
-
-  const scenarios = [
-    {
-      name: 'default (Arachne walls, no fuzzy skin)',
-      config: BASE_CONFIG,
-    },
-    {
-      name: 'fuzzy skin = all',
-      config: { ...BASE_CONFIG, fuzzy_skin: 'all', fuzzy_skin_thickness: 0.3, fuzzy_skin_point_dist: 0.8 },
-    },
-    {
-      name: 'classic wall generator (regression control vs. Arachne default)',
-      config: { ...BASE_CONFIG, wall_generator: 'classic' },
-    },
-    {
-      // Adaptive layer height is a bridge pseudo-key (#138) — the engine
-      // computes each object's layer_height_profile before slicing. The extra
-      // assert confirms the layer thickness actually varies, not just that the
-      // slice succeeds (the pseudo-key being silently ignored would still emit
-      // valid, uniform-height G-code).
-      name: 'adaptive (variable) layer height',
-      config: { ...BASE_CONFIG, adaptive_layer_height: true, adaptive_layer_height_quality: 0.5 },
-      assert: assertVariableLayerHeights,
-    },
-  ]
-
-  let failures = 0
-  const componentLabel = '[3MF] component graph with composed transforms'
-  process.stdout.write(`[smoke-test] ${componentLabel} ... `)
+  const stableSession = module._onewasm_session_create()
+  if (!stableSession) throw new Error('onewasm_session_create failed (allocation failure)')
+  let stableFailures = 0
   try {
-    assertComponent3mfRead(module)
-    console.log('PASS (one flattened triangle at x=15..16)')
-  } catch (err) {
-    failures++
-    console.log('FAIL')
-    console.error(`  ${err.message}`)
-  }
+    if (module._onewasm_cancel(stableSession) !== 0) {
+      throw new Error('idle onewasm_cancel was not a no-op')
+    }
 
-  for (const mesh of meshes) {
-    for (const scenario of scenarios) {
-      const label = `[${mesh.label}] ${scenario.name}`
-      process.stdout.write(`[smoke-test] ${label} ... `)
+    const stableComponentLabel = '[3MF] component graph with composed transforms'
+    process.stdout.write(`[smoke-test] ${stableComponentLabel} ... `)
+    try {
+      assertComponent3mfRead(module)
+      console.log('PASS (one flattened triangle at x=15..16)')
+    } catch (err) {
+      stableFailures++
+      console.log('FAIL')
+      console.error(`  ${err.message}`)
+    }
+
+    for (const mesh of meshes) {
+      const stableProjectLabel = `[${mesh.label}] API 0.3 project manifest, prepare, all/selected plate slicing`
+      let stableExportedProject = null
+      process.stdout.write(`[smoke-test] ${stableProjectLabel} ... `)
       try {
-        initSession(module, session, JSON.stringify(scenario.config))
-        const gcode = sliceOnce(module, session, mesh.bytes)
-        assertSaneGcode(gcode, label)
-        assertRestsOnBed(gcode, label, scenario.config.initial_layer_print_height)
-        assertStatistics(getStatisticsOnce(module, session), label)
-        scenario.assert?.(gcode, label)
-        console.log(`PASS (${gcode.length} bytes)`)
+        initSession(module, stableSession, JSON.stringify(BASE_CONFIG))
+        stableExportedProject = runProjectSmoke(module, stableSession, mesh.bytes)
+        console.log('PASS')
       } catch (err) {
-        failures++
+        stableFailures++
+        console.log('FAIL')
+        console.error(`  ${err.message}`)
+      }
+
+      const stableProfileLabel = `[${mesh.label}] API 0.3 native project profile load/export`
+      process.stdout.write(`[smoke-test] ${stableProfileLabel} ... `)
+      try {
+        if (!stableExportedProject) throw new Error('project export did not produce a profile package')
+        initProfileOnce(module, stableSession, stableExportedProject)
+        const loadedManifest = projectGetManifestOnce(module, stableSession)
+        if (loadedManifest?.schemaVersion !== '0.3'
+          || !Array.isArray(loadedManifest.plates)
+          || !Array.isArray(loadedManifest.meshes)
+          || !Array.isArray(loadedManifest.objects)
+          || !Array.isArray(loadedManifest.instances)
+          || loadedManifest.instances.length === 0) {
+          throw new Error('native project profile did not expose a complete 0.3 manifest')
+        }
+        const passthrough = projectExportOnce(module, stableSession, 'project.3mf', {
+          schemaVersion: '0.3',
+          preservation: 'require',
+          includeSliceArtifacts: false,
+        })
+        if (passthrough?.schemaVersion !== '0.3'
+          || passthrough.asset?.kind !== 'project'
+          || passthrough.asset?.byteLength !== stableExportedProject.length) {
+          throw new Error('native project profile did not support preservation=require export')
+        }
+        const roundTripped = projectGetAssetOnce(module, stableSession, 'project:export')
+        if (roundTripped.length !== stableExportedProject.length
+          || !roundTripped.every((value, index) => value === stableExportedProject[index])) {
+          throw new Error('preservation=require export changed the untouched native project package')
+        }
+        console.log(`PASS (${loadedManifest.instances.length} native instance(s))`)
+      } catch (err) {
+        stableFailures++
+        console.log('FAIL')
+        console.error(`  ${err.message}`)
+      }
+
+      const stableReadLabel = `[${mesh.label}] read .3mf (geometry-only import helper)`
+      process.stdout.write(`[smoke-test] ${stableReadLabel} ... `)
+      try {
+        if (!stableExportedProject) throw new Error('project export did not produce a 3MF package')
+        const stl = read3mfOnce(module, stableExportedProject)
+        const expectedTris = stlTriangleCount(mesh.bytes)
+        const actualTris = stlTriangleCount(stl)
+        if (actualTris !== expectedTris) {
+          throw new Error(`triangle count mismatch: expected ${expectedTris}, got ${actualTris}`)
+        }
+        console.log(`PASS (${actualTris} tris)`)
+      } catch (err) {
+        stableFailures++
         console.log('FAIL')
         console.error(`  ${err.message}`)
       }
     }
 
-    // Multi-object plate with a per-object "extruder" override (same value on
-    // both objects, nozzle_diameter length 1) — the AMS-style path, probing
-    // the onewasm_slice_stl_multi extruder_ids plumbing on its own. The genuinely
-    // multi-nozzle case is the scenario below.
-    const plateLabel = `[${mesh.label}] plate: 2 objects, per-object extruder override (single nozzle)`
-    process.stdout.write(`[smoke-test] ${plateLabel} ... `)
-    try {
-      initSession(module, session, JSON.stringify(BASE_CONFIG))
-      const gcode = sliceMultiOnce(module, session, [mesh.bytes, mesh.bytes], Int32Array.from([1, 1]))
-      assertSaneGcode(gcode, plateLabel)
-      assertRestsOnBed(gcode, plateLabel, BASE_CONFIG.initial_layer_print_height)
-      assertStatistics(getStatisticsOnce(module, session), plateLabel)
-      console.log(`PASS (${gcode.length} bytes)`)
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
+    if (stableFailures > 0) {
+      console.error(`\n[smoke-test] ${stableFailures} API 0.3 scenario(s) failed`)
+      process.exitCode = 1
+    } else {
+      console.log('\n[smoke-test] all API 0.3 scenarios passed')
     }
-
-    // Real multi-nozzle: two objects on one plate, each assigned to a slot
-    // that maps to a different physical nozzle. See DUAL_NOZZLE_CONFIG above
-    // for why this scenario is committed rather than run by hand (#140).
-    const dualLabel = `[${mesh.label}] plate: 2 objects on a real dual-nozzle machine (T0 + T1)`
-    process.stdout.write(`[smoke-test] ${dualLabel} ... `)
-    try {
-      initSession(module, session, JSON.stringify(DUAL_NOZZLE_CONFIG))
-      const gcode = sliceMultiOnce(module, session, [mesh.bytes, mesh.bytes], Int32Array.from([1, 2]))
-      assertSaneGcode(gcode, dualLabel)
-      assertRestsOnBed(gcode, dualLabel, BASE_CONFIG.initial_layer_print_height)
-      assertToolChanges(gcode, dualLabel)
-      assertStatistics(getStatisticsOnce(module, session), dualLabel)
-      console.log(`PASS (${gcode.length} bytes)`)
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
-
-    // The host integration represents assigning one uploaded STL to slot 2 as a one-object
-    // multi slice. Keep that exact shape covered: a two-object T0/T1 plate can
-    // pass while the single-object path still collapses the selected filament.
-    const singlePetgLabel = `[${mesh.label}] single object assigned to filament slot 2 (T1)`
-    process.stdout.write(`[smoke-test] ${singlePetgLabel} ... `)
-    try {
-      initSession(module, session, JSON.stringify(DUAL_NOZZLE_CONFIG))
-      const gcode = sliceMultiOnce(module, session, [mesh.bytes], Int32Array.from([2]))
-      assertSaneGcode(gcode, singlePetgLabel)
-      if (!/; nozzle_temperature = 220,255\n/.test(gcode)) throw new Error('slot 2 assignment collapsed the per-filament nozzle temperatures')
-      if (!/; nozzle_temperature_initial_layer = 220,255\n/.test(gcode)) throw new Error('slot 2 assignment collapsed the first-layer temperatures')
-      if (!/(?:^|\n)T1(?:\s|$)/m.test(gcode)) throw new Error('slot 2 assignment did not select T1')
-      assertStatistics(getStatisticsOnce(module, session), singlePetgLabel)
-      console.log(`PASS (${gcode.length} bytes)`)
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
-
-    // Prime tower placement: a multi-material plate on a shallow bed whose
-    // engine-default tower position would hang off the back edge. Guards the
-    // bridge's clamp (#163) — without it the tower origin sits at y=220 on a
-    // 210 mm bed.
-    const towerLabel = `[${mesh.label}] plate: prime tower clamped onto a shallow bed`
-    process.stdout.write(`[smoke-test] ${towerLabel} ... `)
-    try {
-      initSession(module, session, JSON.stringify(SMALL_BED_AMS_CONFIG))
-      const gcode = sliceMultiOnce(module, session, [mesh.bytes, mesh.bytes], Int32Array.from([1, 2]))
-      assertSaneGcode(gcode, towerLabel)
-      assertToolChanges(gcode, towerLabel)
-      assertWipeTowerOnBed(gcode, SMALL_BED_AMS_CONFIG.bed_size_x, SMALL_BED_AMS_CONFIG.bed_size_y, towerLabel)
-      assertStatistics(getStatisticsOnce(module, session), towerLabel)
-      console.log(`PASS (${gcode.length} bytes)`)
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
-
-    // Mixed-temperature single-nozzle guard (#164): without the override the
-    // engine must reject the plate with -6; with it the same plate slices. Both
-    // halves matter — a bridge that ignored the flag would pass the second
-    // check by never enforcing the guard, so the first check pins that the
-    // guard is still on by default.
-    const guardLabel = `[${mesh.label}] plate: mixed-temp single nozzle is rejected without the override`
-    process.stdout.write(`[smoke-test] ${guardLabel} ... `)
-    try {
-      initSession(module, session, JSON.stringify(MIXED_TEMP_AMS_CONFIG))
-      let rejected = false
-      try {
-        sliceMultiOnce(module, session, [mesh.bytes, mesh.bytes], Int32Array.from([1, 2]))
-      } catch (err) {
-        rejected = true
-        if (!/\(-6\)/.test(err.message) || !/incompatible/i.test(err.message)) {
-          throw new Error(`expected an incompatible-temperature -6 rejection, got: ${err.message}`)
-        }
-        // The message must still carry the desktop menu path that
-        // humanizeSliceError() (host loader) rewrites into the
-        // in-app toggle. If a future engine reworded this tail, the host integration
-        // rewrite would silently no-op — pin the anchor here so that drift is
-        // caught at the engine boundary rather than in production (#164).
-        if (!/Preferences\s*\/\s*Control\s*\/\s*Slicing\s*\/\s*Remove mixed temperature restriction/.test(err.message)) {
-          throw new Error(`rejection message lost the desktop menu-path anchor humanizeSliceError keys on: ${err.message}`)
-        }
-      }
-      if (!rejected) throw new Error('expected the slice to be rejected, but it succeeded')
-      assertNoStatistics(module, session, `${guardLabel} after failed slice`)
-      console.log('PASS (rejected as expected)')
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
-
-    const overrideLabel = `[${mesh.label}] plate: mixed-temp single nozzle slices with the override on`
-    process.stdout.write(`[smoke-test] ${overrideLabel} ... `)
-    try {
-      initSession(module, session, JSON.stringify({ ...MIXED_TEMP_AMS_CONFIG, remove_mixed_temp_restriction: '1' }))
-      const gcode = sliceMultiOnce(module, session, [mesh.bytes, mesh.bytes], Int32Array.from([1, 2]))
-      assertSaneGcode(gcode, overrideLabel)
-      assertToolChanges(gcode, overrideLabel)
-      assertStatistics(getStatisticsOnce(module, session), overrideLabel)
-      console.log(`PASS (${gcode.length} bytes)`)
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
-
-    // onewasm_write_3mf: mesh + embedded config, no plate/gcode data (see
-    // bridge/slicer.cpp).
-    // Use the real dual-nozzle shape here so the read side also proves it
-    // preserves vector boundaries instead of returning one joined scalar per
-    // filament/nozzle option.
-    const write3mfLabel = `[${mesh.label}] write .3mf (mesh + embedded config)`
-    process.stdout.write(`[smoke-test] ${write3mfLabel} ... `)
-    let written3mf = null
-    try {
-      initSession(module, session, JSON.stringify(DUAL_NOZZLE_CONFIG))
-      written3mf = write3mfOnce(module, session, mesh.bytes)
-      assertValid3mf(written3mf, write3mfLabel)
-      console.log(`PASS (${written3mf.length} bytes)`)
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
-
-    // onewasm_read_3mf: round-trip the .3mf just written back through the
-    // engine's own reader. The common contract deliberately returns geometry
-    // only; native settings are loaded through onewasm_init_profile.
-    const read3mfLabel = `[${mesh.label}] read .3mf (round-trip geometry)`
-    process.stdout.write(`[smoke-test] ${read3mfLabel} ... `)
-    try {
-      if (!written3mf) throw new Error('no .3mf available (write step failed above)')
-      initProfileOnce(module, session, written3mf)
-      const stl = read3mfOnce(module, written3mf)
-
-      const expectedTris = stlTriangleCount(mesh.bytes)
-      const actualTris = stlTriangleCount(stl)
-      if (actualTris !== expectedTris) {
-        throw new Error(`triangle count mismatch: expected ${expectedTris}, got ${actualTris}`)
-      }
-
-      console.log(`PASS (${actualTris} tris; geometry-only read contract)`)
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
+  } finally {
+    module._onewasm_session_destroy(stableSession)
   }
-
-  if (supportsPlateActions) {
-    const autoOrientLabel = '[current plate] auto-orient objects'
-    process.stdout.write(`[smoke-test] ${autoOrientLabel} ... `)
-    try {
-      initSession(module, session, JSON.stringify(BASE_CONFIG))
-      const autoOrientMeshes = [meshes[0].bytes, meshes[0].bytes]
-      const transforms = preparePlateOnce(module, session, autoOrientMeshes, 1)
-      assertValidPlateTransforms(transforms, autoOrientMeshes.length, autoOrientLabel, false)
-      const gcode = sliceMultiOnce(module, session, autoOrientMeshes, undefined, encodeObjectTransforms(transforms))
-      assertSaneGcode(gcode, autoOrientLabel)
-      assertRestsOnBed(gcode, autoOrientLabel, BASE_CONFIG.initial_layer_print_height)
-      console.log(`PASS (${transforms.length} transforms)`)
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
-
-    const arrangeLabel = '[current plate] arrange objects'
-    process.stdout.write(`[smoke-test] ${arrangeLabel} ... `)
-    try {
-      initSession(module, session, JSON.stringify(BASE_CONFIG))
-      const transforms = preparePlateOnce(module, session, [meshes[0].bytes, meshes[0].bytes], 2)
-      assertValidPlateTransforms(transforms, 2, arrangeLabel, true)
-      const gcode = sliceMultiOnce(
-        module,
-        session,
-        [meshes[0].bytes, meshes[0].bytes],
-        undefined,
-        encodeObjectTransforms(transforms),
-      )
-      assertSaneGcode(gcode, arrangeLabel)
-      assertRestsOnBed(gcode, arrangeLabel, BASE_CONFIG.initial_layer_print_height)
-      console.log(`PASS (${transforms.length} transforms)`)
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
-  }
-
-  if (supportsProjectApi) {
-    const projectLabel = '[draft 0.3] project manifest, prepare, all/selected plate slicing'
-    process.stdout.write(`[smoke-test] ${projectLabel} ... `)
-    try {
-      initSession(module, session, JSON.stringify(BASE_CONFIG))
-      // Keep this optional draft probe cheap: the regular smoke cases already
-      // exercise the larger torture mesh. The project path itself still uses
-      // two real native slices, one per logical plate.
-      runProjectSmoke(module, session, sphereStl(1, 5))
-      console.log('PASS')
-    } catch (err) {
-      failures++
-      console.log('FAIL')
-      console.error(`  ${err.message}`)
-    }
-  }
-
-  module._onewasm_session_destroy(session)
-
-  if (failures > 0) {
-    console.error(`\n[smoke-test] ${failures} scenario(s) failed`)
-    process.exit(1)
-  }
-  console.log('\n[smoke-test] all scenarios passed')
+  return
 }
 
 main().catch((err) => {

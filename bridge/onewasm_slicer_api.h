@@ -7,14 +7,24 @@
 extern "C" {
 #endif
 
+/*
+ * Version 0.3 clean-break contract. The exported symbol names intentionally
+ * stay in the onewasm_ namespace, but their meaning is defined by this
+ * version of the header.
+ */
 #define ONEWASM_API_VERSION_MAJOR 0
-#define ONEWASM_API_VERSION_MINOR 2
+#define ONEWASM_API_VERSION_MINOR 3
 #define ONEWASM_API_VERSION_PATCH 0
-#define ONEWASM_API_VERSION_STRING "0.2.0"
+#define ONEWASM_API_VERSION_STRING "0.3.0"
 
 typedef void* onewasm_session_t;
 typedef int32_t onewasm_status_t;
 
+/*
+ * The stage string is borrowed and valid only for the duration of the
+ * callback. The callback must be non-blocking and must not re-enter the
+ * session. percent is 0..100, or -1 when no useful percentage is known.
+ */
 typedef void (*onewasm_progress_callback_t)(
     int32_t percent,
     const char* stage_utf8,
@@ -36,13 +46,6 @@ enum {
     ONEWASM_ERR_CANCELLED = -11,
     ONEWASM_ERR_NO_DATA = -12
 };
-
-enum {
-    ONEWASM_PLATE_AUTO_ORIENT = 1,
-    ONEWASM_PLATE_ARRANGE = 2
-};
-
-#define ONEWASM_OBJECT_TRANSFORM_STRIDE 11
 
 onewasm_session_t onewasm_session_create(void);
 void onewasm_session_destroy(onewasm_session_t session);
@@ -69,79 +72,12 @@ onewasm_status_t onewasm_set_progress_callback(
 
 onewasm_status_t onewasm_cancel(onewasm_session_t session);
 
-onewasm_status_t onewasm_slice_stl(
-    onewasm_session_t session,
-    const uint8_t* stl_data,
-    uint32_t stl_len,
-    uint8_t** out_gcode,
-    uint32_t* out_len
-);
-
-onewasm_status_t onewasm_slice_stl_multi(
-    onewasm_session_t session,
-    const uint8_t* stl_blob,
-    uint32_t stl_blob_len,
-    const uint32_t* object_offsets,
-    uint32_t object_count,
-    const int32_t* extruder_ids,
-    const float* object_transforms,
-    uint8_t** out_gcode,
-    uint32_t* out_len
-);
-
-onewasm_status_t onewasm_prepare_plate(
-    onewasm_session_t session,
-    const uint8_t* stl_blob,
-    uint32_t stl_blob_len,
-    const uint32_t* object_offsets,
-    uint32_t object_count,
-    const float* object_transforms,
-    int32_t operation,
-    uint8_t** out_transforms_json,
-    uint32_t* out_len
-);
-
-onewasm_status_t onewasm_obj_to_stl(
-    const uint8_t* obj_data,
-    uint32_t obj_len,
-    uint8_t** out_stl,
-    uint32_t* out_len
-);
-
-onewasm_status_t onewasm_cad_to_stl(
-    const uint8_t* cad_data,
-    uint32_t cad_len,
-    uint8_t** out_stl,
-    uint32_t* out_len
-);
-
-onewasm_status_t onewasm_write_3mf(
-    onewasm_session_t session,
-    const uint8_t* stl_data,
-    uint32_t stl_len,
-    uint8_t** out_3mf,
-    uint32_t* out_len
-);
-
-onewasm_status_t onewasm_read_3mf(
-    const uint8_t* mf_data,
-    uint32_t mf_len,
-    uint8_t** out_stl,
-    uint32_t* out_stl_len
-);
-
-onewasm_status_t onewasm_get_capabilities(
-    uint8_t** out_json,
-    uint32_t* out_len
-);
-
-onewasm_status_t onewasm_get_last_statistics(
-    onewasm_session_t session,
-    uint8_t** out_json,
-    uint32_t* out_len
-);
-
-/* Draft 0.3 project surface. */
+/*
+ * Replace the logical project's mesh objects and placement with a neutral
+ * manifest. Mesh data ranges refer to the object_blob, so large meshes do not
+ * pass through base64/JSON. Native settings already loaded in the session
+ * remain active.
+ */
 onewasm_status_t onewasm_project_set_objects(
     onewasm_session_t session,
     const uint8_t* object_blob,
@@ -187,6 +123,25 @@ onewasm_status_t onewasm_project_export(
     const uint8_t* options_json,
     uint32_t options_len,
     uint8_t** out_result_json,
+    uint32_t* out_len
+);
+
+onewasm_status_t onewasm_obj_to_stl(
+    const uint8_t* obj_data,
+    uint32_t obj_len,
+    uint8_t** out_stl,
+    uint32_t* out_len
+);
+
+onewasm_status_t onewasm_cad_to_stl(
+    const uint8_t* cad_data,
+    uint32_t cad_len,
+    uint8_t** out_stl,
+    uint32_t* out_len
+);
+
+onewasm_status_t onewasm_get_capabilities(
+    uint8_t** out_json,
     uint32_t* out_len
 );
 

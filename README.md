@@ -51,18 +51,19 @@ node scripts/gen-wsl-build-script.mjs
 
 ## C API
 
-The module exports the `one-wasm-slicer-api` 0.2 ABI. The old `orc_*` symbols
-are intentionally not kept in a new artifact; hosts must use the clean-break
-surface below:
+The module exports the `one-wasm-slicer-api` 0.3 ABI. The old `orc_*` and
+0.2 STL-specific symbols are not part of the canonical surface; hosts use the
+project-oriented API below:
 
 ```text
 onewasm_session_create / onewasm_session_destroy
 onewasm_init / onewasm_init_profile / onewasm_set_progress_callback
 onewasm_cancel
-onewasm_slice_stl / onewasm_slice_stl_multi / onewasm_prepare_plate
+onewasm_project_set_objects / onewasm_project_get_manifest
+onewasm_project_prepare / onewasm_project_slice
+onewasm_project_get_asset / onewasm_project_export
 onewasm_obj_to_stl / onewasm_cad_to_stl
-onewasm_write_3mf / onewasm_read_3mf
-onewasm_get_capabilities / onewasm_get_last_statistics
+onewasm_get_capabilities
 onewasm_free / onewasm_last_error
 ```
 
@@ -70,42 +71,36 @@ The Emscripten exports therefore use `_onewasm_*` names. The canonical header
 is vendored at [`bridge/onewasm_slicer_api.h`](bridge/onewasm_slicer_api.h) and
 is synchronized with the private
 [`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
-repository at `v0.2.0`. `onewasm_read_3mf` returns geometry only; an Orca
-project `.3mf` can be loaded as a native profile with
+repository at `v0.3.0`. The extra `onewasm_read_3mf` export is a geometry-only
+PoC import helper, outside the canonical project ABI. An Orca project `.3mf`
+is loaded as a native profile with
 `onewasm_init_profile(session, "project.3mf", ...)`.
-
-The same header currently includes the draft 0.3 project symbols
-(`onewasm_project_set_objects`, `onewasm_project_prepare`,
-`onewasm_project_slice`, `onewasm_project_get_asset`, and
-`onewasm_project_export`) so they can be validated before the clean-break
-header is promoted. They are not included in the released 0.2 capability
-document yet.
 
 ## one-wasm-slicer-api compatibility
 
-| Target capability | OrcaWasm 0.2 status | Evidence |
+| Target capability | OrcaWasm 0.3 status | Evidence |
 |---|---|---|
 | Session lifecycle | supported | `onewasm_session_create/destroy` |
 | Native config initialization | supported | `onewasm_init`, format `orca.native-json` |
 | Full native profile | supported | `onewasm_init_profile`, format `project.3mf` |
 | Progress callback | supported | `onewasm_set_progress_callback` plus worker progress messages |
-| Single STL to G-code | supported | `onewasm_slice_stl` |
-| Multiple STL objects | supported | `onewasm_slice_stl_multi` |
-| Object transforms | supported | 11-float transform table in `onewasm_slice_stl_multi` |
-| Auto-orient / arrange | supported | `onewasm_prepare_plate` |
+| Neutral project manifest | supported | `onewasm_project_set_objects/get_manifest` |
+| Project transforms | supported | row-major 4x4 affine matrices |
+| Auto-orient / arrange | supported | `onewasm_project_prepare` |
+| Single/multi/all-plate slice | supported | `onewasm_project_slice` with selected/all plate selection |
+| Per-plate G-code/statistics | supported | result manifest plus `onewasm_project_get_asset` |
 | OBJ / STEP to STL | supported | `onewasm_obj_to_stl` / `onewasm_cad_to_stl` |
-| 3MF read / write | supported | `onewasm_read_3mf` handles build/component transforms as geometry; `onewasm_write_3mf` writes native config |
+| Native project export | supported with limits | `onewasm_project_export`, explicit preservation policy |
+| G-code in native 3MF | unsupported | `includeSliceArtifacts=true` returns `ONEWASM_ERR_UNSUPPORTED` |
 | Capability metadata | supported | `onewasm_get_capabilities` |
-| Stable status and ownership | supported | 0.2 status values and `onewasm_free` |
+| Stable status and ownership | supported | 0.3 status values and `onewasm_free` |
 | Cooperative cancellation | supported | `onewasm_cancel`, native `PrintBase::cancel()`, `-11` completion status |
-| Canonical slice statistics | supported | `onewasm_get_last_statistics`, schema `0.2`, `-12` no-data status |
 
-### Draft 0.3 adapter progress
+### 0.3 adapter scope
 
-The bridge contains an executable implementation of the proposed 0.3 project
-adapter, without advertising the artifact as 0.3 yet:
+The bridge implements the promoted 0.3 project adapter:
 
-| Draft surface | Status | Scope |
+| 0.3 surface | Status | Scope |
 |---|---|---|
 | `onewasm_project_set_objects` | implemented | neutral 0.3 manifest plus owned concatenated STL blob |
 | `onewasm_project_get_manifest` | implemented | returns the neutral project state |
@@ -115,9 +110,7 @@ adapter, without advertising the artifact as 0.3 yet:
 | `onewasm_project_export` | implemented with limits | clean native projects can be passed through losslessly; host/dirty projects are regenerated with `require`/`best-effort`/`portable` reporting; `includeSliceArtifacts=true` is still unsupported |
 | `init_profile("project.3mf", ...)` as a full project load | implemented with limits | OrcaSlicer loads native configuration/project data and the bridge exposes a neutral manifest; serializable native meshes are copied for later prepare/slice/export |
 
-The released 0.2 capability document remains unchanged until the draft is
-promoted and the 0.3 conformance suite is complete. The draft contract and
-schemas live in the private
+The canonical contract and schemas live in the private
 [`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
 repository.
 
