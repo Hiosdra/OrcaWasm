@@ -256,11 +256,12 @@ function makeComponent3mf() {
     </object>
     <object id="2" type="model">
       <components>
-        <component objectid="1" transform="1 0 0 5 0 1 0 0 0 0 1 0"/>
+        <!-- ST_Matrix3D: row-major affine matrix; translation is the final three values. -->
+        <component objectid="1" transform="1 0 0 0 1 0 0 0 1 5 0 0"/>
       </components>
     </object>
   </resources>
-  <build><item objectid="2" transform="1 0 0 10 0 1 0 0 0 0 1 0"/></build>
+  <build><item objectid="2" transform="1 0 0 0 1 0 0 0 1 10 0 0"/></build>
 </model>`
   return makeStoredZip([
     {
