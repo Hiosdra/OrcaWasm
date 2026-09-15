@@ -4234,11 +4234,17 @@ onewasm_status_t onewasm_read_3mf(
         Loaded3mfResourcesGuard loaded_resources(plate_data_list, project_presets);
         Slic3r::Semver file_version;
 
+        // Do not add default instances here. A 3MF resource object that is
+        // referenced only through a <component> is a definition, not another
+        // build item. AddDefaultInstances would make that definition appear
+        // at the origin in addition to the composed build instance, causing
+        // duplicate geometry and dropping the intended component/build
+        // transform semantics from this geometry-only conversion.
         bool ok = Slic3r::load_bbs_3mf(
             tmp_in, &config, &substitutions, &model,
             &plate_data_list, &project_presets,
             nullptr, nullptr, &file_version, nullptr,
-            Slic3r::LoadStrategy::AddDefaultInstances | Slic3r::LoadStrategy::LoadModel | Slic3r::LoadStrategy::LoadConfig);
+            Slic3r::LoadStrategy::LoadModel | Slic3r::LoadStrategy::LoadConfig);
 
         if (!ok) {
             record_error("3MF load failed");
