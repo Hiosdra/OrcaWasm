@@ -96,7 +96,7 @@ source "$EMSDK/emsdk_env.sh"
 BOOST_VERSION="1.83.0"
 BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
-# _v2 suffix: manually bumped, not tied to BOOST_VERSION — the
+# _v3 suffix: manually bumped, not tied to BOOST_VERSION — the
 # BOOST_LOG_NO_THREADS fix above changed Boost's build *flags*,
 # not its pinned version, so BOOST_VERSION alone wouldn't
 # invalidate a stale cached build. Restore-keys below prefix-match
@@ -356,13 +356,11 @@ source "$EMSDK/emsdk_env.sh"
 OCCT_VERSION="7.8.1"
 OCCT_TAG="V${OCCT_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
-# _v2 suffix: manually bumped, not tied to OCCT_TAG — the -pthread
-# fix below changed OCCT's build *flags* for mt, not its pinned
-# version, so OCCT_TAG alone wouldn't invalidate a stale cached
-# (non-pthread) build already sitting in the mt deps-install
-# cache from before this fix (same gotcha as the Boost stamp
-# bump above — the cache key itself doesn't encode these flags).
-STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_native_eh_v3"
+# _v4 suffix: manually bumped, not tied to OCCT_TAG — the WebAssembly
+# EH patch below changes OCCT's build flags, not its pinned version,
+# so OCCT_TAG alone wouldn't invalidate a stale cached build (same
+# gotcha as the Boost stamp bump above: cache keys omit these flags).
+STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_native_eh_v4"
 [[ -f "${STAMP}" ]] && echo "[occt] stamp exists — skip" && exit 0
 
 echo "[occt] downloading OCCT ${OCCT_VERSION}…"
@@ -388,8 +386,7 @@ print('[occt-patch] excluded ExpToCasExe from BUILD_TOOLKITS')
 PYEOF
 
 echo "[occt] applying WebAssembly EH signal-conversion patch…"
-cp patches/occt/adm/cmake/occt_defs_flags.cmake \
-  /tmp/occt/occt-src/adm/cmake/occt_defs_flags.cmake
+python3 patches/occt/apply-wasm-eh.py /tmp/occt/occt-src
 
 echo "[occt] configuring with Emscripten…"
 # OCCT ignores the standard BUILD_SHARED_LIBS flag — it selects the
@@ -407,8 +404,8 @@ echo "[occt] configuring with Emscripten…"
 #
 # Native WebAssembly EH and explicit C setjmp/longjmp flags are
 # needed here too — this is a separate cmake invocation with its
-# own toolchain file, not emcmake. The copied OCCT file disables its
-# incompatible signal conversion, and C uses the wasm longjmp mode.
+# own toolchain file, not emcmake. This patch selects native EH flags
+# and disables OCCT signal conversion; C also needs wasm longjmp mode.
 cmake \
   -S /tmp/occt/occt-src \
   -B /tmp/occt/build \
