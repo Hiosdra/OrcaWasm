@@ -51,13 +51,13 @@ node scripts/gen-wsl-build-script.mjs
 
 ## C API
 
-The module exports the `one-wasm-slicer-api` 0.3 ABI. The old `orc_*` and
+The module exports the `one-wasm-slicer-api` 0.4 ABI. The old `orc_*` and
 0.2 STL-specific symbols are not part of the canonical surface; hosts use the
 project-oriented API below:
 
 ```text
 onewasm_session_create / onewasm_session_destroy
-onewasm_init / onewasm_init_profile / onewasm_set_progress_callback
+onewasm_init / onewasm_init_profile / onewasm_apply_profile / onewasm_set_progress_callback
 onewasm_cancel
 onewasm_project_set_objects / onewasm_project_get_manifest
 onewasm_project_prepare / onewasm_project_slice
@@ -71,18 +71,19 @@ The Emscripten exports therefore use `_onewasm_*` names. The canonical header
 is vendored at [`bridge/onewasm_slicer_api.h`](bridge/onewasm_slicer_api.h) and
 is synchronized with the private
 [`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
-repository at `v0.3.0`. The extra `onewasm_read_3mf` export is a geometry-only
+repository at `v0.4.0`. The extra `onewasm_read_3mf` export is a geometry-only
 PoC import helper, outside the canonical project ABI. An Orca project `.3mf`
 is loaded as a native profile with
 `onewasm_init_profile(session, "project.3mf", ...)`.
 
 ## one-wasm-slicer-api compatibility
 
-| Target capability | OrcaWasm 0.3 status | Evidence |
+| Target capability | OrcaWasm 0.4 status | Evidence |
 |---|---|---|
 | Session lifecycle | supported | `onewasm_session_create/destroy` |
 | Native config initialization | supported | `onewasm_init`, format `orca.native-json` |
 | Full native profile | supported | `onewasm_init_profile`, format `project.3mf` |
+| Native profile fragments | supported | `onewasm_apply_profile`, formats `orca.profile-json` and `orca.native-json` |
 | Progress callback | supported | `onewasm_set_progress_callback` plus worker progress messages |
 | Neutral project manifest | supported | `onewasm_project_set_objects/get_manifest` |
 | Project transforms | supported | row-major 4x4 affine matrices |
@@ -96,7 +97,7 @@ is loaded as a native profile with
 | Stable status and ownership | supported | 0.3 status values and `onewasm_free` |
 | Cooperative cancellation | supported | `onewasm_cancel`, native `PrintBase::cancel()`, `-11` completion status |
 
-### 0.3 adapter scope
+### 0.3 project adapter scope
 
 The bridge implements the promoted 0.3 project adapter:
 

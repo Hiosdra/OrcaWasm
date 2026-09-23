@@ -87,13 +87,14 @@ target_link_options(slicer PRIVATE
   # keeps MEMFS available for the bridge's /tmp STL-in / G-code-out files.
   -sFORCE_FILESYSTEM=1
   # Exported C functions consumed by the JS runtime and the common
-  # one-wasm-slicer-api 0.3 contract. The geometry-only 3MF converter is a
+  # one-wasm-slicer-api 0.4 contract. The geometry-only 3MF converter is a
   # UI import helper and is intentionally outside the canonical project ABI.
   "-sEXPORTED_FUNCTIONS=[\
 '_onewasm_session_create',\
 '_onewasm_session_destroy',\
 '_onewasm_init',\
 '_onewasm_init_profile',\
+'_onewasm_apply_profile',\
 '_onewasm_set_progress_callback',\
 '_onewasm_cancel',\
 '_onewasm_get_capabilities',\

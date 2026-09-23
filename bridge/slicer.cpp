@@ -18,7 +18,7 @@
  * onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_read_3mf are pure format conversions
  * — they never touch slicer config state, so they take no session handle.
  *
- * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.3:
+ * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.4:
  *   -1  invalid / uninitialized state (includes a null/invalid session handle)
  *   -2  JSON parse failure
  *   -3  STL write to MEMFS failed
@@ -2440,6 +2440,148 @@ onewasm_status_t onewasm_init(onewasm_session_t session_ptr, const uint8_t* conf
 }
 
 EMSCRIPTEN_KEEPALIVE
+onewasm_status_t onewasm_apply_profile(
+    onewasm_session_t session_ptr,
+    const char* format_utf8,
+    uint32_t format_len,
+    const uint8_t* profile_data,
+    uint32_t profile_len
+) {
+    OrcSession* session = as_session(session_ptr);
+    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    session->last_error.clear();
+    if (!format_utf8 || format_len == 0 || !profile_data || profile_len == 0) {
+        record_error(*session, "profile format or data is empty");
+        return ONEWASM_ERR_INVALID_ARGUMENT;
+    }
+
+    const std::string format(format_utf8, format_utf8 + format_len);
+    if (format != "orca.profile-json" && format != "orca.native-json") {
+        record_error(*session, "unsupported Orca profile fragment format: " + format);
+        return ONEWASM_ERR_UNSUPPORTED;
+    }
+
+    nlohmann::json document;
+    try {
+        const char* json_data = reinterpret_cast<const char*>(profile_data);
+        document = nlohmann::json::parse(json_data, json_data + profile_len);
+    } catch (const std::exception& e) {
+        record_error(*session, std::string("invalid Orca profile JSON: ") + e.what());
+        return ONEWASM_ERR_INPUT_FORMAT;
+    }
+    if (!document.is_object()) {
+        record_error(*session, "Orca profile fragment must be a JSON object");
+        return ONEWASM_ERR_INPUT_FORMAT;
+    }
+
+    // Individual native Orca profile files are sparse patches. Establish the
+    // same engine defaults as onewasm_init once, then let Orca's own native
+    // config parser apply each original profile document in caller order.
+    if (!session->initialized) {
+        static constexpr char defaults[] = "{}";
+        const auto status = onewasm_init(
+            session,
+            reinterpret_cast<const uint8_t*>(defaults),
+            static_cast<uint32_t>(sizeof(defaults) - 1)
+        );
+        if (status != ONEWASM_OK) return status;
+        session->last_error.clear();
+    }
+
+    auto pickNumber = [&](const char* key, double fallback) {
+        if (!document.contains(key)) return fallback;
+        const auto& value = document[key];
+        if (value.is_number()) return value.get<double>();
+        if (value.is_string()) {
+            try { return std::stod(value.get<std::string>()); } catch (...) {}
+        }
+        return fallback;
+    };
+    session->bed_cx = pickNumber("bed_size_x", session->bed_cx * 2.0) / 2.0;
+    session->bed_cy = pickNumber("bed_size_y", session->bed_cy * 2.0) / 2.0;
+    // Native Orca printer presets use printable_area rather than the bridge's
+    // display-only bed_size_x/bed_size_y fields. Read the dimensions from the
+    // original profile document so applying it also updates project placement.
+    // This mirrors the PoC's bed-size display convention (origin at 0,0); the
+    // original JSON remains untouched at the API boundary.
+    if (document.contains("printable_area")) {
+        std::vector<std::string> points;
+        const auto& area = document["printable_area"];
+        if (area.is_array()) {
+            for (const auto& point : area) {
+                if (point.is_string()) points.push_back(point.get<std::string>());
+            }
+        } else if (area.is_string()) {
+            std::string flattened = area.get<std::string>();
+            std::size_t begin = 0;
+            while (begin <= flattened.size()) {
+                const std::size_t end = flattened.find(',', begin);
+                points.push_back(flattened.substr(begin, end == std::string::npos ? end : end - begin));
+                if (end == std::string::npos) break;
+                begin = end + 1;
+            }
+        }
+
+        double max_x = 0.0;
+        double max_y = 0.0;
+        std::size_t valid_points = 0;
+        for (const auto& point : points) {
+            const std::size_t separator = point.find_first_of("xX");
+            if (separator == std::string::npos) continue;
+            try {
+                std::size_t x_consumed = 0;
+                std::size_t y_consumed = 0;
+                const double x = std::stod(point.substr(0, separator), &x_consumed);
+                const double y = std::stod(point.substr(separator + 1), &y_consumed);
+                if (x_consumed != separator || y_consumed != point.size() - separator - 1) continue;
+                max_x = std::max(max_x, x);
+                max_y = std::max(max_y, y);
+                ++valid_points;
+            } catch (...) {
+                // Ignore malformed points and keep the previously active bed.
+            }
+        }
+        if (valid_points > 0 && max_x > 0.0 && max_y > 0.0) {
+            session->bed_cx = max_x / 2.0;
+            session->bed_cy = max_y / 2.0;
+            if (!document.contains("bed_shape")) {
+                session->bed_shape = valid_points > 8 ? "circle" : "rectangle";
+            }
+        }
+    }
+    if (document.contains("bed_shape") && document["bed_shape"].is_string()) {
+        session->bed_shape = document["bed_shape"].get<std::string>();
+    }
+    if (document.contains("remove_mixed_temp_restriction")) {
+        session->remove_mixed_temp_restriction = json_flag(document, "remove_mixed_temp_restriction");
+    }
+    if (document.contains("adaptive_layer_height")) {
+        session->adaptive_layer_height = json_flag(document, "adaptive_layer_height");
+    }
+    if (document.contains("adaptive_layer_height_quality")) {
+        const double quality = pickNumber("adaptive_layer_height_quality", 0.5);
+        session->adaptive_layer_height_quality = static_cast<float>(std::min(1.0, std::max(0.0, quality)));
+    }
+
+    for (auto& [key, value] : document.items()) {
+        std::string serialized = value.is_array() ? json_array_to_config_string(key, value) : json_val_to_string(value);
+        if (serialized.empty()) continue;
+        try {
+            session->config.set_deserialize_strict(key, serialized);
+        } catch (...) {
+            // Orca profile metadata and options unknown to this engine build
+            // are handled by Orca's native configuration parser semantics.
+        }
+    }
+
+    session->last_statistics_json.clear();
+    session->has_last_statistics = false;
+    reset_project(*session);
+    session->initialized = true;
+    return ONEWASM_OK;
+}
+
+EMSCRIPTEN_KEEPALIVE
 onewasm_status_t onewasm_init_profile(
     onewasm_session_t session_ptr,
     const char* format_utf8,
@@ -2585,10 +2727,10 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
     constexpr const char* requires_sab = "false";
 #endif
     const std::string json = std::string(R"({
-  "api":{"name":"one-wasm-slicer-api","version":"0.3.0"},
+  "api":{"name":"one-wasm-slicer-api","version":"0.4.0"},
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
-  "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"]},
+  "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
   "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"unsupported"},
   "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","project.manifest":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported","runtime.memory":"supported"}
 })";
