@@ -455,6 +455,8 @@ touch "${STAMP}"
 # ══════════════════════════════════════════════════════════
 (
 source "$EMSDK/emsdk_env.sh"
+export EM_CACHE="${EM_CACHE:-${EMSDK}/upstream/emscripten/cache}"
+echo "[emports] Emscripten cache: ${EM_CACHE}"
 python3 scripts/prepare-emscripten-eh.py --emsdk "$EMSDK"
 SYSROOT_LIB="$EM_CACHE/sysroot/lib/wasm32-emscripten"
 if [[ "${VARIANT}" == "mt" ]]; then
