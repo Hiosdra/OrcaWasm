@@ -39,7 +39,9 @@ WASM_VARIANT=mt ./scripts/build-local-wsl.sh
 
 The script builds the pinned OrcaSlicer dependencies, applies `patches/apply.py`,
 and writes the selected pair to `artifacts/`. Use `EMSDK=/path/to/emsdk` when
-the toolchain is not installed at `/opt/emsdk`.
+the toolchain is not installed at `/opt/emsdk`. Its Emscripten cache is stored
+under `build-wasm/emscripten-cache-$VARIANT`; set `WASM_EM_CACHE` to choose a
+different writable cache directory.
 
 The generated local script is derived from
 `.github/workflows/build-wasm.yml`. After changing that workflow, regenerate it
@@ -113,6 +115,37 @@ The bridge implements the promoted 0.3 project adapter:
 The canonical contract and schemas live in the private
 [`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
 repository.
+
+## Exception model and Memory64 decision
+
+Both wasm32 artifacts use native WebAssembly exception handling. C++ builds
+compile and link with `-fwasm-exceptions`; C code that uses `setjmp` or
+`longjmp` explicitly uses `-sSUPPORT_LONGJMP=wasm`. The bundled zlib, libpng,
+and libjpeg ports are built with matching settings. OCCT signal conversion is
+disabled because it relies on `setjmp`/`longjmp`, and the oneTBB Emscripten
+profile no longer overrides native EH with `-fexceptions`. The workflow runs
+[`scripts/check-wasm-eh.sh`](scripts/check-wasm-eh.sh) before each engine build;
+it exercises mixed C/C++ exceptions and longjmp, pthread execution, and
+separate wasm32/wasm64 toolchain probes.
+
+Memory64 is not shipped. Emscripten 3.1.74 and Node 22.16.0 successfully ran
+the four small ST/MT wasm32/wasm64 probes. The ST module measured 22,469 bytes
+for wasm32 and 22,531 bytes for wasm64; MT measured 46,880 and 48,834 bytes.
+These are probe sizes, not engine benchmarks. The 64-bit probe reports
+8-byte pointers, so an array of 1,048,576 pointer slots uses 8 MiB instead
+of 4 MiB.
+
+The current API 0.3 uses `uint32_t` byte lengths. The extension worker also
+writes and reads pointer outputs through `HEAPU32` and `i32`, which assumes
+wasm32 pointers. `wasm/CMakeLists.txt` caps memory at 4 GiB as well. A
+Memory64 engine would require a coordinated API and worker ABI change and a
+larger-memory configuration; there is no measured workload here that needs
+those changes. Keep the current wasm32 artifact contract until a real model
+demonstrates the need and the API/worker path is updated.
+
+Implementation references: [Emscripten C++ exceptions](https://emscripten.org/docs/porting/exceptions.html),
+[Emscripten setjmp/longjmp](https://emscripten.org/docs/porting/setjmp-longjmp.html),
+and the [WebAssembly Memory64 proposal](https://github.com/WebAssembly/memory64/blob/main/proposals/memory64/Overview.md).
 
 ## CI and releases
 

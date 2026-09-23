@@ -170,6 +170,10 @@ ccache --max-size=2G >/dev/null 2>&1 || true
 # dep's CMakeLists.txt. Not needed in CI, so not added to build-wasm.yml.
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 cd "$(dirname "$0")/.."   # repo root (this script lives in scripts/)
+# The SDK's default cache may be read-only. Keep a variant-specific local
+# cache beside the build tree; override it with WASM_EM_CACHE when needed.
+export EM_CACHE="\${WASM_EM_CACHE:-$(pwd)/build-wasm/emscripten-cache-\${VARIANT}}"
+mkdir -p "$EM_CACHE"
 echo "[build-local-wsl] repo root: $(pwd)"
 echo "[build-local-wsl] ORCA_VERSION=$ORCA_VERSION VARIANT=$VARIANT"
 `

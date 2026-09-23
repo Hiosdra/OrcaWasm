@@ -692,6 +692,66 @@ verify_contains(
 )
 
 # =============================================================================
+# 8h. Forward native WebAssembly EH flags into OrcaSlicer's dependency builds.
+#     CMake's ExternalProject helper omits parent compile flags by default.
+#     Preserve the wasm32 native-EH C/C++ flags in all child builds and replace
+#     oneTBB's incompatible Emscripten `-fexceptions` override.
+# =============================================================================
+patch("deps/CMakeLists.txt", [
+    (
+        r'(?m)^([ \t]*-DCMAKE_CXX_COMPILER_LAUNCHER:STRING=\$\{CMAKE_CXX_COMPILER_LAUNCHER\})(?!\n[ \t]*"-DCMAKE_C_FLAGS:STRING=\$\{CMAKE_C_FLAGS\}")$',
+        r'\1\n            "-DCMAKE_C_FLAGS:STRING=${CMAKE_C_FLAGS}"\n            "-DCMAKE_CXX_FLAGS:STRING=${CMAKE_CXX_FLAGS}"',
+        0,
+    ),
+])
+if not DRY_RUN:
+    verify_contains(
+        "deps/CMakeLists.txt",
+        '"-DCMAKE_C_FLAGS:STRING=${CMAKE_C_FLAGS}"',
+        "OrcaSlicer's child builds do not inherit wasm longjmp C flags.",
+    )
+    verify_contains(
+        "deps/CMakeLists.txt",
+        '"-DCMAKE_CXX_FLAGS:STRING=${CMAKE_CXX_FLAGS}"',
+        "OrcaSlicer's child builds do not inherit native WebAssembly EH CXX flags.",
+    )
+
+patch("deps/TBB/TBB.cmake", [
+    (
+        r'(?s)^if \(FLATPAK AND "\$\{CMAKE_CXX_COMPILER_ID\}" STREQUAL "GNU"\)\s*'
+        r'set\(_patch_command .*?\)\s*else\(\)\s*set\(_patch_command ""\)\s*endif\(\)',
+        'if (EMSCRIPTEN)\n'
+        '    set(_patch_command ${CMAKE_COMMAND} -DTBB_SOURCE_DIR=<SOURCE_DIR> -P ${CMAKE_CURRENT_LIST_DIR}/wasm-exceptions.cmake)\n'
+        'elseif (FLATPAK AND "${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")\n'
+        '    set(_patch_command ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_LIST_DIR}/GNU.cmake ./cmake/compilers/GNU.cmake)\n'
+        'else()\n'
+        '    set(_patch_command "")\n'
+        'endif ()',
+        0,
+    ),
+])
+_tbb_cmake = ORCA / "deps" / "TBB" / "TBB.cmake"
+if _tbb_cmake.exists():
+    _tbb_text = _tbb_cmake.read_text(encoding="utf-8")
+    if "${CMAKE_CURRENT_LIST_DIR}/wasm-exceptions.cmake" not in _tbb_text:
+        if DRY_RUN:
+            print("  WOULD VERIFY: oneTBB native-EH patch command after patch")
+        else:
+            _msg = "oneTBB native-EH patch command was not configured"
+            print(f"FATAL: {_msg}", file=sys.stderr)
+            sys.exit(1)
+
+    _tbb_patch = _tbb_cmake.parent / "wasm-exceptions.cmake"
+    _tbb_patch_source = Path(__file__).resolve().parent / "onetbb" / "wasm-exceptions.cmake"
+    _tbb_patch_text = _tbb_patch_source.read_text(encoding="utf-8")
+    if not _tbb_patch.exists() or _tbb_patch.read_text(encoding="utf-8") != _tbb_patch_text:
+        if DRY_RUN:
+            print("  WOULD WRITE: deps/TBB/wasm-exceptions.cmake")
+        else:
+            _tbb_patch.write_text(_tbb_patch_text, encoding="utf-8")
+            print("  WROTE: deps/TBB/wasm-exceptions.cmake")
+
+# =============================================================================
 # 9. Root CMakeLists.txt — append the bridge + WASM link target
 # =============================================================================
 BRIDGE_INJECTION = """\
