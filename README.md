@@ -128,8 +128,9 @@ profile no longer overrides native EH with `-fexceptions`. The workflow runs
 it exercises mixed C/C++ exceptions and longjmp, pthread execution, and
 separate wasm32/wasm64 toolchain probes.
 
-Memory64 is not shipped. Emscripten 3.1.74 and Node 22.16.0 successfully ran
-the four small ST/MT wasm32/wasm64 probes. The ST module measured 22,469 bytes
+Memory64 is not shipped. The four small ST/MT wasm32/wasm64 probes pass with
+Emscripten 3.1.74 and Node.js 26.9.0. CI pins Node.js 26 for this check because
+the runner's Node 22 cannot instantiate the final wasm64 table encoding. The ST module measured 22,469 bytes
 for wasm32 and 22,531 bytes for wasm64; MT measured 46,880 and 48,834 bytes.
 These are probe sizes, not engine benchmarks. The 64-bit probe reports
 8-byte pointers, so an array of 1,048,576 pointer slots uses 8 MiB instead

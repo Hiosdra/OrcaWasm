@@ -21,6 +21,13 @@ else
     export EM_CACHE="$tmp_root/emscripten-cache"
 fi
 
+node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
+if (( node_major < 26 )); then
+    printf 'Node.js 26+ is required for the wasm64 runtime probe; found %s.\n' "$(node --version)" >&2
+    exit 2
+fi
+echo "Node.js runtime for WebAssembly probes: $(node --version)"
+
 cat > "$tmp_root/longjmp.c" <<'EOF'
 #include <setjmp.h>
 

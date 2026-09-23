@@ -154,10 +154,10 @@ jobs:
           # HEAD). Negligible next to a 1-3 h build.
           fetch-depth: 0
 
-      # ── Node (for the post-build smoke test) ─────────────────────────
+      # ── Node 26 supports the final wasm64 encoding used by the EH probe ──
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 26
 
       # ── Emscripten ──────────────────────────────────────────────────
       # Cache the whole emsdk tree (toolchain + activated config). After the
@@ -992,7 +992,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 26
 
       # Both downloads target artifacts/, not some fresh scratch directory
       # — st ships slicer.js/.wasm, mt ships slicer-mt.js/.wasm, so the
