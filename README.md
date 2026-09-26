@@ -41,6 +41,14 @@ The script builds the pinned OrcaSlicer dependencies, applies `patches/apply.py`
 and writes the selected pair to `artifacts/`. Use `EMSDK=/path/to/emsdk` when
 the toolchain is not installed at `/opt/emsdk`.
 
+The engine and compiled C++ dependencies use native WebAssembly exception
+handling (`-fwasm-exceptions`). C dependencies use
+`-sSUPPORT_LONGJMP=wasm`, so their `setjmp`/`longjmp` handling matches the C++
+exception model; the final link selects both modes explicitly. The OCCT build
+disables `OCC_CONVERT_SIGNALS`, whose Unix signal conversion conflicts with
+that model. The build cache stamp versions are bumped when these compiler
+flags change so old static archives cannot be reused accidentally.
+
 The generated local script is derived from
 `.github/workflows/build-wasm.yml`. After changing that workflow, regenerate it
 with:

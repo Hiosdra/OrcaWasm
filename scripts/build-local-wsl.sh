@@ -15,6 +15,8 @@ export OCCT_VERSION="${OCCT_VERSION:-7.8.1}"
 export EMSDK_VERSION="${EMSDK_VERSION:-3.1.74}"
 export ONETBB_VERSION="${ONETBB_VERSION:-v2021.13.2}"
 export EMSDK="${EMSDK:-/opt/emsdk}"
+export WASM_EH_CXX_FLAGS="${WASM_EH_CXX_FLAGS:--fwasm-exceptions -UOCC_CONVERT_SIGNALS}"
+export WASM_EH_C_FLAGS="${WASM_EH_C_FLAGS:--sSUPPORT_LONGJMP=wasm -UOCC_CONVERT_SIGNALS}"
 if [[ "$VARIANT" == "mt" ]]; then
   export OUTPUT_NAME="slicer-mt"
 else
@@ -79,15 +81,15 @@ source "$EMSDK/emsdk_env.sh"
 BOOST_VERSION="1.83.0"
 BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
-# _v2 suffix: manually bumped, not tied to BOOST_VERSION — the
-# BOOST_LOG_NO_THREADS fix above changed Boost's build *flags*,
-# not its pinned version, so BOOST_VERSION alone wouldn't
+# _v3 suffix: manually bumped, not tied to BOOST_VERSION — the
+# native Wasm EH and BOOST_LOG_NO_THREADS fixes change Boost's build
+# flags, not its pinned version, so BOOST_VERSION alone wouldn't
 # invalidate a stale cached build. Restore-keys below prefix-match
 # regardless of this suffix (see "Restore dep cache"'s own
 # comment on why a version bump alone isn't sufficient), so
 # without this the mt job would restore its OLD, wrongly-built
 # libboost_log.a from cache and skip rebuilding it entirely.
-STAMP="${INSTALL}/.boost_built_${VARIANT}_v2"
+STAMP="${INSTALL}/.boost_built_${VARIANT}_v3"
 mkdir -p "${INSTALL}"
 [[ -f "${STAMP}" ]] && echo "[boost] stamp exists — skip" && exit 0
 
@@ -113,13 +115,13 @@ B2_DEFINES=(
   "define=BOOST_LOG_NO_THREADS=1"
 )
 if [[ "${VARIANT}" == "mt" ]]; then
-  B2_EXTRA_CXXFLAGS="cxxflags=-pthread"
+  B2_EXTRA_CXXFLAGS="cxxflags=${WASM_EH_CXX_FLAGS} -pthread"
 else
   # Existing st behavior, unchanged.
   B2_DEFINES+=(
     "define=BOOST_THREAD_DONT_USE_PTHREAD=1"
   )
-  B2_EXTRA_CXXFLAGS=""
+  B2_EXTRA_CXXFLAGS="cxxflags=${WASM_EH_CXX_FLAGS}"
 fi
 
 ./b2 \
@@ -142,7 +144,7 @@ fi
   --with-system \
   --with-thread \
   "${B2_DEFINES[@]}" \
-  ${B2_EXTRA_CXXFLAGS} \
+  "${B2_EXTRA_CXXFLAGS}" \
   -j"$(nproc)" \
   install
 
@@ -160,7 +162,7 @@ touch "${STAMP}"
 (
 source "$EMSDK/emsdk_env.sh"
 INSTALL="$(pwd)/deps-install"
-STAMP="${INSTALL}/.math_built_${VARIANT}"
+STAMP="${INSTALL}/.math_built_${VARIANT}_wasm-eh-v1"
 [[ -f "${STAMP}" ]] && echo "[math] stamp exists — skip" && exit 0
 
 GMP_VERSION=6.3.0
@@ -179,8 +181,8 @@ cd "${DL}/gmp-${GMP_VERSION}"
 # the same value via direct env inheritance for all sub-configures.
 printf 'gmp_cv_asm_label_suffix=":"\n' > /tmp/gmp_site.sh
 export gmp_cv_asm_label_suffix=":"
-export CFLAGS="${EXTRA_CXX_FLAGS}"
-export CXXFLAGS="${EXTRA_CXX_FLAGS}"
+export CFLAGS="${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}"
+export CXXFLAGS="${WASM_EH_CXX_FLAGS} ${EXTRA_CXX_FLAGS}"
 CONFIG_SITE=/tmp/gmp_site.sh emconfigure ./configure \
   --prefix="${INSTALL}" \
   --host=wasm32-unknown-emscripten \
@@ -229,10 +231,10 @@ source "$EMSDK/emsdk_env.sh"
 INSTALL="$(pwd)/deps-install"
 # Stamp name is version-suffixed (like the OCCT step below) AND
 # variant-suffixed (new — EXPAT/NLopt's compiled objects now
-# differ by -pthread) so that bumping either invalidates it even
+# differ by -pthread and native Wasm EH) so that bumping either invalidates it even
 # if the cache step above only fell back to an older cache via
 # restore-keys.
-STAMP="${INSTALL}/.headers_built_eigen5.0.1_nlohmann3.11.3_expat2.5.0_nlopt2.7.1_cereal1.3.2_${VARIANT}"
+STAMP="${INSTALL}/.headers_built_eigen5.0.1_nlohmann3.11.3_expat2.5.0_nlopt2.7.1_cereal1.3.2_${VARIANT}_wasm-eh-v1"
 [[ -f "${STAMP}" ]] && echo "[headers+expat+nlopt] cached" && exit 0
 
 # ── Eigen3 (header-only, install cmake config) ────────────────
@@ -264,7 +266,7 @@ emcmake cmake -S /tmp/expat-2.5.0 -B /tmp/expat-build -G Ninja \
   -DEXPAT_BUILD_EXAMPLES=OFF \
   -DEXPAT_BUILD_TESTS=OFF \
   -DEXPAT_SHARED_LIBS=OFF \
-  "-DCMAKE_C_FLAGS=${EXTRA_CXX_FLAGS}"
+  "-DCMAKE_C_FLAGS=${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}"
 emmake cmake --build /tmp/expat-build --target install
 
 # ── NLopt (optimizer — needed by libslic3r) ───────────────────
@@ -280,8 +282,8 @@ emcmake cmake -S /tmp/nlopt-2.7.1 -B /tmp/nlopt-build -G Ninja \
   -DNLOPT_OCTAVE=OFF \
   -DNLOPT_SWIG=OFF \
   -DBUILD_SHARED_LIBS=OFF \
-  "-DCMAKE_C_FLAGS=${EXTRA_CXX_FLAGS}" \
-  "-DCMAKE_CXX_FLAGS=${EXTRA_CXX_FLAGS}"
+  "-DCMAKE_C_FLAGS=${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}" \
+  "-DCMAKE_CXX_FLAGS=${WASM_EH_CXX_FLAGS} ${EXTRA_CXX_FLAGS}"
 emmake cmake --build /tmp/nlopt-build --target install
 
 # ── cereal (header-only serialization — needed by libslic3r) ─────
@@ -306,7 +308,7 @@ touch "${STAMP}"
 (
 source "$EMSDK/emsdk_env.sh"
 INSTALL="$(pwd)/deps-install"
-STAMP="${INSTALL}/.libnoise_built_${VARIANT}"
+STAMP="${INSTALL}/.libnoise_built_${VARIANT}_wasm-eh-v1"
 [[ -f "${STAMP}" ]] && echo "[libnoise] stamp exists — skip" && exit 0
 
 echo "[libnoise] downloading Orca-deps-libnoise 1.0…"
@@ -319,7 +321,7 @@ echo "[libnoise] configuring with Emscripten…"
 emcmake cmake -S /tmp/libnoise-src -B /tmp/libnoise-build -G Ninja \
   -DCMAKE_INSTALL_PREFIX="${INSTALL}" \
   -DCMAKE_BUILD_TYPE=Release \
-  "-DCMAKE_CXX_FLAGS=${EXTRA_CXX_FLAGS}"
+  "-DCMAKE_CXX_FLAGS=${WASM_EH_CXX_FLAGS} ${EXTRA_CXX_FLAGS}"
 
 echo "[libnoise] building…"
 emmake cmake --build /tmp/libnoise-build --target install -j"$(nproc)"
@@ -339,13 +341,13 @@ source "$EMSDK/emsdk_env.sh"
 OCCT_VERSION="7.8.1"
 OCCT_TAG="V${OCCT_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
-# _v2 suffix: manually bumped, not tied to OCCT_TAG — the -pthread
-# fix below changed OCCT's build *flags* for mt, not its pinned
-# version, so OCCT_TAG alone wouldn't invalidate a stale cached
-# (non-pthread) build already sitting in the mt deps-install
+# _v3 suffix: manually bumped, not tied to OCCT_TAG — the native
+# Wasm EH and signal-conversion fixes changed OCCT's build flags,
+# not its pinned version, so OCCT_TAG alone wouldn't invalidate a
+# stale cached build already sitting in deps-install
 # cache from before this fix (same gotcha as the Boost stamp
 # bump above — the cache key itself doesn't encode these flags).
-STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_v2"
+STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_v3"
 [[ -f "${STAMP}" ]] && echo "[occt] stamp exists — skip" && exit 0
 
 echo "[occt] downloading OCCT ${OCCT_VERSION}…"
@@ -366,8 +368,22 @@ p = pathlib.Path('/tmp/occt/occt-src/CMakeLists.txt')
 t = p.read_text()
 anchor = 'set (BUILD_TOOLKITS ${RAW_BUILD_TOOLKITS})'
 assert anchor in t, 'OCCT BUILD_TOOLKITS anchor not found — OCCT layout changed'
-p.write_text(t.replace(anchor, anchor + '\nlist (REMOVE_ITEM BUILD_TOOLKITS ExpToCasExe)', 1))
+if 'list (REMOVE_ITEM BUILD_TOOLKITS ExpToCasExe)' not in t:
+  t = t.replace(anchor, anchor + '\nlist (REMOVE_ITEM BUILD_TOOLKITS ExpToCasExe)', 1)
+p.write_text(t)
 print('[occt-patch] excluded ExpToCasExe from BUILD_TOOLKITS')
+
+flags = pathlib.Path('/tmp/occt/occt-src/adm/cmake/occt_defs_flags.cmake')
+t = flags.read_text()
+marker = '# OrcaWasm: disable Unix signal conversion for native Wasm EH.'
+if marker not in t:
+  assert 'OCC_CONVERT_SIGNALS' in t, 'OCCT signal conversion definition not found'
+  t += ('\n\n' + marker + '\n'
+        'if (EMSCRIPTEN)\n'
+        '  remove_definitions(-DOCC_CONVERT_SIGNALS)\n'
+        'endif()\n')
+  flags.write_text(t)
+print('[occt-patch] disabled OCC_CONVERT_SIGNALS for Emscripten')
 PYEOF
 
 echo "[occt] configuring with Emscripten…"
@@ -384,11 +400,13 @@ echo "[occt] configuring with Emscripten…"
 # and CMAKE_CROSSCOMPILING_EMULATOR=node lets cmake run any in-build
 # codegen tools via Node.
 #
-# mt needs -pthread here too — this is a wholly separate cmake
+# C++ dependencies use native Wasm EH; C setjmp/longjmp uses its
+# matching Wasm EH model. mt needs -pthread here too — this is a
+# wholly separate cmake
 # invocation from "Configure WASM build" below (its own toolchain
 # file, not emcmake), so it never inherited that step's
 # EXTRA_CXX_FLAGS. Missing this is exactly what caused a real link
-# failure: OCCT's own -fexceptions runtime glue ("exceptions.o")
+# failure: OCCT's own exception runtime glue ("exceptions.o")
 # got compiled without atomics/bulk-memory support and then linked
 # into the final --shared-memory binary, even though the
 # variant-suffixed Emscripten cache (a different, already-fixed
@@ -422,8 +440,8 @@ cmake \
   -DUSE_DRACO=OFF \
   -DUSE_VTK=OFF \
   -DUSE_TBB=OFF \
-  "-DCMAKE_CXX_FLAGS=-O2 -fexceptions -Wno-deprecated-anon-enum-enum-conversion -Wno-unknown-warning-option ${EXTRA_CXX_FLAGS}" \
-  "-DCMAKE_C_FLAGS=-O2 ${EXTRA_CXX_FLAGS}"
+  "-DCMAKE_CXX_FLAGS=-O2 ${WASM_EH_CXX_FLAGS} -Wno-deprecated-anon-enum-enum-conversion -Wno-unknown-warning-option ${EXTRA_CXX_FLAGS}" \
+  "-DCMAKE_C_FLAGS=-O2 ${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}"
 
 echo "[occt] building (first run ~30–60 min)…"
 cmake --build /tmp/occt/build -j"$(nproc)"
@@ -572,14 +590,17 @@ if [[ "$VARIANT" == "mt" ]]; then
 (
 source "$EMSDK/emsdk_env.sh"
 INSTALL="$(pwd)/deps-install"
-STAMP="${INSTALL}/.onetbb_${ONETBB_VERSION}"
+STAMP="${INSTALL}/.onetbb_${ONETBB_VERSION}_wasm-eh-v1"
 [[ -f "${STAMP}" ]] && echo "[oneTBB] cached" && exit 0
 
 git clone --depth 1 --branch "${ONETBB_VERSION}" \
   https://github.com/uxlfoundation/oneTBB.git /tmp/onetbb
+python3 scripts/patch-onetbb-wasm-exceptions.py /tmp/onetbb
 emcmake cmake -S /tmp/onetbb -B /tmp/onetbb-build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${INSTALL}" \
+  "-DCMAKE_C_FLAGS=${WASM_EH_C_FLAGS} -pthread" \
+  "-DCMAKE_CXX_FLAGS=${WASM_EH_CXX_FLAGS} -pthread" \
   -DBUILD_SHARED_LIBS=OFF \
   -DTBB_TEST=OFF \
   -DTBB_EXAMPLES=OFF \
@@ -646,8 +667,8 @@ emcmake cmake \
   -DCGAL_DIR="${DEP_INSTALL}/lib/cmake/CGAL" \
   -DNLOPT_LIBRARY="${DEP_INSTALL}/lib/libnlopt.a" \
   -DNLOPT_INCLUDE_DIR="${DEP_INSTALL}/include" \
-  "-DCMAKE_CXX_FLAGS=-I${COMMON_SHIM_DIR} -I${TBB_INCLUDE_DIR} -fexceptions -DBOOST_HAS_PTHREADS=1 -DSLIC3R_WASM=1 -DSLIC3R_NO_OPENVDB=1 -DSLIC3R_NO_OPENCV=1 ${EXTRA_CXX_FLAGS}" \
-  "-DCMAKE_C_FLAGS=-I${COMMON_SHIM_DIR} -I${TBB_INCLUDE_DIR} ${EXTRA_CXX_FLAGS}"
+  "-DCMAKE_CXX_FLAGS=-I${COMMON_SHIM_DIR} -I${TBB_INCLUDE_DIR} ${WASM_EH_CXX_FLAGS} -DBOOST_HAS_PTHREADS=1 -DSLIC3R_WASM=1 -DSLIC3R_NO_OPENVDB=1 -DSLIC3R_NO_OPENCV=1 ${EXTRA_CXX_FLAGS}" \
+  "-DCMAKE_C_FLAGS=-I${COMMON_SHIM_DIR} -I${TBB_INCLUDE_DIR} ${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}"
 
 )
 

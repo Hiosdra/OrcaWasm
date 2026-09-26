@@ -36,7 +36,6 @@ target_link_options(slicer PRIVATE
   -sENVIRONMENT=web,worker,node
   -sMODULARIZE=1
   -sEXPORT_NAME=OrcaModule
-  -sDISABLE_EXCEPTION_CATCHING=0
   $<$<BOOL:${SLIC3R_WASM_MT}>:-pthread>
   $<$<BOOL:${SLIC3R_WASM_MT}>:-sUSE_PTHREADS=1>
   # Pre-spawns the pthread worker pool at module load instead of creating
@@ -79,7 +78,10 @@ target_link_options(slicer PRIVATE
   # 8/8c/8d/8e/8f), fixed with default member initializers there instead —
   # verified against the Voron Cube, Stanford Bunny, and a 1.1M-triangle
   # model with Arachne enabled.
-  -fexceptions
+  # Native Wasm EH is selected consistently with all compiled dependencies.
+  -fwasm-exceptions
+  # C dependencies use the matching setjmp/longjmp model.
+  -sSUPPORT_LONGJMP=wasm
   # No --preload-file: the headless flat-config slicer never reads orca/resources
   # at runtime (verified in-host — a full slice opens only /tmp/*.stl/.gcode,
   # zero /resources access, and slicing is byte-identical with /resources removed).

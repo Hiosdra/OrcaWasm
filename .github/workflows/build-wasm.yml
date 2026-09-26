@@ -133,6 +133,10 @@ jobs:
       EMSDK_VERSION: "3.1.74"
       ONETBB_VERSION: "v2021.13.2"
       EMSDK: /opt/emsdk
+      # Keep C++ on native WebAssembly EH and C setjmp/longjmp on its matching
+      # Wasm EH model. OCCT also removes its directory definition; -U is a guard.
+      WASM_EH_CXX_FLAGS: "-fwasm-exceptions -UOCC_CONVERT_SIGNALS"
+      WASM_EH_C_FLAGS: "-sSUPPORT_LONGJMP=wasm -UOCC_CONVERT_SIGNALS"
       # ── Variant-derived settings ─────────────────────────────────────
       # Everything that differs between st/mt boils down to these values;
       # every step below reads them instead of hardcoding "slicer" or the
@@ -176,7 +180,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /opt/emsdk
-          key: emsdk-${{ runner.os }}-${{ matrix.variant }}-${{ env.EMSDK_VERSION }}-v1
+          key: emsdk-${{ runner.os }}-${{ matrix.variant }}-${{ env.EMSDK_VERSION }}-${{ hashFiles('scripts/prepare-emscripten-ports.py') }}-ports-v2
 
       - name: Install Emscripten
         if: steps.cache-emsdk.outputs.cache-hit != 'true'
@@ -245,7 +249,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: deps-install
-          key: wasm-deps-${{ runner.os }}-${{ matrix.variant }}-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-onetbb-${{ env.ONETBB_VERSION }}-v17
+          key: wasm-deps-${{ runner.os }}-${{ matrix.variant }}-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-onetbb-${{ env.ONETBB_VERSION }}-v18
           # On a key bump, fall back to the closest previous cache. Stamp files
           # make partial deps-install safe, so only changed deps get rebuilt
           # instead of redoing the full ~3 h build (OCCT alone is ~45 min).
@@ -295,15 +299,15 @@ jobs:
           BOOST_VERSION="1.83.0"
           BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
           INSTALL="$(pwd)/deps-install"
-          # _v2 suffix: manually bumped, not tied to BOOST_VERSION — the
-          # BOOST_LOG_NO_THREADS fix above changed Boost's build *flags*,
-          # not its pinned version, so BOOST_VERSION alone wouldn't
+          # _v3 suffix: manually bumped, not tied to BOOST_VERSION — the
+          # native Wasm EH and BOOST_LOG_NO_THREADS fixes change Boost's build
+          # flags, not its pinned version, so BOOST_VERSION alone wouldn't
           # invalidate a stale cached build. Restore-keys below prefix-match
           # regardless of this suffix (see "Restore dep cache"'s own
           # comment on why a version bump alone isn't sufficient), so
           # without this the mt job would restore its OLD, wrongly-built
           # libboost_log.a from cache and skip rebuilding it entirely.
-          STAMP="${INSTALL}/.boost_built_${{ matrix.variant }}_v2"
+          STAMP="${INSTALL}/.boost_built_${{ matrix.variant }}_v3"
           mkdir -p "${INSTALL}"
           [[ -f "${STAMP}" ]] && echo "[boost] stamp exists — skip" && exit 0
 
@@ -329,13 +333,13 @@ jobs:
             "define=BOOST_LOG_NO_THREADS=1"
           )
           if [[ "${{ matrix.variant }}" == "mt" ]]; then
-            B2_EXTRA_CXXFLAGS="cxxflags=-pthread"
+            B2_EXTRA_CXXFLAGS="cxxflags=${WASM_EH_CXX_FLAGS} -pthread"
           else
             # Existing st behavior, unchanged.
             B2_DEFINES+=(
               "define=BOOST_THREAD_DONT_USE_PTHREAD=1"
             )
-            B2_EXTRA_CXXFLAGS=""
+            B2_EXTRA_CXXFLAGS="cxxflags=${WASM_EH_CXX_FLAGS}"
           fi
 
           ./b2 \
@@ -358,7 +362,7 @@ jobs:
             --with-system \
             --with-thread \
             "${B2_DEFINES[@]}" \
-            ${B2_EXTRA_CXXFLAGS} \
+            "${B2_EXTRA_CXXFLAGS}" \
             -j"$(nproc)" \
             install
 
@@ -385,7 +389,7 @@ jobs:
         run: |
           source "$EMSDK/emsdk_env.sh"
           INSTALL="$(pwd)/deps-install"
-          STAMP="${INSTALL}/.math_built_${{ matrix.variant }}"
+          STAMP="${INSTALL}/.math_built_${{ matrix.variant }}_wasm-eh-v1"
           [[ -f "${STAMP}" ]] && echo "[math] stamp exists — skip" && exit 0
 
           GMP_VERSION=6.3.0
@@ -404,8 +408,8 @@ jobs:
           # the same value via direct env inheritance for all sub-configures.
           printf 'gmp_cv_asm_label_suffix=":"\n' > /tmp/gmp_site.sh
           export gmp_cv_asm_label_suffix=":"
-          export CFLAGS="${EXTRA_CXX_FLAGS}"
-          export CXXFLAGS="${EXTRA_CXX_FLAGS}"
+          export CFLAGS="${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}"
+          export CXXFLAGS="${WASM_EH_CXX_FLAGS} ${EXTRA_CXX_FLAGS}"
           CONFIG_SITE=/tmp/gmp_site.sh emconfigure ./configure \
             --prefix="${INSTALL}" \
             --host=wasm32-unknown-emscripten \
@@ -456,10 +460,10 @@ jobs:
           INSTALL="$(pwd)/deps-install"
           # Stamp name is version-suffixed (like the OCCT step below) AND
           # variant-suffixed (new — EXPAT/NLopt's compiled objects now
-          # differ by -pthread) so that bumping either invalidates it even
+          # differ by -pthread and native Wasm EH) so that bumping either invalidates it even
           # if the cache step above only fell back to an older cache via
           # restore-keys.
-          STAMP="${INSTALL}/.headers_built_eigen5.0.1_nlohmann3.11.3_expat2.5.0_nlopt2.7.1_cereal1.3.2_${{ matrix.variant }}"
+          STAMP="${INSTALL}/.headers_built_eigen5.0.1_nlohmann3.11.3_expat2.5.0_nlopt2.7.1_cereal1.3.2_${{ matrix.variant }}_wasm-eh-v1"
           [[ -f "${STAMP}" ]] && echo "[headers+expat+nlopt] cached" && exit 0
 
           # ── Eigen3 (header-only, install cmake config) ────────────────
@@ -491,7 +495,7 @@ jobs:
             -DEXPAT_BUILD_EXAMPLES=OFF \
             -DEXPAT_BUILD_TESTS=OFF \
             -DEXPAT_SHARED_LIBS=OFF \
-            "-DCMAKE_C_FLAGS=${EXTRA_CXX_FLAGS}"
+            "-DCMAKE_C_FLAGS=${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}"
           emmake cmake --build /tmp/expat-build --target install
 
           # ── NLopt (optimizer — needed by libslic3r) ───────────────────
@@ -507,8 +511,8 @@ jobs:
             -DNLOPT_OCTAVE=OFF \
             -DNLOPT_SWIG=OFF \
             -DBUILD_SHARED_LIBS=OFF \
-            "-DCMAKE_C_FLAGS=${EXTRA_CXX_FLAGS}" \
-            "-DCMAKE_CXX_FLAGS=${EXTRA_CXX_FLAGS}"
+            "-DCMAKE_C_FLAGS=${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}" \
+            "-DCMAKE_CXX_FLAGS=${WASM_EH_CXX_FLAGS} ${EXTRA_CXX_FLAGS}"
           emmake cmake --build /tmp/nlopt-build --target install
 
           # ── cereal (header-only serialization — needed by libslic3r) ─────
@@ -535,7 +539,7 @@ jobs:
         run: |
           source "$EMSDK/emsdk_env.sh"
           INSTALL="$(pwd)/deps-install"
-          STAMP="${INSTALL}/.libnoise_built_${{ matrix.variant }}"
+          STAMP="${INSTALL}/.libnoise_built_${{ matrix.variant }}_wasm-eh-v1"
           [[ -f "${STAMP}" ]] && echo "[libnoise] stamp exists — skip" && exit 0
 
           echo "[libnoise] downloading Orca-deps-libnoise 1.0…"
@@ -548,7 +552,7 @@ jobs:
           emcmake cmake -S /tmp/libnoise-src -B /tmp/libnoise-build -G Ninja \
             -DCMAKE_INSTALL_PREFIX="${INSTALL}" \
             -DCMAKE_BUILD_TYPE=Release \
-            "-DCMAKE_CXX_FLAGS=${EXTRA_CXX_FLAGS}"
+            "-DCMAKE_CXX_FLAGS=${WASM_EH_CXX_FLAGS} ${EXTRA_CXX_FLAGS}"
 
           echo "[libnoise] building…"
           emmake cmake --build /tmp/libnoise-build --target install -j"$(nproc)"
@@ -567,13 +571,13 @@ jobs:
           OCCT_VERSION="7.8.1"
           OCCT_TAG="V${OCCT_VERSION//./_}"
           INSTALL="$(pwd)/deps-install"
-          # _v2 suffix: manually bumped, not tied to OCCT_TAG — the -pthread
-          # fix below changed OCCT's build *flags* for mt, not its pinned
-          # version, so OCCT_TAG alone wouldn't invalidate a stale cached
-          # (non-pthread) build already sitting in the mt deps-install
+          # _v3 suffix: manually bumped, not tied to OCCT_TAG — the native
+          # Wasm EH and signal-conversion fixes changed OCCT's build flags,
+          # not its pinned version, so OCCT_TAG alone wouldn't invalidate a
+          # stale cached build already sitting in deps-install
           # cache from before this fix (same gotcha as the Boost stamp
           # bump above — the cache key itself doesn't encode these flags).
-          STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_v2"
+          STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_v3"
           [[ -f "${STAMP}" ]] && echo "[occt] stamp exists — skip" && exit 0
 
           echo "[occt] downloading OCCT ${OCCT_VERSION}…"
@@ -594,8 +598,22 @@ jobs:
           t = p.read_text()
           anchor = 'set (BUILD_TOOLKITS ${RAW_BUILD_TOOLKITS})'
           assert anchor in t, 'OCCT BUILD_TOOLKITS anchor not found — OCCT layout changed'
-          p.write_text(t.replace(anchor, anchor + '\nlist (REMOVE_ITEM BUILD_TOOLKITS ExpToCasExe)', 1))
+          if 'list (REMOVE_ITEM BUILD_TOOLKITS ExpToCasExe)' not in t:
+            t = t.replace(anchor, anchor + '\nlist (REMOVE_ITEM BUILD_TOOLKITS ExpToCasExe)', 1)
+          p.write_text(t)
           print('[occt-patch] excluded ExpToCasExe from BUILD_TOOLKITS')
+
+          flags = pathlib.Path('/tmp/occt/occt-src/adm/cmake/occt_defs_flags.cmake')
+          t = flags.read_text()
+          marker = '# OrcaWasm: disable Unix signal conversion for native Wasm EH.'
+          if marker not in t:
+            assert 'OCC_CONVERT_SIGNALS' in t, 'OCCT signal conversion definition not found'
+            t += ('\n\n' + marker + '\n'
+                  'if (EMSCRIPTEN)\n'
+                  '  remove_definitions(-DOCC_CONVERT_SIGNALS)\n'
+                  'endif()\n')
+            flags.write_text(t)
+          print('[occt-patch] disabled OCC_CONVERT_SIGNALS for Emscripten')
           PYEOF
 
           echo "[occt] configuring with Emscripten…"
@@ -612,11 +630,13 @@ jobs:
           # and CMAKE_CROSSCOMPILING_EMULATOR=node lets cmake run any in-build
           # codegen tools via Node.
           #
-          # mt needs -pthread here too — this is a wholly separate cmake
+          # C++ dependencies use native Wasm EH; C setjmp/longjmp uses its
+          # matching Wasm EH model. mt needs -pthread here too — this is a
+          # wholly separate cmake
           # invocation from "Configure WASM build" below (its own toolchain
           # file, not emcmake), so it never inherited that step's
           # EXTRA_CXX_FLAGS. Missing this is exactly what caused a real link
-          # failure: OCCT's own -fexceptions runtime glue ("exceptions.o")
+          # failure: OCCT's own exception runtime glue ("exceptions.o")
           # got compiled without atomics/bulk-memory support and then linked
           # into the final --shared-memory binary, even though the
           # variant-suffixed Emscripten cache (a different, already-fixed
@@ -650,8 +670,8 @@ jobs:
             -DUSE_DRACO=OFF \
             -DUSE_VTK=OFF \
             -DUSE_TBB=OFF \
-            "-DCMAKE_CXX_FLAGS=-O2 -fexceptions -Wno-deprecated-anon-enum-enum-conversion -Wno-unknown-warning-option ${EXTRA_CXX_FLAGS}" \
-            "-DCMAKE_C_FLAGS=-O2 ${EXTRA_CXX_FLAGS}"
+            "-DCMAKE_CXX_FLAGS=-O2 ${WASM_EH_CXX_FLAGS} -Wno-deprecated-anon-enum-enum-conversion -Wno-unknown-warning-option ${EXTRA_CXX_FLAGS}" \
+            "-DCMAKE_C_FLAGS=-O2 ${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}"
 
           echo "[occt] building (first run ~30–60 min)…"
           cmake --build /tmp/occt/build -j"$(nproc)"
@@ -665,121 +685,13 @@ jobs:
           ls "${INSTALL}/lib/libTKernel.a" && echo "  TKernel.a OK"
           touch "${STAMP}"
 
-      # ── Emscripten ports — ZLIB / libpng / libjpeg (mt only) ─────────────
-      # libpng.py already supports a pthread-aware "libpng-mt" variant
-      # (checks settings.PTHREADS, adds -pthread, caches under a distinct
-      # filename), selectable by requesting that exact target name via
-      # embuilder — confirmed by reading tools/ports/libpng.py directly.
-      # zlib.py and libjpeg.py have no such variants dict at all: building
-      # `zlib`/`libjpeg` always produces the same non-pthread object code
-      # regardless of any ambient flag, and there is no "-mt" target to
-      # request instead. An EMCC_CFLAGS-based attempt at this (tried first,
-      # before finding this out) silently did nothing: Emscripten's own
-      # system_libs.clean_env() *deliberately deletes* EMCC_CFLAGS before
-      # every port/system-library compile, specifically so ports build
-      # hermetically regardless of what the user has set — confirmed by
-      # reading tools/system_libs.py directly. So for mt, patch zlib.py/
-      # libjpeg.py in place to add the identical pattern libpng.py already
-      # uses (mirrored exactly, verified locally against this repo's
-      # pinned Emscripten 3.1.74 — `embuilder --help` lists zlib-mt/
-      # libjpeg-mt as valid targets once patched), rather than vendoring
-      # these from a different source and risking subtle divergence from
-      # what the st build already ships.
-      - name: Patch Emscripten zlib/libjpeg ports for pthread (mt)
-        if: matrix.variant == 'mt'
+      # Emscripten ports are built hermetically outside the global CMake flags.
+      # Give zlib/libjpeg the Wasm setjmp variants that pinned libpng already
+      # provides, including pthread combinations for the MT artifact.
+      - name: Prepare Emscripten ports for native Wasm EH
         run: |
           source "$EMSDK/emsdk_env.sh"
-          python3 - <<'PYEOF'
-          import os
-          import pathlib
-
-          # Read EMSDK from the environment rather than interpolating it into
-          # this heredoc — the heredoc delimiter is quoted ('PYEOF') so bash
-          # performs no variable substitution inside it at all.
-          emsdk = os.environ["EMSDK"]
-          zlib_py = pathlib.Path(emsdk, "upstream/emscripten/tools/ports/zlib.py")
-          t = zlib_py.read_text()
-          # The "Cache Emscripten" step above caches the whole $EMSDK tree,
-          # including this file's own patched state from a previous run —
-          # so a cache hit restores an already-patched zlib.py, and this
-          # script must tolerate re-running against it instead of asserting.
-          if "variants = {'zlib-mt'" in t:
-            print("[zlib-patch] already patched (cached emsdk) — skipping")
-          else:
-            anchor = (
-                "def needed(settings):\n"
-                "  return settings.USE_ZLIB\n"
-                "\n\n"
-                "def get(ports, settings, shared):"
-            )
-            assert anchor in t, "zlib.py layout changed — pthread patch anchor not found"
-            t = t.replace(anchor, (
-                "variants = {'zlib-mt': {'PTHREADS': 1}}\n\n\n"
-                "def needed(settings):\n"
-                "  return settings.USE_ZLIB\n"
-                "\n\n"
-                "def get_lib_name(settings):\n"
-                "  return 'libz-mt.a' if settings.PTHREADS else 'libz.a'\n"
-                "\n\n"
-                "def get(ports, settings, shared):"
-            ), 1)
-            anchor2 = (
-                "    flags = ['-Wno-deprecated-non-prototype']\n"
-                "    ports.build_port(source_path, final, 'zlib', srcs=srcs, flags=flags)\n"
-                "\n"
-                "  return [shared.cache.get_lib('libz.a', create, what='port')]"
-            )
-            assert anchor2 in t, "zlib.py build block changed — pthread patch anchor not found"
-            t = t.replace(anchor2, (
-                "    flags = ['-Wno-deprecated-non-prototype']\n"
-                "    if settings.PTHREADS:\n"
-                "      flags += ['-pthread']\n"
-                "    ports.build_port(source_path, final, 'zlib', srcs=srcs, flags=flags)\n"
-                "\n"
-                "  return [shared.cache.get_lib(get_lib_name(settings), create, what='port')]"
-            ), 1)
-            zlib_py.write_text(t)
-            print("[zlib-patch] added pthread-aware zlib-mt variant")
-
-          libjpeg_py = pathlib.Path(emsdk, "upstream/emscripten/tools/ports/libjpeg.py")
-          t = libjpeg_py.read_text()
-          if "variants = {'libjpeg-mt'" in t:
-            print("[libjpeg-patch] already patched (cached emsdk) — skipping")
-          else:
-            anchor = (
-                "def needed(settings):\n"
-                "  return settings.USE_LIBJPEG\n"
-                "\n\n"
-                "def get(ports, settings, shared):"
-            )
-            assert anchor in t, "libjpeg.py layout changed — pthread patch anchor not found"
-            t = t.replace(anchor, (
-                "variants = {'libjpeg-mt': {'PTHREADS': 1}}\n\n\n"
-                "def needed(settings):\n"
-                "  return settings.USE_LIBJPEG\n"
-                "\n\n"
-                "def get_lib_name(settings):\n"
-                "  return 'libjpeg-mt.a' if settings.PTHREADS else 'libjpeg.a'\n"
-                "\n\n"
-                "def get(ports, settings, shared):"
-            ), 1)
-            anchor2 = (
-                "    ports.build_port(source_path, final, 'libjpeg', exclude_files=excludes)\n"
-                "\n"
-                "  return [shared.cache.get_lib('libjpeg.a', create, what='port')]"
-            )
-            assert anchor2 in t, "libjpeg.py build block changed — pthread patch anchor not found"
-            t = t.replace(anchor2, (
-                "    flags = []\n"
-                "    if settings.PTHREADS:\n"
-                "      flags += ['-pthread']\n"
-                "    ports.build_port(source_path, final, 'libjpeg', exclude_files=excludes, flags=flags)\n"
-                "\n"
-                "  return [shared.cache.get_lib(get_lib_name(settings), create, what='port')]"
-            ), 1)
-            libjpeg_py.write_text(t)
-            print("[libjpeg-patch] added pthread-aware libjpeg-mt variant")
-          PYEOF
+          python3 scripts/prepare-emscripten-ports.py --emsdk "$EMSDK"
 
       # ── Emscripten ports — ZLIB / libpng / libjpeg ───────────────────────
       # Build emscripten's bundled ports so FindZLIB/FindPNG/FindJPEG can
@@ -792,8 +704,10 @@ jobs:
       # (a few seconds); on a cold emsdk cache it builds them.  Always run it —
       # embuilder is idempotent and self-caching.
       #
-      # mt requests the -mt-suffixed targets (patched in above) so the
-      # actual compiled objects carry atomics/bulk-memory support — every
+      # Request the Wasm-SjLj variants (and also -mt variants for the shared
+      # memory build) so port C code uses the same setjmp model as the engine.
+      # Every object linked into the --shared-memory build also needs atomics
+      # and bulk-memory support — every
       # object linked into a --shared-memory binary needs this regardless
       # of whether its own code touches threads (see the OCCT step's
       # comment for the full explanation; this exact gap broke the link
@@ -808,14 +722,17 @@ jobs:
           source "$EMSDK/emsdk_env.sh"
           SYSROOT_LIB="$EMSDK/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten"
           if [[ "${{ matrix.variant }}" == "mt" ]]; then
-            echo "[emports] building zlib-mt, libpng-mt, libjpeg-mt via embuilder…"
-            embuilder build zlib-mt libpng-mt libjpeg-mt
-            cp "${SYSROOT_LIB}/libz-mt.a" "${SYSROOT_LIB}/libz.a"
-            cp "${SYSROOT_LIB}/libpng-mt.a" "${SYSROOT_LIB}/libpng.a"
-            cp "${SYSROOT_LIB}/libjpeg-mt.a" "${SYSROOT_LIB}/libjpeg.a"
+            echo "[emports] building MT Wasm-SjLj ports via embuilder…"
+            embuilder build zlib-mt-wasm-sjlj libpng-mt-wasm-sjlj libjpeg-mt-wasm-sjlj
+            cp "${SYSROOT_LIB}/libz-mt-wasm-sjlj.a" "${SYSROOT_LIB}/libz.a"
+            cp "${SYSROOT_LIB}/libpng-mt-wasm-sjlj.a" "${SYSROOT_LIB}/libpng.a"
+            cp "${SYSROOT_LIB}/libjpeg-mt-wasm-sjlj.a" "${SYSROOT_LIB}/libjpeg.a"
           else
-            echo "[emports] building zlib, libpng, libjpeg via embuilder…"
-            embuilder build zlib libpng libjpeg
+            echo "[emports] building Wasm-SjLj ports via embuilder…"
+            embuilder build zlib-wasm-sjlj libpng-wasm-sjlj libjpeg-wasm-sjlj
+            cp "${SYSROOT_LIB}/libz-wasm-sjlj.a" "${SYSROOT_LIB}/libz.a"
+            cp "${SYSROOT_LIB}/libpng-wasm-sjlj.a" "${SYSROOT_LIB}/libpng.a"
+            cp "${SYSROOT_LIB}/libjpeg-wasm-sjlj.a" "${SYSROOT_LIB}/libjpeg.a"
           fi
           echo "[emports] sysroot libs:"
           ls "${SYSROOT_LIB}/libz.a" && echo "  libz OK"
@@ -827,14 +744,17 @@ jobs:
         run: |
           source "$EMSDK/emsdk_env.sh"
           INSTALL="$(pwd)/deps-install"
-          STAMP="${INSTALL}/.onetbb_${ONETBB_VERSION}"
+          STAMP="${INSTALL}/.onetbb_${ONETBB_VERSION}_wasm-eh-v1"
           [[ -f "${STAMP}" ]] && echo "[oneTBB] cached" && exit 0
 
           git clone --depth 1 --branch "${ONETBB_VERSION}" \
             https://github.com/uxlfoundation/oneTBB.git /tmp/onetbb
+          python3 scripts/patch-onetbb-wasm-exceptions.py /tmp/onetbb
           emcmake cmake -S /tmp/onetbb -B /tmp/onetbb-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${INSTALL}" \
+            "-DCMAKE_C_FLAGS=${WASM_EH_C_FLAGS} -pthread" \
+            "-DCMAKE_CXX_FLAGS=${WASM_EH_CXX_FLAGS} -pthread" \
             -DBUILD_SHARED_LIBS=OFF \
             -DTBB_TEST=OFF \
             -DTBB_EXAMPLES=OFF \
@@ -850,7 +770,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: deps-install
-          key: wasm-deps-${{ runner.os }}-${{ matrix.variant }}-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-onetbb-${{ env.ONETBB_VERSION }}-v17
+          key: wasm-deps-${{ runner.os }}-${{ matrix.variant }}-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-onetbb-${{ env.ONETBB_VERSION }}-v18
 
       # ── Configure WASM build ─────────────────────────────────────────
       # Builds from OrcaSlicer's own root cmake (with our patches applied).
@@ -904,8 +824,8 @@ jobs:
             -DCGAL_DIR="${DEP_INSTALL}/lib/cmake/CGAL" \
             -DNLOPT_LIBRARY="${DEP_INSTALL}/lib/libnlopt.a" \
             -DNLOPT_INCLUDE_DIR="${DEP_INSTALL}/include" \
-            "-DCMAKE_CXX_FLAGS=-I${COMMON_SHIM_DIR} -I${TBB_INCLUDE_DIR} -fexceptions -DBOOST_HAS_PTHREADS=1 -DSLIC3R_WASM=1 -DSLIC3R_NO_OPENVDB=1 -DSLIC3R_NO_OPENCV=1 ${EXTRA_CXX_FLAGS}" \
-            "-DCMAKE_C_FLAGS=-I${COMMON_SHIM_DIR} -I${TBB_INCLUDE_DIR} ${EXTRA_CXX_FLAGS}"
+            "-DCMAKE_CXX_FLAGS=-I${COMMON_SHIM_DIR} -I${TBB_INCLUDE_DIR} ${WASM_EH_CXX_FLAGS} -DBOOST_HAS_PTHREADS=1 -DSLIC3R_WASM=1 -DSLIC3R_NO_OPENVDB=1 -DSLIC3R_NO_OPENCV=1 ${EXTRA_CXX_FLAGS}" \
+            "-DCMAKE_C_FLAGS=-I${COMMON_SHIM_DIR} -I${TBB_INCLUDE_DIR} ${WASM_EH_C_FLAGS} ${EXTRA_CXX_FLAGS}"
 
       # ── Build WASM module ────────────────────────────────────────────
       - name: Build WASM module
