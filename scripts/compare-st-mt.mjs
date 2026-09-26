@@ -79,10 +79,17 @@ function assertCapabilities(module, label) {
     const len = module.getValue(outLenPtr, 'i32')
     try {
       const capabilities = JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len)))
-      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.3.0') {
-        throw new Error(`${label}: artifact does not identify one-wasm-slicer-api 0.3.0`)
+      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.4.0') {
+        throw new Error(`${label}: artifact does not identify one-wasm-slicer-api 0.4.0`)
       }
-      for (const feature of ['project.manifest', 'project.slice', 'project.slice.multiPlate', 'project.slice.assets']) {
+      const requiredFeatures = [
+        'config.profileApply',
+        'project.manifest',
+        'project.slice',
+        'project.slice.multiPlate',
+        'project.slice.assets',
+      ]
+      for (const feature of requiredFeatures) {
         if (capabilities.features?.[feature] !== 'supported') {
           throw new Error(`${label}: capability ${feature} is not supported`)
         }
@@ -263,7 +270,7 @@ async function main() {
 
   const stCapabilities = assertCapabilities(st, 'st')
   const mtCapabilities = assertCapabilities(mt, 'mt')
-  console.log(`[compare-st-mt] API 0.3: ${stCapabilities.engine?.family ?? 'unknown'} / ${mtCapabilities.engine?.family ?? 'unknown'}`)
+  console.log(`[compare-st-mt] API 0.4: ${stCapabilities.engine?.family ?? 'unknown'} / ${mtCapabilities.engine?.family ?? 'unknown'}`)
 
   const stSession = st._onewasm_session_create()
   const mtSession = mt._onewasm_session_create()
