@@ -2,10 +2,10 @@
 /**
  * WASM engine smoke test.
  *
- * Loads the built slicer.js/slicer.wasm and runs the stable 0.3 project
- * contract end-to-end: onewasm_init, project manifest/prepare/slice/assets,
- * project export, and the geometry-only 3MF import helper. A broken engine
- * build is caught before it's ever published as a GitHub Release
+ * Loads the built slicer.js/slicer.wasm and runs the stable project contract
+ * end-to-end under API 0.4: onewasm_init, profile application, project
+ * manifest/prepare/slice/assets, project export, and the geometry-only 3MF
+ * import helper. The test catches broken builds before they are published as a GitHub Release
  * (build-wasm.yml) or trusted by a host after the artifacts are prepared.
  *
  * This formalizes the ad-hoc reproduction script referenced (but never
@@ -66,8 +66,8 @@ function getCapabilitiesOnce(module) {
     const len = module.getValue(outLenPtr, 'i32')
     try {
       const capabilities = JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len)))
-      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.3.0') {
-        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.3.0')
+      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.4.0') {
+        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.4.0')
       }
       if (!capabilities.project?.nativeProjectFormats?.includes('project.3mf')) {
         throw new Error('capabilities document does not advertise native project.3mf support')
@@ -76,6 +76,7 @@ function getCapabilitiesOnce(module) {
         'core.session',
         'core.configuration',
         'config.fullProfile',
+        'config.profileApply',
         'project.manifest',
         'project.prepare',
         'project.slice',
@@ -710,14 +711,15 @@ async function main() {
   }
 
   // The active smoke path is intentionally strict: a published artifact must
-  // expose the complete promoted 0.3 surface. The old helper scenarios below
+  // expose the complete promoted 0.4 surface. The old helper scenarios below
   // are unreachable legacy text kept temporarily while their historical
   // assertions are retired; they must never be used to validate a release.
-  const requiredStableExports = [
+  const requiredApiExports = [
     '_onewasm_session_create',
     '_onewasm_session_destroy',
     '_onewasm_init',
     '_onewasm_init_profile',
+    '_onewasm_apply_profile',
     '_onewasm_set_progress_callback',
     '_onewasm_cancel',
     '_onewasm_project_set_objects',
@@ -733,9 +735,9 @@ async function main() {
     '_onewasm_last_error',
     '_onewasm_free',
   ]
-  for (const name of requiredStableExports) {
+  for (const name of requiredApiExports) {
     if (typeof module[name] !== 'function') {
-      throw new Error(`loaded engine is missing required 0.3 export ${name}`)
+      throw new Error(`loaded engine is missing required 0.4 export ${name}`)
     }
   }
 

@@ -8,14 +8,14 @@ extern "C" {
 #endif
 
 /*
- * Version 0.3 clean-break contract. The exported symbol names intentionally
+ * Version 0.4 contract. The exported symbol names intentionally
  * stay in the onewasm_ namespace, but their meaning is defined by this
  * version of the header.
  */
 #define ONEWASM_API_VERSION_MAJOR 0
-#define ONEWASM_API_VERSION_MINOR 3
+#define ONEWASM_API_VERSION_MINOR 4
 #define ONEWASM_API_VERSION_PATCH 0
-#define ONEWASM_API_VERSION_STRING "0.3.0"
+#define ONEWASM_API_VERSION_STRING "0.4.0"
 
 typedef void* onewasm_session_t;
 typedef int32_t onewasm_status_t;
@@ -57,6 +57,14 @@ onewasm_status_t onewasm_init(
 );
 
 onewasm_status_t onewasm_init_profile(
+    onewasm_session_t session,
+    const char* format_utf8,
+    uint32_t format_len,
+    const uint8_t* profile_data,
+    uint32_t profile_len
+);
+
+onewasm_status_t onewasm_apply_profile(
     onewasm_session_t session,
     const char* format_utf8,
     uint32_t format_len,
