@@ -2474,111 +2474,133 @@ onewasm_status_t onewasm_apply_profile(
         return ONEWASM_ERR_INPUT_FORMAT;
     }
 
-    // Individual native Orca profile files are sparse patches. Establish the
-    // same engine defaults as onewasm_init once, then let Orca's own native
-    // config parser apply each original profile document in caller order.
-    if (!session->initialized) {
-        static constexpr char defaults[] = "{}";
-        const auto status = onewasm_init(
-            session,
-            reinterpret_cast<const uint8_t*>(defaults),
-            static_cast<uint32_t>(sizeof(defaults) - 1)
-        );
-        if (status != ONEWASM_OK) return status;
-        session->last_error.clear();
-    }
-
-    auto pickNumber = [&](const char* key, double fallback) {
-        if (!document.contains(key)) return fallback;
-        const auto& value = document[key];
-        if (value.is_number()) return value.get<double>();
-        if (value.is_string()) {
-            try { return std::stod(value.get<std::string>()); } catch (...) {}
-        }
-        return fallback;
-    };
-    session->bed_cx = pickNumber("bed_size_x", session->bed_cx * 2.0) / 2.0;
-    session->bed_cy = pickNumber("bed_size_y", session->bed_cy * 2.0) / 2.0;
-    // Native Orca printer presets use printable_area rather than the bridge's
-    // display-only bed_size_x/bed_size_y fields. Read the dimensions from the
-    // original profile document so applying it also updates project placement.
-    // This mirrors the PoC's bed-size display convention (origin at 0,0); the
-    // original JSON remains untouched at the API boundary.
-    if (document.contains("printable_area")) {
-        std::vector<std::string> points;
-        const auto& area = document["printable_area"];
-        if (area.is_array()) {
-            for (const auto& point : area) {
-                if (point.is_string()) points.push_back(point.get<std::string>());
-            }
-        } else if (area.is_string()) {
-            std::string flattened = area.get<std::string>();
-            std::size_t begin = 0;
-            while (begin <= flattened.size()) {
-                const std::size_t end = flattened.find(',', begin);
-                points.push_back(flattened.substr(begin, end == std::string::npos ? end : end - begin));
-                if (end == std::string::npos) break;
-                begin = end + 1;
-            }
+    // Stage the patch before touching the active session. Individual native
+    // Orca profile files are sparse patches, so omitted settings retain their
+    // active value. An uninitialized session starts from the same Orca
+    // defaults as onewasm_init, without resetting project state on failure.
+    try {
+        Slic3r::DynamicPrintConfig candidate_config;
+        double candidate_bed_cx = session->initialized ? session->bed_cx : 128.0;
+        double candidate_bed_cy = session->initialized ? session->bed_cy : 128.0;
+        std::string candidate_bed_shape = session->initialized ? session->bed_shape : "rectangle";
+        bool candidate_remove_mixed_temp_restriction =
+            session->initialized ? session->remove_mixed_temp_restriction : false;
+        bool candidate_adaptive_layer_height = session->initialized ? session->adaptive_layer_height : false;
+        float candidate_adaptive_layer_height_quality =
+            session->initialized ? session->adaptive_layer_height_quality : 0.5f;
+        if (session->initialized) {
+            candidate_config = session->config;
+        } else {
+            ensure_nozzle_info_json();
+            candidate_config.apply(g_defaults);
+            candidate_config.set_deserialize_strict("use_relative_e_distances", "0");
         }
 
-        double max_x = 0.0;
-        double max_y = 0.0;
-        std::size_t valid_points = 0;
-        for (const auto& point : points) {
-            const std::size_t separator = point.find_first_of("xX");
-            if (separator == std::string::npos) continue;
-            try {
-                std::size_t x_consumed = 0;
-                std::size_t y_consumed = 0;
-                const double x = std::stod(point.substr(0, separator), &x_consumed);
-                const double y = std::stod(point.substr(separator + 1), &y_consumed);
-                if (x_consumed != separator || y_consumed != point.size() - separator - 1) continue;
-                max_x = std::max(max_x, x);
-                max_y = std::max(max_y, y);
-                ++valid_points;
-            } catch (...) {
-                // Ignore malformed points and keep the previously active bed.
+        auto pickNumber = [&](const char* key, double fallback) {
+            if (!document.contains(key)) return fallback;
+            const auto& value = document[key];
+            if (value.is_number()) return value.get<double>();
+            if (value.is_string()) {
+                try { return std::stod(value.get<std::string>()); } catch (...) {}
+            }
+            return fallback;
+        };
+        candidate_bed_cx = pickNumber("bed_size_x", candidate_bed_cx * 2.0) / 2.0;
+        candidate_bed_cy = pickNumber("bed_size_y", candidate_bed_cy * 2.0) / 2.0;
+        // Native Orca printer presets use printable_area rather than the bridge's
+        // display-only bed_size_x/bed_size_y fields. Read the dimensions from the
+        // original profile document so applying it also updates project placement.
+        // This mirrors the PoC's bed-size display convention (origin at 0,0); the
+        // original JSON remains untouched at the API boundary.
+        if (document.contains("printable_area")) {
+            std::vector<std::string> points;
+            const auto& area = document["printable_area"];
+            if (area.is_array()) {
+                for (const auto& point : area) {
+                    if (point.is_string()) points.push_back(point.get<std::string>());
+                }
+            } else if (area.is_string()) {
+                std::string flattened = area.get<std::string>();
+                std::size_t begin = 0;
+                while (begin <= flattened.size()) {
+                    const std::size_t end = flattened.find(',', begin);
+                    points.push_back(flattened.substr(begin, end == std::string::npos ? end : end - begin));
+                    if (end == std::string::npos) break;
+                    begin = end + 1;
+                }
+            }
+
+            double max_x = 0.0;
+            double max_y = 0.0;
+            std::size_t valid_points = 0;
+            for (const auto& point : points) {
+                const std::size_t separator = point.find_first_of("xX");
+                if (separator == std::string::npos) continue;
+                try {
+                    std::size_t x_consumed = 0;
+                    std::size_t y_consumed = 0;
+                    const double x = std::stod(point.substr(0, separator), &x_consumed);
+                    const double y = std::stod(point.substr(separator + 1), &y_consumed);
+                    if (x_consumed != separator || y_consumed != point.size() - separator - 1) continue;
+                    max_x = std::max(max_x, x);
+                    max_y = std::max(max_y, y);
+                    ++valid_points;
+                } catch (...) {
+                    // Ignore malformed points and keep the previously active bed.
+                }
+            }
+            if (valid_points > 0 && max_x > 0.0 && max_y > 0.0) {
+                candidate_bed_cx = max_x / 2.0;
+                candidate_bed_cy = max_y / 2.0;
+                if (!document.contains("bed_shape")) {
+                    candidate_bed_shape = valid_points > 8 ? "circle" : "rectangle";
+                }
             }
         }
-        if (valid_points > 0 && max_x > 0.0 && max_y > 0.0) {
-            session->bed_cx = max_x / 2.0;
-            session->bed_cy = max_y / 2.0;
-            if (!document.contains("bed_shape")) {
-                session->bed_shape = valid_points > 8 ? "circle" : "rectangle";
-            }
+        if (document.contains("bed_shape") && document["bed_shape"].is_string()) {
+            candidate_bed_shape = document["bed_shape"].get<std::string>();
         }
-    }
-    if (document.contains("bed_shape") && document["bed_shape"].is_string()) {
-        session->bed_shape = document["bed_shape"].get<std::string>();
-    }
-    if (document.contains("remove_mixed_temp_restriction")) {
-        session->remove_mixed_temp_restriction = json_flag(document, "remove_mixed_temp_restriction");
-    }
-    if (document.contains("adaptive_layer_height")) {
-        session->adaptive_layer_height = json_flag(document, "adaptive_layer_height");
-    }
-    if (document.contains("adaptive_layer_height_quality")) {
-        const double quality = pickNumber("adaptive_layer_height_quality", 0.5);
-        session->adaptive_layer_height_quality = static_cast<float>(std::min(1.0, std::max(0.0, quality)));
-    }
-
-    for (auto& [key, value] : document.items()) {
-        std::string serialized = value.is_array() ? json_array_to_config_string(key, value) : json_val_to_string(value);
-        if (serialized.empty()) continue;
-        try {
-            session->config.set_deserialize_strict(key, serialized);
-        } catch (...) {
-            // Orca profile metadata and options unknown to this engine build
-            // are handled by Orca's native configuration parser semantics.
+        if (document.contains("remove_mixed_temp_restriction")) {
+            candidate_remove_mixed_temp_restriction = json_flag(document, "remove_mixed_temp_restriction");
         }
-    }
+        if (document.contains("adaptive_layer_height")) {
+            candidate_adaptive_layer_height = json_flag(document, "adaptive_layer_height");
+        }
+        if (document.contains("adaptive_layer_height_quality")) {
+            const double quality = pickNumber("adaptive_layer_height_quality", 0.5);
+            candidate_adaptive_layer_height_quality = static_cast<float>(std::min(1.0, std::max(0.0, quality)));
+        }
 
-    session->last_statistics_json.clear();
-    session->has_last_statistics = false;
-    reset_project(*session);
-    session->initialized = true;
-    return ONEWASM_OK;
+        for (auto& [key, value] : document.items()) {
+            if (value.is_null() || value.is_object()) continue;
+            std::string serialized = value.is_array()
+                ? json_array_to_config_string(key, value)
+                : json_val_to_string(value);
+            if (!Slic3r::print_config_def.get(key)) continue;
+            // Unlike the legacy initializer, API 0.4 rejects an invalid value
+            // for a known option so the staged patch can fail atomically.
+            candidate_config.set_deserialize_strict(key, serialized);
+        }
+
+        session->config = std::move(candidate_config);
+        session->bed_cx = candidate_bed_cx;
+        session->bed_cy = candidate_bed_cy;
+        session->bed_shape = std::move(candidate_bed_shape);
+        session->remove_mixed_temp_restriction = candidate_remove_mixed_temp_restriction;
+        session->adaptive_layer_height = candidate_adaptive_layer_height;
+        session->adaptive_layer_height_quality = candidate_adaptive_layer_height_quality;
+        session->native_project_dirty = session->native_project_dirty || !session->native_project_blob.empty();
+        session->project_cancel_requested.store(false, std::memory_order_release);
+        clear_project_outputs(*session);
+        session->initialized = true;
+        return ONEWASM_OK;
+    } catch (const std::exception& e) {
+        record_error(*session, std::string("failed to apply Orca profile fragment: ") + e.what());
+        return ONEWASM_ERR_CONFIG;
+    } catch (...) {
+        record_error(*session, "failed to apply Orca profile fragment");
+        return ONEWASM_ERR_CONFIG;
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -2732,7 +2754,7 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
   "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"unsupported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","project.manifest":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported","runtime.memory":"supported"}
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported","runtime.memory":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
