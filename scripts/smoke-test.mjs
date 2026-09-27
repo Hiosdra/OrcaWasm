@@ -34,6 +34,7 @@ import {
   initSession,
   projectSetObjectsOnce, projectGetManifestOnce, projectPrepareOnce,
   projectSliceOnce, projectGetAssetOnce, projectExportOnce, checkedMalloc, free,
+  trianglesToStl,
 } from './lib/engine-harness.mjs'
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
@@ -695,6 +696,456 @@ function runProjectSmoke(module, session, meshBytes) {
   return exported
 }
 
+// A deliberately asymmetric triangular prism keeps transform regressions
+// cheap while making each axis observable in the real sliced toolpaths. Its
+// base is offset from the origin and its unequal dimensions expose axis swaps.
+const TRANSFORM_VERTICES = [
+  [20, 24, 0],
+  [44, 24, 0],
+  [44, 36, 0],
+  [20, 24, 8],
+  [44, 24, 8],
+  [44, 32, 8],
+]
+const TRANSFORM_FACES = [
+  [0, 2, 1],
+  [3, 4, 5],
+  [0, 1, 4],
+  [0, 4, 3],
+  [1, 2, 5],
+  [1, 5, 4],
+  [2, 0, 3],
+  [2, 3, 5],
+]
+const TRANSFORM_MESH = trianglesToStl(TRANSFORM_VERTICES, TRANSFORM_FACES)
+const TRANSFORM_CONFIG = {
+  ...BASE_CONFIG,
+  sparse_infill_density: 0,
+  skirt_loops: 0,
+  brim_type: 'no_brim',
+  support_enable: 0,
+}
+
+function projectTransformMatrix({
+  scale = [1, 1, 1],
+  rotation = [0, 0, 0],
+  mirror = [1, 1, 1],
+  translation = [0, 0, 0],
+} = {}) {
+  const [sx, sy, sz] = scale
+  const [rx, ry, rz] = rotation
+  const [mx, my, mz] = mirror
+  const [tx, ty, tz] = translation
+  const cx = Math.cos(rx), sxr = Math.sin(rx)
+  const cy = Math.cos(ry), syr = Math.sin(ry)
+  const cz = Math.cos(rz), szr = Math.sin(rz)
+
+  // Rz * Ry * Rx, with signed non-uniform scale applied to each column.
+  const linear = [
+    cz * cy, cz * syr * sxr - szr * cx, cz * syr * cx + szr * sxr,
+    szr * cy, szr * syr * sxr + cz * cx, szr * syr * cx - cz * sxr,
+    -syr, cy * sxr, cy * cx,
+  ]
+  const signedScale = [sx * mx, sy * my, sz * mz]
+  return [
+    linear[0] * signedScale[0], linear[1] * signedScale[1], linear[2] * signedScale[2], tx,
+    linear[3] * signedScale[0], linear[4] * signedScale[1], linear[5] * signedScale[2], ty,
+    linear[6] * signedScale[0], linear[7] * signedScale[1], linear[8] * signedScale[2], tz,
+    0, 0, 0, 1,
+  ]
+}
+
+function transformedBounds(vertices, matrix) {
+  const points = vertices.map(([x, y, z]) => [
+    matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3],
+    matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7],
+    matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11],
+  ])
+  return boundsOfPoints(points)
+}
+
+function boundsOfPoints(points) {
+  const xs = points.map((point) => point[0])
+  const ys = points.map((point) => point[1])
+  const zs = points.map((point) => point[2])
+  return {
+    minX: Math.min(...xs), maxX: Math.max(...xs),
+    minY: Math.min(...ys), maxY: Math.max(...ys),
+    minZ: Math.min(...zs), maxZ: Math.max(...zs),
+  }
+}
+
+function boundsUnion(boundsList) {
+  return {
+    minX: Math.min(...boundsList.map((bounds) => bounds.minX)),
+    maxX: Math.max(...boundsList.map((bounds) => bounds.maxX)),
+    minY: Math.min(...boundsList.map((bounds) => bounds.minY)),
+    maxY: Math.max(...boundsList.map((bounds) => bounds.maxY)),
+    minZ: Math.min(...boundsList.map((bounds) => bounds.minZ)),
+    maxZ: Math.max(...boundsList.map((bounds) => bounds.maxZ)),
+  }
+}
+
+function assertBoundsNear(actual, expected, tolerance, label) {
+  for (const key of ['minX', 'maxX', 'minY', 'maxY', 'minZ', 'maxZ']) {
+    if (Math.abs(actual[key] - expected[key]) > tolerance) {
+      throw new Error(label + ': ' + key + ' ' + actual[key].toFixed(2)
+        + ' is not near transformed mesh bound ' + expected[key].toFixed(2))
+    }
+  }
+}
+
+function assertXYBoundsChanged(actual, reference, label) {
+  const changed = ['minX', 'maxX', 'minY', 'maxY']
+    .some((key) => Math.abs(actual[key] - reference[key]) > 0.5)
+  if (!changed) throw new Error(label + ': XY sliced footprint did not change')
+}
+
+function extractExtrusionGeometry(gcode, label) {
+  const position = { x: 0, y: 0, z: 0, e: 0 }
+  let absoluteXYZ = true
+  let absoluteE = true
+  const points = []
+
+  for (const sourceLine of gcode.split('\n')) {
+    const line = sourceLine.split(';', 1)[0].trim()
+    if (!line) continue
+    const command = line.match(/^(G\d+|M\d+)/)?.[1]
+    if (command === 'G90') { absoluteXYZ = true; continue }
+    if (command === 'G91') { absoluteXYZ = false; continue }
+    if (command === 'M82') { absoluteE = true; continue }
+    if (command === 'M83') { absoluteE = false; continue }
+
+    const params = {}
+    for (const match of line.matchAll(/(?:^|\s)([XYZE])([-+]?(?:\d+(?:\.\d*)?|\.\d+))/g)) {
+      params[match[1].toLowerCase()] = Number(match[2])
+    }
+    if (command === 'G92') {
+      for (const axis of ['x', 'y', 'z', 'e']) {
+        if (axis in params) position[axis] = params[axis]
+      }
+      continue
+    }
+    if (command !== 'G0' && command !== 'G1') continue
+
+    const before = { ...position }
+    for (const axis of ['x', 'y', 'z']) {
+      if (axis in params) {
+        position[axis] = absoluteXYZ ? params[axis] : position[axis] + params[axis]
+      }
+    }
+    let extrusionDelta = 0
+    if ('e' in params) {
+      extrusionDelta = absoluteE ? params.e - position.e : params.e
+      position.e = absoluteE ? params.e : position.e + params.e
+    }
+    if (command === 'G1' && extrusionDelta > 1e-5 && ('x' in params || 'y' in params)) {
+      points.push([before.x, before.y, before.z], [position.x, position.y, position.z])
+    }
+  }
+
+  if (points.length < 10) throw new Error(label + ': no useful extruded XY toolpaths found')
+  const layers = new Map()
+  for (const point of points) {
+    const z = Math.round(point[2] * 100) / 100
+    if (!layers.has(z)) layers.set(z, [])
+    layers.get(z).push(point)
+  }
+  const layerFootprints = [...layers.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([z, layerPoints]) => [z, boundsOfPoints(layerPoints)])
+  return {
+    points,
+    bounds: boundsOfPoints(points),
+    trace: JSON.stringify(points.map((point) => point.map((value) => Math.round(value * 100) / 100))),
+    layerFootprints,
+  }
+}
+
+function makeTransformProjectManifest(meshBytes, matrices) {
+  return {
+    schemaVersion: '0.3',
+    plates: [{ id: 'transform-plate', label: 'Transform plate', index: 0 }],
+    meshes: [{
+      id: 'transform-mesh',
+      format: 'stl',
+      dataRange: { offset: 0, length: meshBytes.length },
+    }],
+    objects: [{ id: 'asymmetric-object', meshId: 'transform-mesh', extruderId: 0 }],
+    instances: matrices.map((matrix, index) => ({
+      id: 'transform-instance-' + index,
+      objectId: 'asymmetric-object',
+      plateId: 'transform-plate',
+      transform: { matrix },
+    })),
+  }
+}
+
+function sliceTransformManifest(module, session, meshBytes, manifest, label) {
+  try {
+    projectSetObjectsOnce(module, session, new Uint8Array(meshBytes), manifest)
+  } catch (error) {
+    throw new Error(label + ': ' + error.message)
+  }
+  let result
+  try {
+    result = projectSliceOnce(module, session, {
+      schemaVersion: '0.3',
+      plateSelection: 'selected',
+      plateIds: ['transform-plate'],
+      includeGcode: true,
+      includeStatistics: false,
+    })
+  } catch (error) {
+    throw new Error(label + ': ' + error.message)
+  }
+  const plate = result?.plateResults?.[0]
+  if (plate?.plateId !== 'transform-plate' || plate.assets?.length !== 1
+    || plate.assets[0].id !== 'gcode:transform-plate') {
+    throw new Error(label + ': API 0.3 did not return the transform plate G-code asset')
+  }
+  const gcode = new TextDecoder().decode(projectGetAssetOnce(module, session, 'gcode:transform-plate'))
+  assertSaneGcode(gcode, label)
+  return { manifest, gcode, geometry: extractExtrusionGeometry(gcode, label) }
+}
+
+function sliceTransformMatrices(module, session, meshBytes, matrices, label) {
+  return sliceTransformManifest(
+    module, session, meshBytes, makeTransformProjectManifest(meshBytes, matrices), label,
+  )
+}
+
+function assertExpectedFailure(label, operation, expectedMessage) {
+  let failure = null
+  try {
+    operation()
+  } catch (error) {
+    failure = error
+  }
+  if (!failure) throw new Error(label + ': invalid input unexpectedly succeeded')
+  if (!expectedMessage.test(failure.message)) {
+    throw new Error(label + ': rejected for an unexpected reason: ' + failure.message)
+  }
+}
+
+function assertInsideBed(bounds, label) {
+  const epsilon = 0.05
+  if (bounds.minX < -epsilon || bounds.minY < -epsilon
+    || bounds.maxX > BASE_CONFIG.bed_size_x + epsilon
+    || bounds.maxY > BASE_CONFIG.bed_size_y + epsilon) {
+    throw new Error(label + ': sliced footprint ' + JSON.stringify(bounds)
+      + ' is outside the ' + BASE_CONFIG.bed_size_x + 'x' + BASE_CONFIG.bed_size_y + ' bed')
+  }
+}
+
+function runTransformRegressionSmoke(module, session) {
+  initSession(module, session, JSON.stringify(TRANSFORM_CONFIG))
+
+  const identityMatrix = projectTransformMatrix()
+  const identity = sliceTransformMatrices(
+    module, session, TRANSFORM_MESH, [identityMatrix], 'identity transform',
+  )
+  assertBoundsNear(
+    identity.geometry.bounds,
+    transformedBounds(TRANSFORM_VERTICES, identityMatrix),
+    2.5,
+    'identity transform',
+  )
+  assertInsideBed(identity.geometry.bounds, 'identity transform')
+
+  const placement = [80, 80, 0]
+  const referenceMatrix = projectTransformMatrix({ translation: placement })
+  const reference = sliceTransformMatrices(
+    module, session, TRANSFORM_MESH, [referenceMatrix], 'identity linear transform',
+  )
+  assertBoundsNear(
+    reference.geometry.bounds,
+    transformedBounds(TRANSFORM_VERTICES, referenceMatrix),
+    2.5,
+    'identity linear transform',
+  )
+
+  const scenarioDefinitions = [
+    ['non-uniform scale', { scale: [1.45, 0.7, 1.25] }, true],
+    ['X rotation', { rotation: [Math.PI / 2, 0, 0] }, true],
+    ['Y rotation', { rotation: [0, Math.PI / 2, 0] }, true],
+    ['Z rotation', { rotation: [0, 0, 0.47] }, true],
+    ['X mirror', { mirror: [-1, 1, 1] }, true],
+    ['Y mirror', { mirror: [1, -1, 1] }, true],
+    ['Z mirror', { mirror: [1, 1, -1] }, false],
+  ]
+  for (const [label, components, expectXYBoundsChange] of scenarioDefinitions) {
+    const options = {
+      ...components,
+      translation: placement,
+    }
+    let matrix = projectTransformMatrix(options)
+    const beforeBed = transformedBounds(TRANSFORM_VERTICES, matrix)
+    if (Math.abs(beforeBed.minZ) > 1e-6) {
+      options.translation = [placement[0], placement[1], -beforeBed.minZ]
+      matrix = projectTransformMatrix(options)
+    }
+    const sliced = sliceTransformMatrices(module, session, TRANSFORM_MESH, [matrix], label)
+    if (sliced.geometry.trace === reference.geometry.trace) {
+      throw new Error(label + ': sliced extrusion paths are identical to the identity transform')
+    }
+    if (expectXYBoundsChange) {
+      assertXYBoundsChanged(sliced.geometry.bounds, reference.geometry.bounds, label)
+    } else if (JSON.stringify(sliced.geometry.layerFootprints) === JSON.stringify(reference.geometry.layerFootprints)) {
+      throw new Error(label + ': per-layer XY footprint did not change')
+    }
+    assertBoundsNear(
+      sliced.geometry.bounds,
+      transformedBounds(TRANSFORM_VERTICES, matrix),
+      2.5,
+      label,
+    )
+    assertInsideBed(sliced.geometry.bounds, label)
+  }
+
+  const placedMatrix = projectTransformMatrix({ translation: [64, 72, 0] })
+  const placed = sliceTransformMatrices(
+    module, session, TRANSFORM_MESH, [placedMatrix], 'finite bed-relative placement',
+  )
+  assertBoundsNear(
+    placed.geometry.bounds,
+    transformedBounds(TRANSFORM_VERTICES, placedMatrix),
+    2.5,
+    'finite bed-relative placement',
+  )
+  assertInsideBed(placed.geometry.bounds, 'finite bed-relative placement')
+
+  const secondInstanceMatrix = projectTransformMatrix({
+    scale: [1.35, 0.8, 1.2],
+    rotation: [0, 0, 0.34],
+    translation: [150, 130, 0],
+  })
+  const multipleManifest = makeTransformProjectManifest(
+    TRANSFORM_MESH, [projectTransformMatrix({ translation: [40, 45, 0] }), secondInstanceMatrix],
+  )
+  if (multipleManifest.objects.length !== 1 || multipleManifest.instances.length !== 2
+    || JSON.stringify(multipleManifest.instances[0].transform.matrix)
+      === JSON.stringify(multipleManifest.instances[1].transform.matrix)) {
+    throw new Error('same-object multi-instance fixture does not carry two distinct transforms')
+  }
+  const multiple = sliceTransformManifest(
+    module, session, TRANSFORM_MESH, multipleManifest, 'same-object instances with separate transforms',
+  )
+  const expectedInstanceBounds = multipleManifest.instances.map((instance) =>
+    transformedBounds(TRANSFORM_VERTICES, instance.transform.matrix))
+  for (const [index, expected] of expectedInstanceBounds.entries()) {
+    const nearbyPoints = multiple.geometry.points.filter((point) =>
+      point[0] >= expected.minX - 3 && point[0] <= expected.maxX + 3
+      && point[1] >= expected.minY - 3 && point[1] <= expected.maxY + 3)
+    if (nearbyPoints.length < 10) {
+      throw new Error('same-object instances: transform ' + index + ' has no corresponding sliced footprint')
+    }
+    assertBoundsNear(
+      boundsOfPoints(nearbyPoints),
+      expected,
+      2.5,
+      'same-object instance ' + index,
+    )
+  }
+
+  // Keep the source mesh offset from the origin so the prepared matrices are
+  // checked against the original project coordinates, including the shift the
+  // native arrangement helper uses while centring its temporary model.
+  const arrangeMatrices = [
+    projectTransformMatrix(),
+    projectTransformMatrix({ scale: [1.8, 0.72, 1.3] }),
+  ]
+  const arrangeManifest = makeTransformProjectManifest(TRANSFORM_MESH, arrangeMatrices)
+  projectSetObjectsOnce(module, session, new Uint8Array(TRANSFORM_MESH), arrangeManifest)
+  const arrangedManifest = projectPrepareOnce(module, session, {
+    schemaVersion: '0.3',
+    operation: 'arrange',
+  })
+  if (!Array.isArray(arrangedManifest?.instances) || arrangedManifest.instances.length !== 2) {
+    throw new Error('arrange: expected two prepared instances of one object')
+  }
+  const arrangedBounds = arrangedManifest.instances.map((instance, index) => {
+    const matrix = instance.transform?.matrix
+    if (!Array.isArray(matrix) || matrix.length !== 16 || !matrix.every(Number.isFinite)) {
+      throw new Error('arrange: instance ' + index + ' has no finite project transform')
+    }
+    return transformedBounds(TRANSFORM_VERTICES, matrix)
+  })
+  const [firstArranged, secondArranged] = arrangedBounds
+  const spacingTolerance = 0.05
+  const separated = firstArranged.maxX <= secondArranged.minX + spacingTolerance
+    || secondArranged.maxX <= firstArranged.minX + spacingTolerance
+    || firstArranged.maxY <= secondArranged.minY + spacingTolerance
+    || secondArranged.maxY <= firstArranged.minY + spacingTolerance
+  if (!separated) throw new Error('arrange: transformed instance footprints overlap')
+  if (secondArranged.maxX - secondArranged.minX
+      <= firstArranged.maxX - firstArranged.minX + 5) {
+    throw new Error('arrange: the larger transformed instance did not retain its wider footprint')
+  }
+  for (const [index, bounds] of arrangedBounds.entries()) {
+    assertInsideBed(bounds, 'arrange instance ' + index)
+  }
+  const arranged = sliceTransformManifest(
+    module, session, TRANSFORM_MESH, arrangedManifest, 'arranged transformed footprints',
+  )
+  assertBoundsNear(
+    arranged.geometry.bounds,
+    boundsUnion(arrangedBounds),
+    2.5,
+    'arranged transformed footprints',
+  )
+
+  const invalidMatrix = projectTransformMatrix({ translation: [Number.NaN, 72, 0] })
+  assertExpectedFailure(
+    'non-finite XY placement',
+    () => projectSetObjectsOnce(
+      module,
+      session,
+      new Uint8Array(TRANSFORM_MESH),
+      makeTransformProjectManifest(TRANSFORM_MESH, [invalidMatrix]),
+    ),
+    /number|finite|matrix/i,
+  )
+  const offBedMatrix = projectTransformMatrix({ translation: [300, 300, 0] })
+  projectSetObjectsOnce(
+    module,
+    session,
+    new Uint8Array(TRANSFORM_MESH),
+    makeTransformProjectManifest(TRANSFORM_MESH, [offBedMatrix]),
+  )
+  assertExpectedFailure(
+    'off-bed XY placement',
+    () => projectSliceOnce(module, session, {
+      schemaVersion: '0.3',
+      plateSelection: 'selected',
+      plateIds: ['transform-plate'],
+      includeGcode: true,
+      includeStatistics: false,
+    }),
+    /bed|outside|printable/i,
+  )
+
+  initSession(module, session, JSON.stringify({ ...TRANSFORM_CONFIG, bed_shape: 'circle' }))
+  const outsideCircleMatrix = projectTransformMatrix({ translation: [184, 184, 0] })
+  projectSetObjectsOnce(
+    module,
+    session,
+    new Uint8Array(TRANSFORM_MESH),
+    makeTransformProjectManifest(TRANSFORM_MESH, [outsideCircleMatrix]),
+  )
+  assertExpectedFailure(
+    'XY placement outside circular bed printable area',
+    () => projectSliceOnce(module, session, {
+      schemaVersion: '0.3',
+      plateSelection: 'selected',
+      plateIds: ['transform-plate'],
+      includeGcode: true,
+      includeStatistics: false,
+    }),
+    /bed|outside|printable/i,
+  )
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -830,6 +1281,17 @@ async function main() {
         console.log('FAIL')
         console.error(`  ${err.message}`)
       }
+    }
+
+    const transformLabel = 'API 0.3 asymmetric object-transform and placement regression coverage'
+    process.stdout.write('[smoke-test] ' + transformLabel + ' ... ')
+    try {
+      runTransformRegressionSmoke(module, stableSession)
+      console.log('PASS (geometry, placement, mirroring, arrangement, multi-instance)')
+    } catch (err) {
+      stableFailures++
+      console.log('FAIL')
+      console.error('  ' + err.message)
     }
 
     if (stableFailures > 0) {
