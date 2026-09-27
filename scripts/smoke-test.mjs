@@ -3,7 +3,7 @@
  * WASM engine smoke test.
  *
  * Loads the built slicer.js/slicer.wasm and runs the stable project contract
- * end-to-end under API 0.4: onewasm_init, profile application, project
+ * end-to-end under API 0.4/0.5: onewasm_init, profile application, project
  * manifest/prepare/slice/assets, project export, and the geometry-only 3MF
  * import helper. The test catches broken builds before they are published as a GitHub Release
  * (build-wasm.yml) or trusted by a host after the artifacts are prepared.
@@ -67,8 +67,8 @@ function getCapabilitiesOnce(module) {
     const len = module.getValue(outLenPtr, 'i32')
     try {
       const capabilities = JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len)))
-      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.4.0') {
-        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.4.0')
+      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.5.0') {
+        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.5.0')
       }
       if (!capabilities.project?.nativeProjectFormats?.includes('project.3mf')) {
         throw new Error('capabilities document does not advertise native project.3mf support')
@@ -79,6 +79,7 @@ function getCapabilitiesOnce(module) {
         'config.fullProfile',
         'config.profileApply',
         'project.manifest',
+        'project.modifierVolumes',
         'project.prepare',
         'project.slice',
         'project.slice.multiPlate',
@@ -97,6 +98,9 @@ function getCapabilitiesOnce(module) {
         if (capabilities.features?.[feature] !== 'supported') {
           throw new Error(`capabilities document does not mark ${feature} as supported`)
         }
+      }
+      if (capabilities.features?.['project.modifierVolumes.nativeProject'] !== 'unsupported') {
+        throw new Error('capabilities document must mark native-project modifier volumes as unsupported')
       }
       return capabilities
     } finally {
@@ -581,6 +585,184 @@ function projectMatrix(tx, ty, tz = 0, shearXByY = 0) {
     0, 0, 1, tz,
     0, 0, 0, 1,
   ]
+}
+
+function makeBoxStl(size) {
+  const [hx, hy, hz] = size.map((value) => value / 2)
+  const vertices = [
+    [-hx, -hy, -hz], [hx, -hy, -hz], [hx, hy, -hz], [-hx, hy, -hz],
+    [-hx, -hy, hz], [hx, -hy, hz], [hx, hy, hz], [-hx, hy, hz],
+  ]
+  const faces = [
+    [1, 2, 6], [1, 6, 5],
+    [0, 4, 7], [0, 7, 3],
+    [3, 7, 6], [3, 6, 2],
+    [0, 1, 5], [0, 5, 4],
+    [4, 5, 6], [4, 6, 7],
+    [0, 3, 2], [0, 2, 1],
+  ]
+  return trianglesToStl(vertices, faces)
+}
+
+function makeSupportModifierProject(meshBytes, modifier) {
+  const modifierBytes = modifier ? makeBoxStl(modifier.size) : null
+  const blob = new Uint8Array(meshBytes.length + (modifierBytes?.length ?? 0))
+  blob.set(meshBytes)
+  if (modifierBytes) blob.set(modifierBytes, meshBytes.length)
+  const meshes = [{
+    id: 'mesh-model',
+    format: 'stl',
+    dataRange: { offset: 0, length: meshBytes.length },
+  }]
+  if (modifierBytes) {
+    meshes.push({
+      id: 'mesh-modifier',
+      format: 'stl',
+      dataRange: { offset: meshBytes.length, length: modifierBytes.length },
+    })
+  }
+  return {
+    blob,
+    manifest: {
+      schemaVersion: '0.5',
+      plates: [{ id: 'plate-0', index: 0 }],
+      meshes,
+      objects: [{ id: 'object-model', meshId: 'mesh-model' }],
+      instances: [{
+        id: 'instance-model',
+        objectId: 'object-model',
+        plateId: 'plate-0',
+        transform: { matrix: projectMatrix(128, 128) },
+      }],
+      modifierVolumes: modifier ? [{
+        id: 'modifier-' + modifier.role,
+        meshId: 'mesh-modifier',
+        role: modifier.role,
+        objectId: 'object-model',
+        plateId: 'plate-0',
+        transform: { matrix: projectMatrix(...modifier.position) },
+      }] : [],
+    },
+  }
+}
+
+function expectProjectValidationFailure(module, session, project, message, label) {
+  let failure = null
+  try {
+    projectSetObjectsOnce(module, session, project.blob, project.manifest)
+  } catch (error) {
+    failure = error
+  }
+  if (!failure || !String(failure.message).includes(message)) {
+    throw new Error(label + ': expected validation error containing "' + message + '", got '
+      + (failure?.message ?? 'success'))
+  }
+}
+
+function sliceSupportProject(module, session, label) {
+  const result = projectSliceOnce(module, session, {
+    schemaVersion: '0.3',
+    plateSelection: 'selected',
+    plateIds: ['plate-0'],
+    includeGcode: true,
+    includeStatistics: false,
+  })
+  const plate = result.plateResults?.[0]
+  const asset = plate?.assets?.find((entry) => entry.kind === 'gcode')
+  if (result.schemaVersion !== '0.3' || plate?.plateId !== 'plate-0' || !asset) {
+    throw new Error(label + ': modifier test did not return one plate G-code asset')
+  }
+  const gcode = new TextDecoder().decode(projectGetAssetOnce(module, session, asset.id))
+  assertSaneGcode(gcode, label)
+  return gcode
+}
+
+function expectModifierExportUnsupported(module, session) {
+  let failure = null
+  try {
+    projectExportOnce(module, session, 'project.3mf', {
+      schemaVersion: '0.3',
+      preservation: 'portable',
+      includeSliceArtifacts: false,
+    })
+  } catch (error) {
+    failure = error
+  }
+  if (!failure || !String(failure.message).includes('native 3MF modifier import/export is not supported yet')) {
+    throw new Error('modifier project export must fail clearly, got ' + (failure?.message ?? 'success'))
+  }
+}
+
+function runSupportModifierSmoke(module, session) {
+  // The low-resolution sphere has a printable underside and upper surface:
+  // a blocker removes automatically generated supports near the bed, while an
+  // enforcer requests supports on an upper area that automatic support omits.
+  const meshBytes = sphereStl(2, 10)
+  initSession(module, session, JSON.stringify({
+    ...BASE_CONFIG,
+    support_type: 'normal(auto)',
+    support_threshold_angle: 45,
+  }))
+
+  const baseline = makeSupportModifierProject(meshBytes, null)
+  projectSetObjectsOnce(module, session, baseline.blob, baseline.manifest)
+  const baselineRoundTrip = projectGetManifestOnce(module, session)
+  if (baselineRoundTrip.schemaVersion !== '0.5' || baselineRoundTrip.modifierVolumes?.length !== 0) {
+    throw new Error('API 0.5 empty modifierVolumes manifest did not round-trip')
+  }
+  const automaticSupports = sliceSupportProject(module, session, 'automatic support baseline')
+
+  const invalidTransform = makeSupportModifierProject(meshBytes, {
+    role: 'support-enforcer',
+    position: [0, 0, 16],
+    size: [8, 8, 8],
+  })
+  invalidTransform.manifest.modifierVolumes[0].transform.matrix[3] = null
+  expectProjectValidationFailure(
+    module,
+    session,
+    invalidTransform,
+    'modifierVolume.transform.matrix must be a number',
+    'modifier transform validation',
+  )
+
+  const cases = [
+    {
+      role: 'support-enforcer',
+      position: [9, 0, 16],
+      size: [8, 8, 8],
+    },
+    {
+      role: 'support-blocker',
+      position: [0, 0, 6],
+      size: [16, 16, 12],
+    },
+  ]
+  for (const modifier of cases) {
+    const project = makeSupportModifierProject(meshBytes, modifier)
+    projectSetObjectsOnce(module, session, project.blob, project.manifest)
+    const roundTrip = projectGetManifestOnce(module, session)
+    const returned = roundTrip.modifierVolumes?.[0]
+    if (
+      roundTrip.schemaVersion !== '0.5' ||
+      roundTrip.modifierVolumes?.length !== 1 ||
+      !returned ||
+      returned.id !== 'modifier-' + modifier.role ||
+      returned.role !== modifier.role ||
+      returned.objectId !== 'object-model' ||
+      returned.plateId !== 'plate-0' ||
+      JSON.stringify(returned.transform.matrix) !== JSON.stringify(project.manifest.modifierVolumes[0].transform.matrix)
+    ) {
+      throw new Error(modifier.role + ' geometry, association, or transform did not round-trip')
+    }
+
+    const modifiedSupports = sliceSupportProject(module, session, modifier.role)
+    if (modifiedSupports === automaticSupports) {
+      throw new Error(modifier.role + ' did not change support output from the automatic-support baseline')
+    }
+    if (modifier.role === 'support-enforcer') expectModifierExportUnsupported(module, session)
+    console.log('PASS (' + modifier.role + ' round-trip and support output changed)')
+  }
 }
 
 function makeProjectFixture(meshBytes) {
@@ -1294,11 +1476,25 @@ async function main() {
       console.error('  ' + err.message)
     }
 
+    process.stdout.write('[smoke-test] API 0.5 support modifier round-trip, validation, slicing, and export boundary ... ')
+    const modifierSession = module._onewasm_session_create()
+    if (!modifierSession) throw new Error('onewasm_session_create failed for modifier smoke test')
+    try {
+      runSupportModifierSmoke(module, modifierSession)
+      console.log('PASS')
+    } catch (err) {
+      stableFailures++
+      console.log('FAIL')
+      console.error('  ' + err.message)
+    } finally {
+      module._onewasm_session_destroy(modifierSession)
+    }
+
     if (stableFailures > 0) {
-      console.error(`\n[smoke-test] ${stableFailures} API 0.3 scenario(s) failed`)
+      console.error(`\n[smoke-test] ${stableFailures} scenario(s) failed`)
       process.exitCode = 1
     } else {
-      console.log('\n[smoke-test] all API 0.3 scenarios passed')
+      console.log('\n[smoke-test] all engine smoke scenarios passed')
     }
   } finally {
     module._onewasm_session_destroy(stableSession)

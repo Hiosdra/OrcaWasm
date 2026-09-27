@@ -201,11 +201,22 @@ struct ProjectInstanceInput {
     std::array<double, 16> matrix{};
 };
 
+struct ProjectModifierVolumeInput {
+    std::string id;
+    std::string mesh_id;
+    std::string role;
+    std::string object_id;
+    std::string plate_id;
+    std::array<double, 16> matrix{};
+};
+
 struct ProjectManifestInput {
+    std::string schema_version = "0.3";
     std::vector<std::string> plate_ids;
     std::vector<ProjectMeshInput> meshes;
     std::vector<ProjectObjectInput> objects;
     std::vector<ProjectInstanceInput> instances;
+    std::vector<ProjectModifierVolumeInput> modifier_volumes;
 };
 
 static nlohmann::json empty_project_manifest() {
@@ -521,18 +532,30 @@ static bool parse_project_manifest(const uint8_t* manifest_data,
         return false;
     }
     if (!root.is_object() || !root.contains("schemaVersion")
-        || !root.at("schemaVersion").is_string()
-        || root.at("schemaVersion").get<std::string>() != "0.3") {
-        error = "project manifest schemaVersion must be 0.3";
+        || !root.at("schemaVersion").is_string()) {
+        error = "project manifest schemaVersion must be 0.3 or 0.5";
         return false;
     }
-    if (!reject_unknown_keys(root, {"schemaVersion", "plates", "meshes", "objects", "instances"},
-                             "project manifest", error))
+    result.schema_version = root.at("schemaVersion").get<std::string>();
+    const bool has_modifier_volumes = result.schema_version == "0.5";
+    if (result.schema_version != "0.3" && !has_modifier_volumes) {
+        error = "project manifest schemaVersion must be 0.3 or 0.5";
         return false;
-    const char* arrays[] = {"plates", "meshes", "objects", "instances"};
-    for (const char* name : arrays) {
+    }
+    if (has_modifier_volumes) {
+        if (!reject_unknown_keys(root, {"schemaVersion", "plates", "meshes", "objects", "instances", "modifierVolumes"},
+                                 "project manifest", error))
+            return false;
+    } else if (!reject_unknown_keys(root, {"schemaVersion", "plates", "meshes", "objects", "instances"},
+                                    "project manifest", error)) {
+        return false;
+    }
+    const std::vector<std::string> arrays = has_modifier_volumes
+        ? std::vector<std::string>{"plates", "meshes", "objects", "instances", "modifierVolumes"}
+        : std::vector<std::string>{"plates", "meshes", "objects", "instances"};
+    for (const std::string& name : arrays) {
         if (!root.contains(name) || !root.at(name).is_array()) {
-            error = std::string("project manifest field ") + name + " must be an array";
+            error = "project manifest field " + name + " must be an array";
             return false;
         }
     }
@@ -694,6 +717,67 @@ static bool parse_project_manifest(const uint8_t* manifest_data,
             return false;
         }
         result.instances.push_back(std::move(parsed));
+    }
+
+    if (has_modifier_volumes) {
+        std::set<std::string> modifier_ids;
+        for (const auto& modifier : root.at("modifierVolumes")) {
+            if (!modifier.is_object() || !modifier.contains("id") || !modifier.contains("meshId")
+                || !modifier.contains("role") || !modifier.contains("objectId")
+                || !modifier.contains("plateId") || !modifier.contains("transform")) {
+                error = "project modifier volume must contain id, meshId, role, objectId, plateId, and transform";
+                return false;
+            }
+            if (!reject_unknown_keys(modifier, {"id", "meshId", "role", "objectId", "plateId", "transform"},
+                                     "project modifier volume", error))
+                return false;
+            ProjectModifierVolumeInput parsed;
+            if (!valid_project_id(modifier.at("id"), parsed.id, "modifierVolume.id", error)
+                || !valid_project_id(modifier.at("meshId"), parsed.mesh_id, "modifierVolume.meshId", error)
+                || !valid_project_id(modifier.at("objectId"), parsed.object_id, "modifierVolume.objectId", error)
+                || !valid_project_id(modifier.at("plateId"), parsed.plate_id, "modifierVolume.plateId", error))
+                return false;
+            if (!modifier_ids.insert(parsed.id).second) {
+                error = "project manifest contains a duplicate modifier volume id: " + parsed.id;
+                return false;
+            }
+            if (!modifier.at("role").is_string()) {
+                error = "modifierVolume.role must be support-enforcer or support-blocker";
+                return false;
+            }
+            parsed.role = modifier.at("role").get<std::string>();
+            if (parsed.role != "support-enforcer" && parsed.role != "support-blocker") {
+                error = "modifierVolume.role must be support-enforcer or support-blocker";
+                return false;
+            }
+            if (std::none_of(result.meshes.begin(), result.meshes.end(), [&parsed](const auto& mesh) {
+                    return mesh.id == parsed.mesh_id;
+                })) {
+                error = "modifier volume " + parsed.id + " refers to an unknown mesh: " + parsed.mesh_id;
+                return false;
+            }
+            if (object_ids.find(parsed.object_id) == object_ids.end()) {
+                error = "modifier volume " + parsed.id + " refers to an unknown object: " + parsed.object_id;
+                return false;
+            }
+            if (plate_ids.find(parsed.plate_id) == plate_ids.end()) {
+                error = "modifier volume " + parsed.id + " refers to an unknown plate: " + parsed.plate_id;
+                return false;
+            }
+            if (std::none_of(result.instances.begin(), result.instances.end(), [&parsed](const auto& instance) {
+                    return instance.object_id == parsed.object_id && instance.plate_id == parsed.plate_id;
+                })) {
+                error = "modifier volume " + parsed.id + " target object has no instance on plate " + parsed.plate_id;
+                return false;
+            }
+            if (!modifier.at("transform").is_object()
+                || !reject_unknown_keys(modifier.at("transform"), {"matrix"}, "modifierVolume.transform", error)
+                || !modifier.at("transform").contains("matrix")
+                || !parse_project_matrix(modifier.at("transform").at("matrix"), parsed.matrix,
+                                         "modifierVolume.transform.matrix", error))
+                return false;
+            result.modifier_volumes.push_back(std::move(parsed));
+        }
     }
 
     if (result.plate_ids.empty() || result.instances.empty()) {
@@ -1679,6 +1763,7 @@ static onewasm_status_t build_project_plate_model(
     Slic3r::Model& model,
     std::string& error
 ) {
+    std::map<std::string, std::vector<Slic3r::ModelObject*>> native_objects_by_id;
     std::size_t instance_index = 0;
     for (const auto& instance : manifest.instances) {
         if (instance.plate_id != plate_id)
@@ -1744,6 +1829,7 @@ static onewasm_status_t build_project_plate_model(
                 continue;
             if (!object_input->label.empty())
                 object->name = object_input->label;
+            native_objects_by_id[object_input->id].push_back(object);
             auto* native_instance = object->add_instance();
             if (!native_instance) {
                 error = "OrcaSlicer could not allocate a project instance";
@@ -1752,6 +1838,82 @@ static onewasm_status_t build_project_plate_model(
             native_instance->set_transformation(transformation);
             if (object_input->extruder_id > 0)
                 object->config.set("extruder", object_input->extruder_id);
+        }
+    }
+
+    for (const auto& modifier : manifest.modifier_volumes) {
+        if (modifier.plate_id != plate_id)
+            continue;
+        const auto* mesh_input = find_project_mesh(manifest, modifier.mesh_id);
+        const auto target = native_objects_by_id.find(modifier.object_id);
+        if (!mesh_input || target == native_objects_by_id.end() || target->second.empty()) {
+            error = "project modifier volume contains an unresolved mesh or target object";
+            return ONEWASM_ERR_VALIDATION;
+        }
+        if (!mesh_input->has_data_range
+            || static_cast<std::uint64_t>(mesh_input->offset) + mesh_input->length
+                > session.project_object_blob.size()) {
+            error = "project modifier volume requires a host-readable mesh asset";
+            return ONEWASM_ERR_UNSUPPORTED;
+        }
+
+        const std::string path = "/tmp/ow-project-modifier-"
+            + std::to_string(session.id) + "-" + std::to_string(instance_index++) + ".stl";
+        TempFileGuard input_guard(path);
+        FILE* file = std::fopen(path.c_str(), "wb");
+        if (!file) {
+            error = "unable to stage project modifier STL";
+            return ONEWASM_ERR_INPUT_IO;
+        }
+        const std::size_t written = std::fwrite(
+            session.project_object_blob.data() + mesh_input->offset,
+            1,
+            mesh_input->length,
+            file
+        );
+        std::fclose(file);
+        if (written != mesh_input->length) {
+            error = "unable to stage complete project modifier STL";
+            return ONEWASM_ERR_INPUT_IO;
+        }
+
+        Slic3r::Model modifier_model;
+        if (!Slic3r::load_stl(path.c_str(), &modifier_model, modifier.id.c_str())
+            || modifier_model.objects.empty()) {
+            error = "OrcaSlicer could not load project modifier mesh " + mesh_input->id;
+            return ONEWASM_ERR_INPUT_FORMAT;
+        }
+        Slic3r::Transform3d modifier_matrix = Slic3r::Transform3d::Identity();
+        for (int row = 0; row < 4; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                modifier_matrix.matrix()(row, column) = modifier.matrix[
+                    static_cast<std::size_t>(row * 4 + column)
+                ];
+            }
+        }
+        const Slic3r::Geometry::Transformation modifier_transform(modifier_matrix);
+        const Slic3r::ModelVolumeType volume_type = modifier.role == "support-enforcer"
+            ? Slic3r::ModelVolumeType::SUPPORT_ENFORCER
+            : Slic3r::ModelVolumeType::SUPPORT_BLOCKER;
+        for (auto* target_object : target->second) {
+            if (!target_object)
+                continue;
+            for (const auto* source_object : modifier_model.objects) {
+                if (!source_object)
+                    continue;
+                for (const auto* source_volume : source_object->volumes) {
+                    if (!source_volume)
+                        continue;
+                    auto* volume = target_object->add_volume(*source_volume);
+                    if (!volume) {
+                        error = "OrcaSlicer could not allocate a project modifier volume";
+                        return ONEWASM_ERR_OUTPUT;
+                    }
+                    volume->name = modifier.id;
+                    volume->set_type(volume_type);
+                    volume->set_transformation(modifier_transform);
+                }
+            }
         }
     }
 
@@ -2736,6 +2898,17 @@ onewasm_status_t onewasm_init_profile(
             record_error(*session, "OrcaSlicer could not load the project profile");
             return ONEWASM_ERR_INPUT_FORMAT;
         }
+        for (const auto* object : model.objects) {
+            if (!object)
+                continue;
+            for (const auto* volume : object->volumes) {
+                if (volume && (volume->type() == Slic3r::ModelVolumeType::SUPPORT_ENFORCER
+                               || volume->type() == Slic3r::ModelVolumeType::SUPPORT_BLOCKER)) {
+                    record_error(*session, "OrcaWasm does not import native 3MF support modifier volumes yet; create the regions in the host using the API 0.5 manifest");
+                    return ONEWASM_ERR_UNSUPPORTED;
+                }
+            }
+        }
 
         session->config = Slic3r::DynamicPrintConfig();
         session->config.apply(g_defaults);
@@ -2819,12 +2992,12 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
     constexpr const char* requires_sab = "false";
 #endif
     const std::string json = std::string(R"({
-  "api":{"name":"one-wasm-slicer-api","version":"0.4.0"},
+  "api":{"name":"one-wasm-slicer-api","version":"0.5.0"},
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
   "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"unsupported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported","runtime.memory":"supported"}
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"unsupported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported","runtime.memory":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
@@ -3439,6 +3612,10 @@ onewasm_status_t onewasm_project_export(
                 )) {
                 record_error(*session, error);
                 return ONEWASM_ERR_VALIDATION;
+            }
+            if (!manifest.modifier_volumes.empty()) {
+                record_error(*session, "OrcaWasm can slice API 0.5 modifier volumes, but native 3MF modifier import/export is not supported yet");
+                return ONEWASM_ERR_UNSUPPORTED;
             }
             if (manifest.plate_ids.size() > 1) {
                 if (options.preservation == "require") {
