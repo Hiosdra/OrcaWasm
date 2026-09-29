@@ -270,7 +270,7 @@ async function main() {
 
   const stCapabilities = assertCapabilities(st, 'st')
   const mtCapabilities = assertCapabilities(mt, 'mt')
-  console.log(`[compare-st-mt] API 0.4: ${stCapabilities.engine?.family ?? 'unknown'} / ${mtCapabilities.engine?.family ?? 'unknown'}`)
+  console.log(`[compare-st-mt] API 0.5: ${stCapabilities.engine?.family ?? 'unknown'} / ${mtCapabilities.engine?.family ?? 'unknown'}`)
 
   const stSession = st._onewasm_session_create()
   const mtSession = mt._onewasm_session_create()

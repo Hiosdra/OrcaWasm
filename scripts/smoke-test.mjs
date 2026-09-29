@@ -3,7 +3,7 @@
  * WASM engine smoke test.
  *
  * Loads the built slicer.js/slicer.wasm and runs the stable project contract
- * end-to-end under API 0.4/0.5: onewasm_init, profile application, project
+ * end-to-end under API 0.5: onewasm_init, profile application, project
  * manifest/prepare/slice/assets, project export, and the geometry-only 3MF
  * import helper. The test catches broken builds before they are published as a GitHub Release
  * (build-wasm.yml) or trusted by a host after the artifacts are prepared.
@@ -30,11 +30,10 @@
 
 import { readFileSync } from 'node:fs'
 import {
-  sphereStl, loadModule, writeBytes, decodeError,
+  sphereStl, trianglesToStl, loadModule, writeBytes, decodeError,
   initSession,
   projectSetObjectsOnce, projectGetManifestOnce, projectPrepareOnce,
   projectSliceOnce, projectGetAssetOnce, projectExportOnce, checkedMalloc, free,
-  trianglesToStl,
 } from './lib/engine-harness.mjs'
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
@@ -1344,7 +1343,7 @@ async function main() {
   }
 
   // The active smoke path is intentionally strict: a published artifact must
-  // expose the complete promoted 0.4 surface. The old helper scenarios below
+  // expose the complete promoted 0.5 surface. The old helper scenarios below
   // are unreachable legacy text kept temporarily while their historical
   // assertions are retired; they must never be used to validate a release.
   const requiredApiExports = [
@@ -1370,7 +1369,7 @@ async function main() {
   ]
   for (const name of requiredApiExports) {
     if (typeof module[name] !== 'function') {
-      throw new Error(`loaded engine is missing required 0.4 export ${name}`)
+      throw new Error(`loaded engine is missing required 0.5 export ${name}`)
     }
   }
 

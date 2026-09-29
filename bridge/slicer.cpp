@@ -2809,7 +2809,7 @@ onewasm_status_t onewasm_apply_profile(
                 ? json_array_to_config_string(key, value)
                 : json_val_to_string(value);
             if (!Slic3r::print_config_def.get(key)) continue;
-            // Unlike the legacy initializer, API 0.4 rejects an invalid value
+            // Unlike the legacy initializer, API 0.5 rejects an invalid value
             // for a known option so the staged patch can fail atomically.
             candidate_config.set_deserialize_strict(key, serialized);
         }
