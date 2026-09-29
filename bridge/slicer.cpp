@@ -1079,7 +1079,8 @@ static void auto_orient_model(Slic3r::Model& model) {
     }
 }
 
-static nlohmann::json serialize_object_transform(const Slic3r::ModelInstance& instance,
+static nlohmann::json serialize_object_transform(const Slic3r::ModelObject& object,
+                                                 const Slic3r::ModelInstance& instance,
                                                  const OrcSession& session,
                                                  bool keep_position) {
     const Slic3r::Vec3d scale = instance.get_scaling_factor();
@@ -1095,6 +1096,22 @@ static nlohmann::json serialize_object_transform(const Slic3r::ModelInstance& in
     } else {
         value["offset"] = nullptr;
     }
+    Slic3r::Geometry::Transformation transformation;
+    transformation.set_scaling_factor(scale);
+    transformation.set_rotation(rotation);
+    transformation.set_mirror(mirror);
+    const auto& linear = transformation.get_matrix().matrix();
+    const Slic3r::Vec3d& source_origin = object.origin_translation;
+    const Slic3r::Vec3d correction(
+        linear(0, 0) * source_origin.x() + linear(0, 1) * source_origin.y()
+            + linear(0, 2) * source_origin.z(),
+        linear(1, 0) * source_origin.x() + linear(1, 1) * source_origin.y()
+            + linear(1, 2) * source_origin.z(),
+        linear(2, 0) * source_origin.x() + linear(2, 1) * source_origin.y()
+            + linear(2, 2) * source_origin.z());
+    value["sourceOriginCorrection"] = nlohmann::json::array({
+        correction.x(), correction.y(), correction.z(),
+    });
     return value;
 }
 
@@ -1108,7 +1125,11 @@ static int write_transform_json(OrcSession& session, const Slic3r::Model& model,
             return -5;
         }
         const bool keep = i < keep_positions.size() && keep_positions[i];
-        result.push_back(serialize_object_transform(*model.objects[i]->instances.front(), session, keep));
+        result.push_back(serialize_object_transform(
+            *model.objects[i],
+            *model.objects[i]->instances.front(),
+            session,
+            keep));
     }
     const std::string json = result.dump();
     if (json.size() > static_cast<std::size_t>(UINT32_MAX) - 1) {
@@ -1588,6 +1609,14 @@ static void set_is_bbl_printer(
     Slic3r::Print& print,
     const Slic3r::DynamicPrintConfig& config
 );
+static onewasm_status_t legacy_prepare_plate(
+    onewasm_session_t session_ptr,
+    const uint8_t* all_stl, uint32_t all_stl_len,
+    const uint32_t* offsets, uint32_t n_files,
+    const float* transforms,
+    int32_t operation,
+    uint8_t** out_transforms, uint32_t* out_len
+);
 static void throw_if_cancelled(const ActiveSliceGuard& operation);
 static std::string serialize_slice_statistics(
     const Slic3r::Print& print,
@@ -1601,6 +1630,42 @@ static void clamp_wipe_tower_to_bed(
     double bed_x,
     double bed_y
 );
+
+static bool validate_project_model_footprints(
+    const OrcSession& session,
+    const Slic3r::Model& model,
+    std::string& error
+) {
+    const double half_w = session.bed_shape == "circle"
+        ? session.bed_cx / std::sqrt(2.)
+        : session.bed_cx;
+    const double half_h = session.bed_shape == "circle"
+        ? session.bed_cy / std::sqrt(2.)
+        : session.bed_cy;
+    const double min_x = session.bed_cx - half_w;
+    const double min_y = session.bed_cy - half_h;
+    const double max_x = session.bed_cx + half_w;
+    const double max_y = session.bed_cy + half_h;
+    constexpr double epsilon = 1e-4;
+    std::size_t instance_index = 0;
+    for (const auto* object : model.objects) {
+        if (!object)
+            continue;
+        for (const auto* instance : object->instances) {
+            if (!instance)
+                continue;
+            const Slic3r::BoundingBoxf3 bounds = object->instance_bounding_box(*instance);
+            if (bounds.min.x() < min_x - epsilon || bounds.min.y() < min_y - epsilon
+                || bounds.max.x() > max_x + epsilon || bounds.max.y() > max_y + epsilon) {
+                error = "project instance " + std::to_string(instance_index)
+                    + " is outside the configured printable bed";
+                return false;
+            }
+            ++instance_index;
+        }
+    }
+    return true;
+}
 
 // The released 0.2 multi-object entry point intentionally exposes the older
 // decomposed transform table. The 0.3 project manifest is different: its
@@ -1705,6 +1770,11 @@ static onewasm_status_t slice_project_model(
     uint32_t* out_len
 ) {
     try {
+        std::string footprint_error;
+        if (!validate_project_model_footprints(session, model, footprint_error)) {
+            record_error(session, footprint_error);
+            return ONEWASM_ERR_VALIDATION;
+        }
         throw_if_cancelled(operation);
         clamp_wipe_tower_to_bed(
             session.config,
@@ -3003,8 +3073,25 @@ onewasm_status_t onewasm_project_prepare(
                     record_error(*session, error);
                     return ONEWASM_ERR_INTERNAL;
                 }
+                auto matrix = legacy_transform_to_project_matrix(transform, *session);
+                if (prepared[index].contains("sourceOriginCorrection")) {
+                    const auto& correction = prepared[index].at("sourceOriginCorrection");
+                    if (!correction.is_array() || correction.size() != 3) {
+                        record_error(*session, "OrcaSlicer returned an invalid source-origin correction");
+                        return ONEWASM_ERR_INTERNAL;
+                    }
+                    for (std::size_t axis = 0; axis < 3; ++axis) {
+                        double value = 0.;
+                        if (!project_number(correction[axis], value,
+                                            "prepared source-origin correction", error)) {
+                            record_error(*session, error);
+                            return ONEWASM_ERR_INTERNAL;
+                        }
+                        matrix[axis * 4 + 3] += value;
+                    }
+                }
                 updated["instances"][manifest_indices[index]]["transform"]["matrix"] =
-                    project_matrix_json(legacy_transform_to_project_matrix(transform, *session));
+                    project_matrix_json(matrix);
             }
         }
     } catch (const std::bad_alloc&) {
@@ -3689,7 +3776,8 @@ static onewasm_status_t legacy_prepare_plate(
         else
             arrange_transformed_model(model, *session, &pinned);
 
-        return write_transform_json(*session, model, keep_positions, out_transforms, out_len);
+        return write_transform_json(*session, model, keep_positions,
+                                    out_transforms, out_len);
     } catch (const std::exception& e) {
         record_error(*session, e.what());
         return -9;
