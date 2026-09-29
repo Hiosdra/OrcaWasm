@@ -1,38 +1,19 @@
-# FindTBB.cmake — shim for WASM builds.
-# Creates interface targets TBB::tbb and TBB::tbbmalloc that satisfy
-# find_package(TBB REQUIRED) without linking any real threading library.
+# FindTBB.cmake — load the real Emscripten oneTBB built by the WASM workflow.
+set(_TBB_CONFIG "${CMAKE_PREFIX_PATH}/lib/cmake/TBB/TBBConfig.cmake")
+if(NOT EXISTS "${_TBB_CONFIG}")
+  message(FATAL_ERROR "The WASM build requires installed oneTBB: ${_TBB_CONFIG}")
+endif()
 
-if(SLIC3R_WASM_MT)
-  set(_TBB_CONFIG "${CMAKE_PREFIX_PATH}/lib/cmake/TBB/TBBConfig.cmake")
-  if(NOT EXISTS "${_TBB_CONFIG}")
-    message(FATAL_ERROR "MT build requires installed oneTBB: ${_TBB_CONFIG}")
+include("${_TBB_CONFIG}")
+foreach(_TBB_TARGET IN ITEMS TBB::tbb TBB::tbbmalloc TBB::tbbmalloc_proxy)
+  if(TARGET "${_TBB_TARGET}")
+    get_target_property(_TBB_IS_IMPORTED "${_TBB_TARGET}" IMPORTED)
+    get_target_property(_TBB_IS_GLOBAL "${_TBB_TARGET}" IMPORTED_GLOBAL)
+    if(_TBB_IS_IMPORTED AND NOT _TBB_IS_GLOBAL)
+      set_property(TARGET "${_TBB_TARGET}" PROPERTY IMPORTED_GLOBAL TRUE)
+    endif()
   endif()
-  include("${_TBB_CONFIG}")
-  set(TBB_FOUND TRUE)
-  set(TBB_INCLUDE_DIRS "${CMAKE_PREFIX_PATH}/include")
-  set(TBB_LIBRARIES TBB::tbb)
-  return()
-endif()
-
-if(NOT DEFINED TBB_SHIM_DIR)
-  set(TBB_SHIM_DIR "${CMAKE_CURRENT_LIST_DIR}/../wasm/shims")
-endif()
-
-if(NOT TARGET TBB::tbb)
-  add_library(TBB::tbb INTERFACE IMPORTED GLOBAL)
-  set_target_properties(TBB::tbb PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES "${TBB_SHIM_DIR}")
-endif()
-
-if(NOT TARGET TBB::tbbmalloc)
-  add_library(TBB::tbbmalloc INTERFACE IMPORTED GLOBAL)
-endif()
-
-if(NOT TARGET TBB::tbbmalloc_proxy)
-  add_library(TBB::tbbmalloc_proxy INTERFACE IMPORTED GLOBAL)
-endif()
-
-set(TBB_FOUND   TRUE)
-set(TBB_VERSION "2021.0")
-set(TBB_INCLUDE_DIRS "${TBB_SHIM_DIR}")
-set(TBB_LIBRARIES    TBB::tbb)
+endforeach()
+set(TBB_FOUND TRUE)
+set(TBB_INCLUDE_DIRS "${CMAKE_PREFIX_PATH}/include")
+set(TBB_LIBRARIES TBB::tbb)

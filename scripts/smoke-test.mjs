@@ -2,7 +2,7 @@
 /**
  * WASM engine smoke test.
  *
- * Loads the built slicer.js/slicer.wasm and runs the stable project contract
+ * Loads the built slicer-mt.js/slicer-mt.wasm and runs the stable project contract
  * end-to-end under API 0.5: onewasm_init, profile application, project
  * manifest/prepare/slice/assets, project export, and the geometry-only 3MF
  * import helper. The test catches broken builds before they are published as a GitHub Release
@@ -15,13 +15,7 @@
  * noticed until a live user's host session failed.
  *
  * Usage:
- *   node scripts/smoke-test.mjs [--wasm-dir artifacts] [--engine slicer] [--fixture path/to.stl]
- *
- * --engine selects the output-name stem (see wasm/CMakeLists.txt's
- * ORCA_WEB_WASM_OUTPUT_NAME) — "slicer" (default, single-threaded) or
- * "slicer-mt" (build-wasm.yml's mt matrix leg, real oneTBB).
- * The mt build never produces a plain
- * slicer.js/.wasm alias, so this must be passed explicitly for that variant.
+ *   node scripts/smoke-test.mjs [--wasm-dir artifacts] [--fixture path/to.stl]
  *
  * Without --fixture, the scenario runs against a synthetic torture-test mesh
  * generated in memory.
@@ -43,10 +37,9 @@ const VORON_PROFILE_FIXTURE = JSON.parse(
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wasmDir: 'artifacts', engine: 'slicer', fixture: null }
+  const args = { wasmDir: 'artifacts', fixture: null }
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--wasm-dir') args.wasmDir = argv[++i]
-    else if (argv[i] === '--engine') args.engine = argv[++i]
     else if (argv[i] === '--fixture') args.fixture = argv[++i]
   }
   return args
@@ -1432,7 +1425,8 @@ function runTransformRegressionSmoke(module, session) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const { wasmDir, engine, fixture } = parseArgs(process.argv.slice(2))
+  const { wasmDir, fixture } = parseArgs(process.argv.slice(2))
+  const engine = 'slicer-mt'
   console.log(`[smoke-test] loading engine "${engine}" from ${wasmDir}...`)
   const module = await loadModule(wasmDir, engine)
   console.log('[smoke-test] engine loaded')

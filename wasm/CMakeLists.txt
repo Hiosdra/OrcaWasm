@@ -6,17 +6,7 @@ add_executable(slicer "${CMAKE_CURRENT_SOURCE_DIR}/empty_main.cpp")
 
 target_link_libraries(slicer PRIVATE orca_web_bridge)
 
-# Output filename stem — "slicer" for the default sequential build,
-# "slicer-mt" for the multithreaded variant, so both can be published side by
-# side and a host loader can pick one at runtime without either
-# overwriting the other in artifacts/.
-if(NOT DEFINED ORCA_WEB_WASM_OUTPUT_NAME)
-  if(SLIC3R_WASM_MT)
-    set(ORCA_WEB_WASM_OUTPUT_NAME "slicer-mt")
-  else()
-    set(ORCA_WEB_WASM_OUTPUT_NAME "slicer")
-  endif()
-endif()
+set(ORCA_WEB_WASM_OUTPUT_NAME "slicer-mt")
 
 # ── Emscripten link flags ────────────────────────────────────────────────────
 target_link_options(slicer PRIVATE
@@ -38,8 +28,8 @@ target_link_options(slicer PRIVATE
   -sEXPORT_NAME=OrcaModule
   -fwasm-exceptions
   -sSUPPORT_LONGJMP=wasm
-  $<$<BOOL:${SLIC3R_WASM_MT}>:-pthread>
-  $<$<BOOL:${SLIC3R_WASM_MT}>:-sUSE_PTHREADS=1>
+  -pthread
+  -sUSE_PTHREADS=1
   # Pre-spawns the pthread worker pool at module load instead of creating
   # Web Workers lazily on first pthread_create() — required because the
   # slicer's calling thread never yields to the JS event loop while blocked
@@ -60,12 +50,12 @@ target_link_options(slicer PRIVATE
   # let the pool track the machine. `navigator.hardwareConcurrency` is
   # evaluated at load in web/worker/node(22); +4 covers incidental non-TBB
   # threads.
-  $<$<BOOL:${SLIC3R_WASM_MT}>:-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency+4>
+  -sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency+4
   # Turn any residual pool exhaustion into a loud, immediate abort (surfaced
   # via onAbort → WASM_ERROR → the app falls back to reload) instead of the
   # silent on-demand-Worker deadlock. With the pool tracking the machine this
   # should never fire; a fast, debuggable failure still beats a runtime hang.
-  $<$<BOOL:${SLIC3R_WASM_MT}>:-sPTHREAD_POOL_SIZE_STRICT=2>
+  -sPTHREAD_POOL_SIZE_STRICT=2
   # EMULATE_FUNCTION_POINTER_CASTS + a raised max-func-params was tried here
   # to fix a real crash (slicing the official Voron Design Cube v7 STL traps
   # with "memory access out of bounds"), on the initial hypothesis that it

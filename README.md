@@ -13,7 +13,7 @@ cmake/                dependency discovery and WASM configuration
 overrides/            source overrides for unavailable desktop libraries
 patches/              idempotent OrcaSlicer compatibility patcher
 wasm/                 Emscripten target and compatibility shims
-scripts/              local build, smoke-test, and comparison tools
+scripts/              local build, smoke-test, and build-probe tools
 .github/workflows/    reproducible CI build and release workflow
 ```
 
@@ -21,8 +21,10 @@ scripts/              local build, smoke-test, and comparison tools
 
 | File | Description |
 |------|-------------|
-| `slicer.js` / `slicer.wasm` | Single-threaded compatibility engine |
-| `slicer-mt.js` / `slicer-mt.wasm` | Multithreaded engine for COOP/COEP hosts |
+| `slicer-mt.js` / `slicer-mt.wasm` | Multithreaded engine |
+
+The engine requires `SharedArrayBuffer` and a cross-origin isolated page.
+Web hosts must provide the appropriate COOP/COEP response headers.
 
 The build does not produce `slicer.data`: the headless engine uses its virtual
 filesystem only for input and output files.
@@ -33,14 +35,13 @@ Install Emscripten 3.1.74 and the system tools used by CI (CMake, Ninja,
 Python 3, `m4`, `texinfo`, OpenSSL, `ccache`, and a C/C++ toolchain). Then run:
 
 ```bash
-WASM_VARIANT=st ./scripts/build-local-wsl.sh
-WASM_VARIANT=mt ./scripts/build-local-wsl.sh
+./scripts/build-local-wsl.sh
 ```
 
 The script builds the pinned OrcaSlicer dependencies, applies `patches/apply.py`,
-and writes the selected pair to `artifacts/`. Use `EMSDK=/path/to/emsdk` when
+and writes the threaded pair to `artifacts/`. Use `EMSDK=/path/to/emsdk` when
 the toolchain is not installed at `/opt/emsdk`. Its Emscripten cache is stored
-under `build-wasm/emscripten-cache-$VARIANT`; set `WASM_EM_CACHE` to choose a
+under `build-wasm/emscripten-cache-mt`; set `WASM_EM_CACHE` to choose a
 different writable cache directory.
 
 The generated local script is derived from
@@ -130,11 +131,11 @@ profile no longer overrides native EH with `-fexceptions`. The workflow runs
 it exercises mixed C/C++ exceptions and longjmp, pthread execution, and
 separate wasm32/wasm64 toolchain probes.
 
-Memory64 is not shipped. The four small ST/MT wasm32/wasm64 probes pass with
+Memory64 is not shipped. The pthread-enabled wasm32/wasm64 probes pass with
 Emscripten 3.1.74 and Node.js 26.9.0. CI pins Node.js 26 for this check because
-the runner's Node 22 cannot instantiate the final wasm64 table encoding. The ST module measured 22,469 bytes
-for wasm32 and 22,531 bytes for wasm64; MT measured 46,880 and 48,834 bytes.
-These are probe sizes, not engine benchmarks. The 64-bit probe reports
+the runner's Node 22 cannot instantiate the final wasm64 table encoding. The
+wasm32 probe measured 46,880 bytes and the wasm64 probe 48,834 bytes. These are
+probe sizes, not engine benchmarks. The 64-bit probe reports
 8-byte pointers, so an array of 1,048,576 pointer slots uses 8 MiB instead
 of 4 MiB.
 
@@ -152,15 +153,16 @@ and the [WebAssembly Memory64 proposal](https://github.com/WebAssembly/memory64/
 
 ## CI and releases
 
-The `Build WASM` workflow validates pull requests and builds both `st` and
-`mt` variants on the default branch. Each successful build runs the real
+The `Build WASM` workflow validates pull requests and builds the pthread-enabled
+engine on the default branch. Each successful build runs the real
 engine smoke test before publishing immutable GitHub Release assets:
 
 ```text
-wasm-v2.4.2
-wasm-v2.4.2-patchN
 wasm-v2.4.2-patchN-multithreaded
 ```
+
+The first build for an OrcaSlicer version uses the corresponding
+`wasm-vX.Y.Z-multithreaded` tag; later engine changes use immutable patch tags.
 
 The smoke test exercises API 0.5 support enforcers and blockers both with a
 minimal config and with the reduced selected-profile fixture at

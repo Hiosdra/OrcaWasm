@@ -233,26 +233,6 @@ patch("src/libslic3r/CMakeLists.txt", [
 ])
 
 # =============================================================================
-# 3c. FuzzySkin.cpp — thread_local compatibility
-#     Emscripten single-threaded mode may not support thread_local or
-#     std::this_thread without -sUSE_PTHREADS; replace with static equivalents.
-#     If a future OrcaSlicer version writes "static thread_local" instead of
-#     bare `thread_local`, the regex below will produce "static static" and
-#     fail loudly at compile time rather than silently miscompiling.
-# =============================================================================
-patch("src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp", [
-    (
-        r'\bthread_local\b',
-        r'static',
-        1,
-    ),
-    (
-        r'rd\.entropy\(\)\s*>\s*0\s*\?\s*rd\(\)\s*:\s*std::hash<std::thread::id>\(\)\(std::this_thread::get_id\(\)\)',
-        r'rd()',
-        1,
-    ),
-])
-
 # =============================================================================
 # 4a. AABBTreeLines.hpp — Eigen template deduction fix
 #     origin.cast<Scalar>() returns a lazy CwiseUnaryOp that does not match
@@ -443,8 +423,9 @@ if _thumb_cpp.exists():
         print("  OK (no change): src/libslic3r/GCode/Thumbnails.cpp (jpeg patch)")
 
 # =============================================================================
-# 7. utils.cpp — single-threaded Boost.Log compatibility
-#    Boost is built with BOOST_LOG_NO_THREADS so the MT sink type and
+# 7. utils.cpp — Boost.Log ABI compatibility
+#    The engine uses pthreads, while Boost.Log is built with
+#    BOOST_LOG_NO_THREADS, so the MT sink type and
 #    current_thread_id attribute don't exist.
 # =============================================================================
 patch("src/libslic3r/utils.cpp", [
@@ -638,14 +619,12 @@ verify_contains(
 )
 
 # =============================================================================
-# 8g. Thread.cpp — stub thread naming on Emscripten instead of linking a
-#     real pthread_setname_np
+# 8g. Thread.cpp — keep Emscripten's unsupported thread naming as a no-op
 #     Thread.cpp's generic "posix" branch (the #else after the __APPLE__
 #     special-case) calls pthread_setname_np()/pthread_getname_np()
 #     unconditionally on any non-Windows/non-Apple platform, which includes
-#     Emscripten (it defines the usual posix macros). This build is
-#     single-threaded (no real pthreads), so these symbols
-#     don't exist; normal Release linking has so far gotten away with it
+#     Emscripten (it defines the usual posix macros). Emscripten does not
+#     provide these naming APIs; normal Release linking has so far gotten away with it
 #     because nothing reachable from an ordinary slice calls set_thread_name()
 #     — wasm-ld's --gc-sections silently drops the whole function, symbol and
 #     all, before it ever needs to resolve. That's fragile, not fixed: adding
@@ -661,7 +640,7 @@ patch("src/libslic3r/Thread.cpp", [
     (
         r'#else\n\n// posix\nbool set_thread_name\(std::thread &thread, const char \*thread_name\)\n\{\n   \tpthread_setname_np\(thread\.native_handle\(\), thread_name\);',
         r'#elif defined(__EMSCRIPTEN__)\n\n'
-        r'// Single-threaded WASM build — no real pthread_setname_np.\n'
+        r'// Emscripten does not provide pthread_setname_np.\n'
         r'// Thread naming is a debugging aid only; no-op rather than link against\n'
         r'// a symbol this build does not provide.\n'
         r'bool set_thread_name(std::thread &thread, const char *thread_name)\n'

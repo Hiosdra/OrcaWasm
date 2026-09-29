@@ -1,6 +1,6 @@
 # FindFreetype.cmake — WASM stub.
 # Font rendering is not needed for headless G-code slicing.
-set(_FT_STUB_DIR "${CMAKE_CURRENT_LIST_DIR}/../wasm/shims")
+set(_FT_STUB_DIR "${CMAKE_CURRENT_LIST_DIR}/../wasm/shims-common")
 
 if(NOT TARGET Freetype::Freetype)
   add_library(Freetype::Freetype INTERFACE IMPORTED GLOBAL)

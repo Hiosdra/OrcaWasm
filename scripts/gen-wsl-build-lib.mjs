@@ -4,29 +4,13 @@
 // build-local-wsl.sh as a side effect of being imported, so the functions
 // couldn't be exercised in isolation while they lived inside it.
 
-// Translate a step-level `if:` matrix guard into a bash test. Only the two
-// shapes the workflow actually uses are recognized; anything else throws so a
-// new guard shape can't be silently dropped from the generated script.
-export function ifCondToBash(cond) {
-  const m = cond.trim().match(/^matrix\.variant\s*(==|!=)\s*'(st|mt)'$/)
-  if (!m) {
-    throw new Error(
-      `gen-wsl-build-script: unrecognized step 'if:' condition ${JSON.stringify(cond)} — ` +
-        `teach ifCondToBash() how to translate it before regenerating.`,
-    )
-  }
-  const [, op, val] = m
-  return `[[ "$VARIANT" ${op} "${val}" ]]`
-}
-
-// Rewrites `${{ matrix.variant }}` and `${{ env.FOO }}` to shell references.
+// Rewrites `${{ env.FOO }}` to shell references.
 // Anything else under `${{ }}` (github.*, secrets.*, ternaries inline in a
 // step body, etc.) has no local equivalent — fail loudly rather than emit
 // broken-but-plausible bash, so a future workflow change that introduces a new
 // expression shape can't silently slip through un-translated again.
 export function substituteExpr(text, context) {
   const out = text
-    .replace(/\$\{\{\s*matrix\.variant\s*\}\}/g, '${VARIANT}')
     .replace(/\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g, '${$1}')
   if (out.includes('${{')) {
     const snippet = out.match(/.{0,40}\$\{\{.{0,40}/)[0]
@@ -55,11 +39,6 @@ export function stripYamlComment(value) {
   return value
 }
 
-// A per-variant value resolved by GitHub Actions from the build matrix, e.g.
-//   ${{ matrix.variant == 'mt' && 'ON' || 'OFF' }}
-// The local script builds one variant per run, so this becomes a $VARIANT if.
-const TERNARY_RE = /^\$\{\{\s*matrix\.variant\s*==\s*'mt'\s*&&\s*'([^']*)'\s*\|\|\s*'([^']*)'\s*\}\}$/
-
 // A GitHub-context expression like ORCA_VERSION's
 //   ${{ github.event.inputs.orca_version || (…github.ref…) || 'v2.4.2' }}
 // has no local equivalent for the github.* terms — but its *trailing*
@@ -77,11 +56,6 @@ const GITHUB_EXPR_FALLBACK_RE = /\|\|\s*'([^']*)'\s*\}\}$/
 // whitespace included); the returned line has no trailing newline.
 export function envExportLine(key, rawValue) {
   const value = stripYamlComment(rawValue).trim()
-  const ternary = value.match(TERNARY_RE)
-  if (ternary) {
-    const [, mtVal, stVal] = ternary
-    return `if [[ "$VARIANT" == "mt" ]]; then\n  export ${key}="${mtVal}"\nelse\n  export ${key}="${stVal}"\nfi`
-  }
   let literal
   if (/\$\{\{/.test(value)) {
     const fallback = value.match(GITHUB_EXPR_FALLBACK_RE)
