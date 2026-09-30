@@ -1499,7 +1499,7 @@ static bool append_native_model_project(
         }
 
         for (const auto* volume : object->volumes) {
-            if (!volume || volume->type() == Slic3r::ModelVolumeType::MODEL)
+            if (!volume || volume->type() == Slic3r::ModelVolumeType::MODEL_PART)
                 continue;
             if (volume->type() != Slic3r::ModelVolumeType::SUPPORT_ENFORCER
                 && volume->type() != Slic3r::ModelVolumeType::SUPPORT_BLOCKER) {
