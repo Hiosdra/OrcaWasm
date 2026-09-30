@@ -8,14 +8,13 @@ extern "C" {
 #endif
 
 /*
- * Version 0.4 contract. The exported symbol names intentionally
- * stay in the onewasm_ namespace, but their meaning is defined by this
- * version of the header.
+ * Version 0.5 contract. The exported symbol names intentionally stay in the
+ * onewasm_ namespace; the project-manifest extension adds no new C symbols.
  */
 #define ONEWASM_API_VERSION_MAJOR 0
-#define ONEWASM_API_VERSION_MINOR 4
+#define ONEWASM_API_VERSION_MINOR 5
 #define ONEWASM_API_VERSION_PATCH 0
-#define ONEWASM_API_VERSION_STRING "0.4.0"
+#define ONEWASM_API_VERSION_STRING "0.5.0"
 
 typedef void* onewasm_session_t;
 typedef int32_t onewasm_status_t;

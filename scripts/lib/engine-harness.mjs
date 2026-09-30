@@ -180,6 +180,22 @@ export function initSession(module, session, configJson) {
   if (rc !== 0) throw new Error(`onewasm_init failed (${rc}): ${decodeError(module, session)}`)
 }
 
+export function applyProfileOnce(module, session, profile, format = 'orca.profile-json') {
+  const formatBytes = new TextEncoder().encode(format)
+  const profileBytes = new TextEncoder().encode(JSON.stringify(profile))
+  const formatPtr = writeBytes(module, formatBytes)
+  const profilePtr = writeBytes(module, profileBytes)
+  try {
+    const rc = module._onewasm_apply_profile(
+      session, formatPtr, formatBytes.length, profilePtr, profileBytes.length,
+    )
+    if (rc !== 0) throw new Error(`onewasm_apply_profile failed (${rc}): ${decodeError(module, session)}`)
+  } finally {
+    free(module, profilePtr)
+    free(module, formatPtr)
+  }
+}
+
 export function projectSetObjectsOnce(module, session, objectBlob, manifest) {
   const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest))
   const blobPtr = writeBytes(module, objectBlob)

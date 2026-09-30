@@ -92,6 +92,7 @@ is loaded as a native profile with
 | Auto-orient / arrange | supported | `onewasm_project_prepare` |
 | Single/multi/all-plate slice | supported | `onewasm_project_slice` with selected/all plate selection |
 | Per-plate G-code/statistics | supported | result manifest plus `onewasm_project_get_asset` |
+| Native project modifier preservation | supported for API 0.5 support enforcers/blockers | native `project.3mf` import/export retains modifier type, geometry, target object, plate, and transform; unrepresentable native volume types fail explicitly |
 | OBJ / STEP to STL | supported | `onewasm_obj_to_stl` / `onewasm_cad_to_stl` |
 | Native project export | supported with limits | `onewasm_project_export`, explicit preservation policy |
 | G-code in native 3MF | unsupported | `includeSliceArtifacts=true` returns `ONEWASM_ERR_UNSUPPORTED` |
@@ -160,6 +161,12 @@ wasm-v2.4.2
 wasm-v2.4.2-patchN
 wasm-v2.4.2-patchN-multithreaded
 ```
+
+The smoke test exercises API 0.5 support enforcers and blockers both with a
+minimal config and with the reduced selected-profile fixture at
+`scripts/fixtures/voron-0.4-profile-smoke.json`. The profile export does not
+include the active bed surface, so this test explicitly uses `Textured PEI
+Plate` as a test-only setting; it does not select a surface for the printer.
 
 A rebuild never overwrites an existing release. Consumers should resolve the
 highest patch number in the desired release family and use the JavaScript and

@@ -79,8 +79,8 @@ function assertCapabilities(module, label) {
     const len = module.getValue(outLenPtr, 'i32')
     try {
       const capabilities = JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len)))
-      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.4.0') {
-        throw new Error(`${label}: artifact does not identify one-wasm-slicer-api 0.4.0`)
+      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.5.0') {
+        throw new Error(`${label}: artifact does not identify one-wasm-slicer-api 0.5.0`)
       }
       const requiredFeatures = [
         'config.profileApply',
@@ -270,7 +270,7 @@ async function main() {
 
   const stCapabilities = assertCapabilities(st, 'st')
   const mtCapabilities = assertCapabilities(mt, 'mt')
-  console.log(`[compare-st-mt] API 0.4: ${stCapabilities.engine?.family ?? 'unknown'} / ${mtCapabilities.engine?.family ?? 'unknown'}`)
+  console.log(`[compare-st-mt] API 0.5: ${stCapabilities.engine?.family ?? 'unknown'} / ${mtCapabilities.engine?.family ?? 'unknown'}`)
 
   const stSession = st._onewasm_session_create()
   const mtSession = mt._onewasm_session_create()
