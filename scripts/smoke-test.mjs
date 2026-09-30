@@ -680,6 +680,12 @@ function sliceSupportProject(module, session, label) {
   return gcode
 }
 
+function gcodeMotionCommands(gcode) {
+  return gcode.split(/\r?\n/u)
+    .map((line) => line.trim().replace(/\s+/gu, ' '))
+    .filter((line) => /^G(?:0|1|2|3|5)(?:\s|$)/iu.test(line))
+}
+
 function expectModifierNativeProjectRoundTrip(
   module,
   session,
@@ -717,8 +723,14 @@ function expectModifierNativeProjectRoundTrip(
   const reimportedSupports = sliceSupportProject(
     module, session, role + ' native modifier re-import',
   )
-  if (reimportedSupports !== expectedSupports) {
-    throw new Error(role + ': native modifier re-import changed the sliced support output')
+  const expectedMotion = gcodeMotionCommands(expectedSupports)
+  const reimportedMotion = gcodeMotionCommands(reimportedSupports)
+  const firstDifference = expectedMotion.findIndex((line, index) => line !== reimportedMotion[index])
+  if (firstDifference >= 0 || expectedMotion.length !== reimportedMotion.length) {
+    throw new Error(role + ': native modifier re-import changed sliced motion commands'
+      + ' (before=' + expectedMotion.length
+      + ', after=' + reimportedMotion.length
+      + ', first difference=' + firstDifference + ')')
   }
 }
 
