@@ -161,6 +161,12 @@ wasm-v2.4.2-patchN
 wasm-v2.4.2-patchN-multithreaded
 ```
 
+The smoke test exercises API 0.5 support enforcers and blockers both with a
+minimal config and with the reduced selected-profile fixture at
+`scripts/fixtures/voron-0.4-profile-smoke.json`. The profile export does not
+include the active bed surface, so this test explicitly uses `Textured PEI
+Plate` as a test-only setting; it does not select a surface for the printer.
+
 A rebuild never overwrites an existing release. Consumers should resolve the
 highest patch number in the desired release family and use the JavaScript and
 WASM files from the same tag. This repository publishes engine releases only;

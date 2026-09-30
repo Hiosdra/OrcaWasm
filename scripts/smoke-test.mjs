@@ -31,10 +31,14 @@
 import { readFileSync } from 'node:fs'
 import {
   sphereStl, trianglesToStl, loadModule, writeBytes, decodeError,
-  initSession,
+  initSession, applyProfileOnce,
   projectSetObjectsOnce, projectGetManifestOnce, projectPrepareOnce,
   projectSliceOnce, projectGetAssetOnce, projectExportOnce, checkedMalloc, free,
 } from './lib/engine-harness.mjs'
+
+const VORON_PROFILE_FIXTURE = JSON.parse(
+  readFileSync(new URL('./fixtures/voron-0.4-profile-smoke.json', import.meta.url), 'utf8'),
+)
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -692,16 +696,18 @@ function expectModifierExportUnsupported(module, session) {
   }
 }
 
-function runSupportModifierSmoke(module, session) {
-  // The low-resolution sphere has a printable underside and upper surface:
-  // a blocker removes automatically generated supports near the bed, while an
-  // enforcer requests supports on an upper area that automatic support omits.
-  const meshBytes = sphereStl(2, 10)
+function runSupportModifierSmoke(module, session, configureSession = () => {
   initSession(module, session, JSON.stringify({
     ...BASE_CONFIG,
     support_type: 'normal(auto)',
     support_threshold_angle: 45,
   }))
+}, assertSupportOutputChange = true) {
+  // The low-resolution sphere has a printable underside and upper surface:
+  // a blocker removes automatically generated supports near the bed, while an
+  // enforcer requests supports on an upper area that automatic support omits.
+  const meshBytes = sphereStl(2, 10)
+  configureSession()
 
   const baseline = makeSupportModifierProject(meshBytes, null)
   projectSetObjectsOnce(module, session, baseline.blob, baseline.manifest)
@@ -756,12 +762,64 @@ function runSupportModifierSmoke(module, session) {
     }
 
     const modifiedSupports = sliceSupportProject(module, session, modifier.role)
-    if (modifiedSupports === automaticSupports) {
+    const supportOutputChanged = modifiedSupports !== automaticSupports
+    if (assertSupportOutputChange && !supportOutputChanged) {
       throw new Error(modifier.role + ' did not change support output from the automatic-support baseline')
     }
     if (modifier.role === 'support-enforcer') expectModifierExportUnsupported(module, session)
-    console.log('PASS (' + modifier.role + ' round-trip and support output changed)')
+    const sliceAssertion = assertSupportOutputChange
+      ? 'support output changed'
+      : 'profile-configured slice succeeded'
+    console.log('PASS (' + modifier.role + ' round-trip and ' + sliceAssertion + ')')
   }
+}
+
+function makeSelectedFilamentFragment(filaments) {
+  const metadata = new Set([
+    'compatible_printers',
+    'compatible_printers_condition',
+    'filament_settings_id',
+    'id',
+    'inherits',
+    'name',
+    'type',
+    'version',
+  ])
+  const keys = new Set(filaments.flatMap((profile) => Object.keys(profile)))
+  const fragment = {}
+  for (const key of keys) {
+    if (metadata.has(key)) continue
+    const values = filaments.map((profile) => {
+      const value = profile[key]
+      if (Array.isArray(value)) {
+        if (value.length !== 1) {
+          throw new Error(`Voron smoke fixture expected one selected-slot value for ${key}`)
+        }
+        return value[0]
+      }
+      return value
+    })
+    if (values.some((value) => value === undefined || value === null || value === '')) continue
+    fragment[key] = values
+  }
+  return fragment
+}
+
+function applyVoronProfile(module, session) {
+  applyProfileOnce(module, session, VORON_PROFILE_FIXTURE.machine)
+  applyProfileOnce(module, session, VORON_PROFILE_FIXTURE.process)
+  applyProfileOnce(module, session, makeSelectedFilamentFragment(VORON_PROFILE_FIXTURE.filaments))
+
+  // The profile-set format does not include the user's currently selected
+  // physical plate. Pick a test-only surface that has explicit temperatures
+  // in both selected material presets; this is test setup, not a hardware
+  // recommendation or an application-side auto-selection. Enable supports
+  // because the selected process omits support_enable, but retain its tree
+  // strategy and all other support settings.
+  applyProfileOnce(module, session, {
+    curr_bed_type: 'Textured PEI Plate',
+    support_enable: 1,
+  }, 'orca.native-json')
 }
 
 function makeProjectFixture(meshBytes) {
@@ -1487,6 +1545,25 @@ async function main() {
       console.error('  ' + err.message)
     } finally {
       module._onewasm_session_destroy(modifierSession)
+    }
+
+    process.stdout.write('[smoke-test] API 0.5 support modifiers with the user Voron 0.4 profile ... ')
+    const voronModifierSession = module._onewasm_session_create()
+    if (!voronModifierSession) throw new Error('onewasm_session_create failed for Voron profile modifier smoke test')
+    try {
+      runSupportModifierSmoke(
+        module,
+        voronModifierSession,
+        () => applyVoronProfile(module, voronModifierSession),
+        false,
+      )
+      console.log(`PASS (${VORON_PROFILE_FIXTURE.selection.machine}, ${VORON_PROFILE_FIXTURE.selection.process}, ${VORON_PROFILE_FIXTURE.selection.filaments.join(' + ')})`)
+    } catch (err) {
+      stableFailures++
+      console.log('FAIL')
+      console.error('  ' + err.message)
+    } finally {
+      module._onewasm_session_destroy(voronModifierSession)
     }
 
     if (stableFailures > 0) {
