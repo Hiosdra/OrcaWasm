@@ -680,7 +680,7 @@ function sliceSupportProject(module, session, label) {
   return gcode
 }
 
-function expectModifierNativeProjectRoundTrip(module, session, role) {
+function expectModifierNativeProjectRoundTrip(module, session, role, expectedSupports) {
   const result = projectExportOnce(module, session, 'project.3mf', {
     schemaVersion: '0.3',
     preservation: 'portable',
@@ -706,6 +706,12 @@ function expectModifierNativeProjectRoundTrip(module, session, role) {
   const expectedZ = role === 'support-enforcer' ? 16 : 6
   if (Math.abs(volume.transform.matrix[11] - expectedZ) > 0.01) {
     throw new Error(role + ': native 3MF export/import changed the modifier transform')
+  }
+  const reimportedSupports = sliceSupportProject(
+    module, session, role + ' native modifier re-import',
+  )
+  if (reimportedSupports !== expectedSupports) {
+    throw new Error(role + ': native modifier re-import changed the sliced support output')
   }
 }
 
@@ -779,7 +785,7 @@ function runSupportModifierSmoke(module, session, configureSession = () => {
     if (assertSupportOutputChange && !supportOutputChanged) {
       throw new Error(modifier.role + ' did not change support output from the automatic-support baseline')
     }
-    expectModifierNativeProjectRoundTrip(module, session, modifier.role)
+    expectModifierNativeProjectRoundTrip(module, session, modifier.role, modifiedSupports)
     const sliceAssertion = assertSupportOutputChange
       ? 'support output changed'
       : 'profile-configured slice succeeded'
