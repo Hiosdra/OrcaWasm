@@ -102,8 +102,8 @@ function getCapabilitiesOnce(module) {
           throw new Error(`capabilities document does not mark ${feature} as supported`)
         }
       }
-      if (capabilities.features?.['project.modifierVolumes.nativeProject'] !== 'unsupported') {
-        throw new Error('capabilities document must mark native-project modifier volumes as unsupported')
+      if (capabilities.features?.['project.modifierVolumes.nativeProject'] !== 'supported') {
+        throw new Error('capabilities document must mark native-project modifier volumes as supported')
       }
       return capabilities
     } finally {
@@ -680,19 +680,32 @@ function sliceSupportProject(module, session, label) {
   return gcode
 }
 
-function expectModifierExportUnsupported(module, session) {
-  let failure = null
-  try {
-    projectExportOnce(module, session, 'project.3mf', {
-      schemaVersion: '0.3',
-      preservation: 'portable',
-      includeSliceArtifacts: false,
-    })
-  } catch (error) {
-    failure = error
+function expectModifierNativeProjectRoundTrip(module, session, role) {
+  const result = projectExportOnce(module, session, 'project.3mf', {
+    schemaVersion: '0.3',
+    preservation: 'portable',
+    includeSliceArtifacts: false,
+  })
+  if (result.schemaVersion !== '0.3' || result.asset?.kind !== 'project') {
+    throw new Error('modifier project export returned an invalid asset descriptor')
   }
-  if (!failure || !String(failure.message).includes('native 3MF modifier import/export is not supported yet')) {
-    throw new Error('modifier project export must fail clearly, got ' + (failure?.message ?? 'success'))
+  const bytes = projectGetAssetOnce(module, session, result.asset.id)
+  if (bytes.length !== result.asset.byteLength) {
+    throw new Error('modifier project export returned an incorrect byte length')
+  }
+  initProfileOnce(module, session, bytes)
+  const imported = projectGetManifestOnce(module, session)
+  const volume = imported.modifierVolumes?.find((entry) => entry.role === role)
+  if (imported.schemaVersion !== '0.5'
+    || imported.modifierVolumes?.length !== 1
+    || !volume
+    || volume.objectId !== 'native-object-0'
+    || volume.plateId !== 'plate-0') {
+    throw new Error(role + ': native 3MF export/import did not preserve the modifier role and association')
+  }
+  const expectedZ = role === 'support-enforcer' ? 16 : 6
+  if (Math.abs(volume.transform.matrix[11] - expectedZ) > 0.01) {
+    throw new Error(role + ': native 3MF export/import changed the modifier transform')
   }
 }
 
@@ -766,7 +779,7 @@ function runSupportModifierSmoke(module, session, configureSession = () => {
     if (assertSupportOutputChange && !supportOutputChanged) {
       throw new Error(modifier.role + ' did not change support output from the automatic-support baseline')
     }
-    if (modifier.role === 'support-enforcer') expectModifierExportUnsupported(module, session)
+    expectModifierNativeProjectRoundTrip(module, session, modifier.role)
     const sliceAssertion = assertSupportOutputChange
       ? 'support output changed'
       : 'profile-configured slice succeeded'

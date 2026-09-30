@@ -92,6 +92,7 @@ is loaded as a native profile with
 | Auto-orient / arrange | supported | `onewasm_project_prepare` |
 | Single/multi/all-plate slice | supported | `onewasm_project_slice` with selected/all plate selection |
 | Per-plate G-code/statistics | supported | result manifest plus `onewasm_project_get_asset` |
+| Native project modifier preservation | supported for API 0.5 support enforcers/blockers | native `project.3mf` import/export retains modifier type, geometry, target object, plate, and transform; unrepresentable native volume types fail explicitly |
 | OBJ / STEP to STL | supported | `onewasm_obj_to_stl` / `onewasm_cad_to_stl` |
 | Native project export | supported with limits | `onewasm_project_export`, explicit preservation policy |
 | G-code in native 3MF | unsupported | `includeSliceArtifacts=true` returns `ONEWASM_ERR_UNSUPPORTED` |
