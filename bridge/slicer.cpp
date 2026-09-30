@@ -3605,7 +3605,7 @@ static onewasm_status_t legacy_write_model_3mf(
         TempFileGuard out_guard(path);
         ModelBackupPathGuard backup_guard(model);
         Slic3r::StoreParams store_params;
-        store_params.path = path;
+        store_params.path = path.c_str();
         store_params.model = &model;
         store_params.config = &session.config;
         if (!Slic3r::store_bbs_3mf(store_params)) {
