@@ -3637,6 +3637,45 @@ static onewasm_status_t legacy_write_model_3mf(
     }
 }
 
+static bool prepare_native_modifier_model_for_export(
+    Slic3r::Model& model,
+    std::string& error
+) {
+    bool found_modifier = false;
+    for (auto* object : model.objects) {
+        if (!object)
+            continue;
+        for (auto* volume : object->volumes) {
+            if (!volume
+                || (volume->type() != Slic3r::ModelVolumeType::SUPPORT_ENFORCER
+                    && volume->type() != Slic3r::ModelVolumeType::SUPPORT_BLOCKER))
+                continue;
+
+            found_modifier = true;
+            const Slic3r::Transform3d api_transform = volume->get_matrix()
+                * volume->source.transform.get_matrix();
+            const double determinant = api_transform.linear().determinant();
+            if (!api_transform.matrix().allFinite() || !std::isfinite(determinant)
+                || std::abs(determinant) < 1e-12) {
+                error = "native support modifier transform must be finite and invertible for 3MF export";
+                return false;
+            }
+
+            // Orca's writer stores the volume matrix in both the standard 3MF
+            // component and its private source-transform metadata. Store the
+            // API matrix as the component transform and its inverse as source
+            // metadata so Orca's importer composes them to the API matrix once.
+            volume->set_transformation(Slic3r::Geometry::Transformation(api_transform));
+            volume->source.transform = Slic3r::Geometry::Transformation(api_transform.inverse());
+        }
+    }
+    if (!found_modifier) {
+        error = "native modifier export was requested but no support modifier volume was built";
+        return false;
+    }
+    return true;
+}
+
 EMSCRIPTEN_KEEPALIVE
 onewasm_status_t onewasm_project_export(
     onewasm_session_t session_ptr,
@@ -3777,6 +3816,10 @@ onewasm_status_t onewasm_project_export(
                         record_error(*session, error);
                         return export_status;
                     }
+                }
+                if (!prepare_native_modifier_model_for_export(native_model, error)) {
+                    record_error(*session, error);
+                    return ONEWASM_ERR_VALIDATION;
                 }
                 export_status = legacy_write_model_3mf(
                     *session, native_model, &exported_data, &exported_len

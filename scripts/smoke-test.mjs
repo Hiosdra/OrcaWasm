@@ -680,7 +680,13 @@ function sliceSupportProject(module, session, label) {
   return gcode
 }
 
-function expectModifierNativeProjectRoundTrip(module, session, role, expectedSupports) {
+function expectModifierNativeProjectRoundTrip(
+  module,
+  session,
+  role,
+  expectedSupports,
+  expectedTransform,
+) {
   const result = projectExportOnce(module, session, 'project.3mf', {
     schemaVersion: '0.3',
     preservation: 'portable',
@@ -703,9 +709,10 @@ function expectModifierNativeProjectRoundTrip(module, session, role, expectedSup
     || volume.plateId !== 'plate-0') {
     throw new Error(role + ': native 3MF export/import did not preserve the modifier role and association')
   }
-  const expectedZ = role === 'support-enforcer' ? 16 : 6
-  if (Math.abs(volume.transform.matrix[11] - expectedZ) > 0.01) {
-    throw new Error(role + ': native 3MF export/import changed the modifier transform')
+  const actualTransform = volume.transform.matrix
+  if (actualTransform.length !== expectedTransform.length
+    || expectedTransform.some((value, index) => Math.abs(actualTransform[index] - value) > 0.01)) {
+    throw new Error(role + ': native 3MF export/import changed the modifier transform matrix')
   }
   const reimportedSupports = sliceSupportProject(
     module, session, role + ' native modifier re-import',
@@ -785,7 +792,13 @@ function runSupportModifierSmoke(module, session, configureSession = () => {
     if (assertSupportOutputChange && !supportOutputChanged) {
       throw new Error(modifier.role + ' did not change support output from the automatic-support baseline')
     }
-    expectModifierNativeProjectRoundTrip(module, session, modifier.role, modifiedSupports)
+    expectModifierNativeProjectRoundTrip(
+      module,
+      session,
+      modifier.role,
+      modifiedSupports,
+      project.manifest.modifierVolumes[0].transform.matrix,
+    )
     const sliceAssertion = assertSupportOutputChange
       ? 'support output changed'
       : 'profile-configured slice succeeded'
