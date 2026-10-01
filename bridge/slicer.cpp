@@ -95,8 +95,9 @@
 // Boost.Log is unusable in this build: no sink is ever registered (utils.cpp's
 // file sink needs set_logging_file(), which only the desktop CLI calls), so
 // every record that passes the severity filter — left at `warning` by
-// utils.cpp's RunOnInit — goes to Boost.Log's *default* sink. Under this
-// single-threaded (BOOST_LOG_NO_THREADS) Emscripten build that path is both
+// utils.cpp's RunOnInit — goes to Boost.Log's *default* sink. Boost.Log uses
+// its no-thread ABI even though the slicer itself uses pthreads. In this
+// Emscripten build that path is both
 // broken and expensive: it non-deterministically traps with "memory access
 // out of bounds" inside core::push_record_move() (first seen as the
 // nozzle_info.json incident — see ensure_nozzle_info_json() below — and again
@@ -338,8 +339,8 @@ struct ProgressWindow {
 };
 
 // Slicing blocks the worker's event loop. MAIN_THREAD_EM_ASM delivers this
-// from both the single-threaded engine and a pthread back to that worker,
-// where postMessage reaches the host's main thread immediately.
+// from the pthread engine back to that worker, where postMessage reaches the
+// host's main thread immediately.
 static void post_slice_progress(int percent, const std::string& stage) {
     MAIN_THREAD_EM_ASM({
         // The build smoke test also runs this bridge in Node, where there is
@@ -1109,11 +1110,7 @@ static Slic3r::BoundingBox arrangement_bed(const OrcSession& session) {
 static Slic3r::ArrangeParams arrangement_params() {
     Slic3r::ArrangeParams params;
     params.min_obj_distance = static_cast<coord_t>(2. * 1e6); // 2 mm gap
-#ifdef SLIC3R_WASM_MT
     params.parallel = true;
-#else
-    params.parallel = false;
-#endif
     return params;
 }
 
@@ -2642,7 +2639,7 @@ void onewasm_session_destroy(onewasm_session_t session_ptr) {
 // string) since we ship no /resources tree. The parse always fails there,
 // which is handled — but the BOOST_LOG_TRIVIAL(error) call on that failure
 // path traps with "memory access out of bounds" inside boost::log's
-// single-threaded core on every single slice, even for trivial models.
+// no-thread Boost.Log core on every single slice, even for trivial models.
 // Pre-seed the file in MEMFS so the parse succeeds and that log call (and
 // whatever makes it crash) is never reached, rather than patching boost::log.
 static void ensure_nozzle_info_json() {
@@ -3069,13 +3066,8 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
         return ONEWASM_ERR_INVALID_ARGUMENT;
     }
 
-#ifdef SLIC3R_WASM_MT
     constexpr const char* threading_model = "pthreads";
     constexpr const char* requires_sab = "true";
-#else
-    constexpr const char* threading_model = "single-threaded";
-    constexpr const char* requires_sab = "false";
-#endif
     const std::string json = std::string(R"({
   "api":{"name":"one-wasm-slicer-api","version":"0.5.0"},
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
@@ -4421,16 +4413,7 @@ static onewasm_status_t legacy_slice_stl_multi(
 
             Slic3r::ArrangeParams params;
             params.min_obj_distance = static_cast<coord_t>(2.0 * 1e6); // 2 mm gap
-            // See bridge/CMakeLists.txt's SLIC3R_WASM_MT
-            // option — the only threading-aware line in the entire bridge.
-            // Everything else runs in parallel automatically via real oneTBB
-            // (built from source in CI) once that option is set; the sequential
-            // build (default) is unaffected.
-#ifdef SLIC3R_WASM_MT
             params.parallel         = true;
-#else
-            params.parallel         = false; // WASM is single-threaded
-#endif
 
             // Objects that don't fit land at bed centre instead of throwing
             Slic3r::arrange_objects(model, bed, params,

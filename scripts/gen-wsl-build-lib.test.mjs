@@ -3,26 +3,10 @@
 // built-in test runner so a dev-only script needs no extra dev dependency.
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { envExportLine, ifCondToBash, stripYamlComment, substituteExpr } from './gen-wsl-build-lib.mjs'
-
-describe('ifCondToBash', () => {
-  it('translates == and != matrix guards', () => {
-    assert.equal(ifCondToBash("matrix.variant == 'mt'"), '[[ "$VARIANT" == "mt" ]]')
-    assert.equal(ifCondToBash("matrix.variant != 'st'"), '[[ "$VARIANT" != "st" ]]')
-  })
-
-  it('tolerates surrounding whitespace', () => {
-    assert.equal(ifCondToBash("  matrix.variant == 'st'  "), '[[ "$VARIANT" == "st" ]]')
-  })
-
-  it('throws on an unrecognized condition rather than emitting broken bash', () => {
-    assert.throws(() => ifCondToBash("github.event_name == 'push'"), /unrecognized step 'if:' condition/)
-  })
-})
+import { envExportLine, stripYamlComment, substituteExpr } from './gen-wsl-build-lib.mjs'
 
 describe('substituteExpr', () => {
-  it('rewrites matrix.variant and env.FOO to shell references', () => {
-    assert.equal(substituteExpr('build ${{ matrix.variant }} now', 'ctx'), 'build ${VARIANT} now')
+  it('rewrites env.FOO to shell references', () => {
     assert.equal(substituteExpr('v=${{ env.ORCA_VERSION }}', 'ctx'), 'v=${ORCA_VERSION}')
   })
 
@@ -64,13 +48,6 @@ describe('envExportLine', () => {
     assert.equal(
       envExportLine('ONETBB_VERSION', 'v2021.13.0  # keep in sync'),
       'export ONETBB_VERSION="${ONETBB_VERSION:-v2021.13.0}"',
-    )
-  })
-
-  it('expands a matrix ternary into a $VARIANT branch', () => {
-    assert.equal(
-      envExportLine('EXTRA', "${{ matrix.variant == 'mt' && 'ON' || 'OFF' }}"),
-      'if [[ "$VARIANT" == "mt" ]]; then\n  export EXTRA="ON"\nelse\n  export EXTRA="OFF"\nfi',
     )
   })
 

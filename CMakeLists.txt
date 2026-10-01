@@ -22,9 +22,6 @@ set(BUILD_TESTS       OFF CACHE BOOL "" FORCE)
 set(ORCA_TOOLS        OFF CACHE BOOL "" FORCE)
 set(SLIC3R_BUILD_SANDBOXES OFF CACHE BOOL "" FORCE)
 
-# Shim directory — must be set before FindTBB is invoked
-set(TBB_SHIM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/wasm/shims")
-
 # ── Dependency paths (exported from build.sh via environment) ────────────────
 # Boost (built for WASM by deps/build_boost.sh)
 set(BOOST_ROOT        "$ENV{BOOST_WASM_ROOT}"  CACHE PATH "Boost built for WASM")

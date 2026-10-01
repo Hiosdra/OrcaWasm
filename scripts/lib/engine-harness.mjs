@@ -1,5 +1,5 @@
 // Shared Node test harness for the OrcaSlicer WASM engine — used by
-// smoke-test.mjs and compare-st-mt.mjs. Centralizes the ABI-coupled pieces
+// smoke-test.mjs. Centralizes the ABI-coupled pieces
 // (module loading + heap marshaling for the stable 0.3 project operations)
 // so the C bridge's calling convention lives in ONE place instead of being
 // copy-pasted and drifting between scripts.
@@ -55,8 +55,7 @@ export function icosphere(subdivisions) {
 }
 
 // A printable sphere STL: projects the raw icosphere onto a sphere of the
-// given radius and lifts it so min z = 0. Both smoke-test.mjs (radius 10) and
-// compare-st-mt.mjs (radius 15) build their sphere meshes through here.
+// given radius and lifts it so min z = 0. The smoke test uses a 10 mm radius.
 export function sphereStl(subdivisions, radiusMm) {
   const { verts, faces } = icosphere(subdivisions)
   const scaled = verts.map(([x, y, z]) => {
@@ -99,7 +98,7 @@ export function trianglesToStl(verts, faces) {
 // of the file would make Node parse its CommonJS syntax as ES module syntax
 // and fail. A data: URL sidesteps that entirely.
 //
-// Built with `-sENVIRONMENT=web,worker,node`, slicer.js's own Node-detection
+// Built with `-sENVIRONMENT=web,worker,node`, slicer-mt.js's Node-detection
 // branch unconditionally does `var fs = require("fs"); ... scriptDirectory =
 // __dirname + "/"` whenever it detects Node — but loading it as a real ES
 // module (which the data: URL trick does) means `require`/`__dirname` don't
@@ -134,8 +133,7 @@ export async function loadModule(wasmDir, engine) {
     // without this override Node's Worker constructor rejects the empty
     // path with ERR_WORKER_PATH. Hand Emscripten the real script path
     // directly via the officially-supported override instead of relying on
-    // the __filename fallback. Harmless no-op for st (non-pthread) builds,
-    // whose output has no code path that reads this option.
+    // the __filename fallback required by pthread worker creation.
     mainScriptUrlOrBlob: jsPath,
     printErr: (m) => console.warn('[OrcaWASM]', m),
     onAbort: (m) => { throw new Error(`WASM module aborted: ${m}`) },

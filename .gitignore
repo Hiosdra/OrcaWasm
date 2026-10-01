@@ -1,7 +1,3 @@
-artifacts/slicer.js
-artifacts/slicer.wasm
-artifacts/slicer.data
-artifacts/slicer.cjs
 artifacts/slicer-mt.js
 artifacts/slicer-mt.wasm
 artifacts/.wasm-release-tag

@@ -30,10 +30,8 @@ https://github.com/Open-Cascade-SAS/OCCT
 
 ## oneTBB
 
-The multithreaded variant links
-[oneTBB](https://github.com/uxlfoundation/oneTBB) v2021.13.2, built from source
-for `wasm32-emscripten`. The single-threaded variant uses local sequential
-header stubs instead.
+The engine links [oneTBB](https://github.com/uxlfoundation/oneTBB) v2021.13.2,
+built from source for `wasm32-emscripten` with pthread support.
 
 - License: Apache License 2.0
 - Copyright: Intel Corporation and oneTBB contributors

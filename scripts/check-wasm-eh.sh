@@ -74,11 +74,11 @@ int main() {
 }
 EOF
 
-for variant in st mt wasm64 wasm64-mt; do
+for variant in mt wasm64-mt; do
     variant_dir="$tmp_root/$variant"
     mkdir -p "$variant_dir"
-    thread_flags=()
-    pthread_value=0
+    thread_flags=(-pthread)
+    pthread_value=1
     memory_flags=()
     link_flags=(
         -fwasm-exceptions
@@ -86,15 +86,11 @@ for variant in st mt wasm64 wasm64-mt; do
         -sEXIT_RUNTIME=1
         -sENVIRONMENT=node,worker
     )
-    if [[ "$variant" == "mt" || "$variant" == "wasm64-mt" ]]; then
-        thread_flags=(-pthread)
-        pthread_value=1
-        link_flags+=(
-            -sUSE_PTHREADS=1
-            -sPTHREAD_POOL_SIZE=1
-            -sPTHREAD_POOL_SIZE_STRICT=2
-        )
-    fi
+    link_flags+=(
+        -sUSE_PTHREADS=1
+        -sPTHREAD_POOL_SIZE=1
+        -sPTHREAD_POOL_SIZE_STRICT=2
+    )
     if [[ "$variant" == "wasm64" || "$variant" == "wasm64-mt" ]]; then
         memory_flags=(-sMEMORY64=1)
     fi

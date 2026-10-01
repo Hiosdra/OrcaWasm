@@ -2,7 +2,7 @@
 # OrcaSlicer uses OpenSSL::Crypto only for MD5 checksums of config files.
 # We provide stub headers + empty targets so the code compiles; the MD5
 # functions are no-ops in WASM (config validation is skipped).
-set(_SSL_STUB_DIR "${CMAKE_CURRENT_LIST_DIR}/../wasm/shims")
+set(_SSL_STUB_DIR "${CMAKE_CURRENT_LIST_DIR}/../wasm/shims-common")
 
 if(NOT TARGET OpenSSL::Crypto)
   add_library(OpenSSL::Crypto INTERFACE IMPORTED GLOBAL)
