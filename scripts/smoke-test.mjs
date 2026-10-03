@@ -1167,7 +1167,7 @@ function extractExtrusionGeometry(gcode, label) {
 
 function makeTransformProjectManifest(meshBytes, matrices) {
   return {
-    schemaVersion: '0.3',
+    schemaVersion: '0.5',
     plates: [{ id: 'transform-plate', label: 'Transform plate', index: 0 }],
     meshes: [{
       id: 'transform-mesh',
