@@ -3,7 +3,7 @@
  * WASM engine smoke test.
  *
  * Loads the built slicer-mt.js/slicer-mt.wasm and runs the stable project contract
- * end-to-end under API 0.5.1: onewasm_init, profile application, project
+ * end-to-end under API 0.6.0: onewasm_init, profile application, project
  * manifest/prepare/slice/assets, project export, and the geometry-only 3MF
  * import helper. The test catches broken builds before they are published as a GitHub Release
  * (build-wasm.yml) or trusted by a host after the artifacts are prepared.
@@ -63,8 +63,8 @@ function getCapabilitiesOnce(module) {
     const len = module.getValue(outLenPtr, 'i32')
     try {
       const capabilities = JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len)))
-      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.5.1') {
-        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.5.1')
+      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.6.0') {
+        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.6.0')
       }
       if (!capabilities.project?.nativeProjectFormats?.includes('project.3mf')) {
         throw new Error('capabilities document does not advertise native project.3mf support')
@@ -78,7 +78,6 @@ function getCapabilitiesOnce(module) {
         'runtime.capabilities',
         'runtime.progress',
         'runtime.errors',
-        'runtime.memory',
       ]
       for (const feature of coreRequiredFeatures) {
         if (capabilities.features?.[feature] !== 'supported') {
@@ -97,6 +96,7 @@ function getCapabilitiesOnce(module) {
         'project.export.preservation',
         'format.objToStl',
         'format.stepToStl',
+        'format.threeMfToStl',
         'runtime.cancellation',
       ]
       for (const feature of optionalFeatures) {
@@ -947,7 +947,7 @@ function runProjectSmoke(module, session, meshBytes) {
   } catch {
     obsoleteManifestRejected = true
   }
-  if (!obsoleteManifestRejected) throw new Error('API 0.5.1 accepted obsolete project manifest revision 0.3')
+  if (!obsoleteManifestRejected) throw new Error('API 0.6.0 accepted obsolete project manifest revision 0.3')
   assertProjectManifest(projectGetManifestOnce(module, session), 'project after obsolete manifest rejection')
 
   const prepared = projectPrepareOnce(module, session, {
@@ -1206,7 +1206,7 @@ function sliceTransformManifest(module, session, meshBytes, manifest, label) {
   const plate = result?.plateResults?.[0]
   if (plate?.plateId !== 'transform-plate' || plate.assets?.length !== 1
     || plate.assets[0].id !== 'gcode:transform-plate') {
-    throw new Error(label + ': API 0.5.1 did not return the transform plate G-code asset')
+    throw new Error(label + ': API 0.6.0 did not return the transform plate G-code asset')
   }
   const gcode = new TextDecoder().decode(projectGetAssetOnce(module, session, 'gcode:transform-plate'))
   assertSaneGcode(gcode, label)
@@ -1517,7 +1517,7 @@ async function main() {
     }
 
     for (const mesh of meshes) {
-      const stableProjectLabel = `[${mesh.label}] API 0.5.1 manifest, prepare, all/selected plate slicing`
+      const stableProjectLabel = `[${mesh.label}] API 0.6.0 manifest, prepare, all/selected plate slicing`
       let stableExportedProject = null
       process.stdout.write(`[smoke-test] ${stableProjectLabel} ... `)
       try {
@@ -1530,7 +1530,7 @@ async function main() {
         console.error(`  ${err.message}`)
       }
 
-      const stableProfileLabel = `[${mesh.label}] API 0.5.1 native project profile load/export`
+      const stableProfileLabel = `[${mesh.label}] API 0.6.0 native project profile load/export`
       process.stdout.write(`[smoke-test] ${stableProfileLabel} ... `)
       try {
         if (!stableExportedProject) throw new Error('project export did not produce a profile package')
@@ -1588,7 +1588,7 @@ async function main() {
       }
     }
 
-    const transformLabel = 'API 0.5.1 asymmetric object-transform and placement regression coverage'
+    const transformLabel = 'API 0.6.0 asymmetric object-transform and placement regression coverage'
     process.stdout.write('[smoke-test] ' + transformLabel + ' ... ')
     try {
       runTransformRegressionSmoke(module, stableSession)

@@ -10,7 +10,7 @@
  *   onewasm_project_prepare/slice/get_asset(session, request)
  *   onewasm_project_export(session, native format, options)
  *   onewasm_obj_to_stl / onewasm_cad_to_stl(input, output)
- *   onewasm_read_3mf(input, output)                                → engine-specific geometry helper
+ *   onewasm_read_3mf(input, output)                                → optional format.threeMfToStl
  *   onewasm_get_capabilities(outJson, outLen)
  *   onewasm_free(ptr)
  *   onewasm_last_error(session)                                   → null-terminated UTF-8 string
@@ -18,7 +18,7 @@
  * onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_read_3mf are pure format conversions
  * — they never touch slicer config state, so they take no session handle.
  *
- * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.5.1:
+ * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.6.0:
  *   -1  invalid / uninitialized state (includes a null/invalid session handle)
  *   -2  JSON parse failure
  *   -3  STL write to MEMFS failed
@@ -3070,12 +3070,12 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
     constexpr const char* threading_model = "pthreads";
     constexpr const char* requires_sab = "true";
     const std::string json = std::string(R"({
-  "api":{"name":"one-wasm-slicer-api","version":"0.5.1"},
+  "api":{"name":"one-wasm-slicer-api","version":"0.6.0"},
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
   "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"unsupported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported","runtime.memory":"supported"}
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
@@ -4283,7 +4283,7 @@ onewasm_status_t onewasm_obj_to_stl(
  *              rotation xyz (radians), mirror xyz, and X/Y offset in mm
  *              relative to bed centre. NaN X/Y delegates placement to arrange.
  *
- * Internal adapter used by the API 0.5.1 project implementation.
+ * Internal adapter used by the API 0.6.0 project implementation.
  */
 static onewasm_status_t legacy_slice_stl_multi(
     onewasm_session_t session_ptr,
@@ -4661,7 +4661,7 @@ onewasm_status_t onewasm_cad_to_stl(
  * length, never a NUL-terminated string read). Caller must free with
  * onewasm_free().
  *
- * Internal adapter used by the API 0.5.1 project implementation; -8 means the 3MF export
+ * Internal adapter used by the API 0.6.0 project implementation; -8 means the 3MF export
  * itself (store_bbs_3mf) failed rather than gcode export.
  */
 static onewasm_status_t legacy_write_3mf(

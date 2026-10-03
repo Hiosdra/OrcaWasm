@@ -1,5 +1,14 @@
 # Third-party notices
 
+## one-wasm-slicer-api glue
+
+`wasm/onewasm/onewasm-emscripten-glue.js` and
+`wasm/onewasm/onewasm-conformance.mjs` are copied unmodified from the
+one-wasm-slicer-api 0.6.0 release. The glue is linked into `slicer-mt.js`.
+
+- License: Apache License 2.0
+- Copyright: one-wasm-slicer-api contributors
+
 ## OrcaSlicer
 
 This repository embeds a WebAssembly build of

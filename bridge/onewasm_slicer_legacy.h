@@ -3,10 +3,10 @@
 
 /*
  * Internal adapter helpers retained by the bridge implementation. These
- * declarations are deliberately separate from the current 0.5.1 header. The
- * symbols are not part of the current contract; project operations use a few of
- * them internally, and the PoC still uses the geometry-only 3MF converter to
- * populate its model preview.
+ * declarations are deliberately separate from the canonical API header and are
+ * not part of the contract; project operations use a few of them internally.
+ * The geometry-only 3MF converter is declared by the canonical header as
+ * optional format.threeMfToStl.
  */
 
 #include "onewasm_slicer_api.h"
@@ -58,13 +58,6 @@ static onewasm_status_t legacy_write_3mf(
     uint32_t stl_len,
     uint8_t** out_3mf,
     uint32_t* out_len
-);
-
-onewasm_status_t onewasm_read_3mf(
-    const uint8_t* mf_data,
-    uint32_t mf_len,
-    uint8_t** out_stl,
-    uint32_t* out_stl_len
 );
 
 static onewasm_status_t legacy_get_last_statistics(
