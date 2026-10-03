@@ -3,8 +3,8 @@
 
 /*
  * Internal adapter helpers retained by the bridge implementation. These
- * declarations are deliberately separate from the canonical 0.3 header. The
- * symbols are not part of the 0.3 contract; project operations use a few of
+ * declarations are deliberately separate from the current 0.5.1 header. The
+ * symbols are not part of the current contract; project operations use a few of
  * them internally, and the PoC still uses the geometry-only 3MF converter to
  * populate its model preview.
  */

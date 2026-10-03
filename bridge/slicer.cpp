@@ -18,7 +18,7 @@
  * onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_read_3mf are pure format conversions
  * — they never touch slicer config state, so they take no session handle.
  *
- * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.4:
+ * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.5.1:
  *   -1  invalid / uninitialized state (includes a null/invalid session handle)
  *   -2  JSON parse failure
  *   -3  STL write to MEMFS failed
@@ -162,7 +162,7 @@ struct OrcSession {
     std::shared_ptr<struct ActiveSlice> active_slice;
     std::string last_statistics_json;
     bool has_last_statistics = false;
-    // Draft 0.3 project state. The host-provided mesh blob is copied into the
+    // API 0.5 project state. The host-provided mesh blob is copied into the
     // session; the manifest is neutral and never escapes as Orca types.
     nlohmann::json project_manifest;
     std::vector<std::uint8_t> project_object_blob;
@@ -212,7 +212,7 @@ struct ProjectModifierVolumeInput {
 };
 
 struct ProjectManifestInput {
-    std::string schema_version = "0.3";
+    std::string schema_version = "0.5";
     std::vector<std::string> plate_ids;
     std::vector<ProjectMeshInput> meshes;
     std::vector<ProjectObjectInput> objects;
@@ -222,11 +222,12 @@ struct ProjectManifestInput {
 
 static nlohmann::json empty_project_manifest() {
     return nlohmann::json{
-        {"schemaVersion", "0.3"},
+        {"schemaVersion", "0.5"},
         {"plates", nlohmann::json::array()},
         {"meshes", nlohmann::json::array()},
         {"objects", nlohmann::json::array()},
         {"instances", nlohmann::json::array()},
+        {"modifierVolumes", nlohmann::json::array()},
     };
 }
 
@@ -534,13 +535,13 @@ static bool parse_project_manifest(const uint8_t* manifest_data,
     }
     if (!root.is_object() || !root.contains("schemaVersion")
         || !root.at("schemaVersion").is_string()) {
-        error = "project manifest schemaVersion must be 0.3 or 0.5";
+        error = "project manifest schemaVersion must be 0.5";
         return false;
     }
     result.schema_version = root.at("schemaVersion").get<std::string>();
     const bool has_modifier_volumes = result.schema_version == "0.5";
-    if (result.schema_version != "0.3" && !has_modifier_volumes) {
-        error = "project manifest schemaVersion must be 0.3 or 0.5";
+    if (!has_modifier_volumes) {
+        error = "project manifest schemaVersion must be 0.5";
         return false;
     }
     if (has_modifier_volumes) {
@@ -1846,7 +1847,7 @@ static bool validate_project_model_footprints(
 }
 
 // The released 0.2 multi-object entry point intentionally exposes the older
-// decomposed transform table. The 0.3 project manifest is different: its
+// decomposed transform table. The 0.5 project manifest is different: its
 // matrix is the source-of-truth affine transform and may contain a valid
 // shear or a non-zero Z translation. Build the native model directly for the
 // project path so the common API does not inherit the legacy transform limit.
@@ -3069,7 +3070,7 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
     constexpr const char* threading_model = "pthreads";
     constexpr const char* requires_sab = "true";
     const std::string json = std::string(R"({
-  "api":{"name":"one-wasm-slicer-api","version":"0.5.0"},
+  "api":{"name":"one-wasm-slicer-api","version":"0.5.1"},
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
@@ -3734,7 +3735,7 @@ onewasm_status_t onewasm_project_export(
                 // file as regenerated: plate artifacts, thumbnails, embedded
                 // presets, painting data, and custom per-layer data are not
                 // retained by this adapter and must be reported as opaque
-                // omissions under the 0.3 policy.
+                // omissions under the optional preservation policy.
                 const std::set<std::string> regenerated_entries{
                     "[Content_Types].xml",
                     "_rels/.rels",
@@ -4282,7 +4283,7 @@ onewasm_status_t onewasm_obj_to_stl(
  *              rotation xyz (radians), mirror xyz, and X/Y offset in mm
  *              relative to bed centre. NaN X/Y delegates placement to arrange.
  *
- * Internal adapter used by the 0.3 project implementation.
+ * Internal adapter used by the API 0.5.1 project implementation.
  */
 static onewasm_status_t legacy_slice_stl_multi(
     onewasm_session_t session_ptr,
@@ -4660,7 +4661,7 @@ onewasm_status_t onewasm_cad_to_stl(
  * length, never a NUL-terminated string read). Caller must free with
  * onewasm_free().
  *
- * Internal adapter used by the 0.3 project implementation; -8 means the 3MF export
+ * Internal adapter used by the API 0.5.1 project implementation; -8 means the 3MF export
  * itself (store_bbs_3mf) failed rather than gcode export.
  */
 static onewasm_status_t legacy_write_3mf(
