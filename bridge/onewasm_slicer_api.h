@@ -8,13 +8,14 @@ extern "C" {
 #endif
 
 /*
- * Version 0.5 contract. The exported symbol names intentionally stay in the
- * onewasm_ namespace; the project-manifest extension adds no new C symbols.
+ * API 0.5.1: one exact API version per release. Core behavior is required;
+ * optional behavior is reported by the capability document. Symbol presence
+ * does not establish optional-feature support.
  */
 #define ONEWASM_API_VERSION_MAJOR 0
 #define ONEWASM_API_VERSION_MINOR 5
-#define ONEWASM_API_VERSION_PATCH 0
-#define ONEWASM_API_VERSION_STRING "0.5.0"
+#define ONEWASM_API_VERSION_PATCH 1
+#define ONEWASM_API_VERSION_STRING "0.5.1"
 
 typedef void* onewasm_session_t;
 typedef int32_t onewasm_status_t;

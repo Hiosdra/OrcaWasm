@@ -54,7 +54,8 @@ node scripts/gen-wsl-build-script.mjs
 
 ## C API
 
-The module exports the `one-wasm-slicer-api` 0.4 ABI. The old `orc_*` and
+The module implements exactly `one-wasm-slicer-api` 0.5.1 per engine release.
+It does not negotiate or claim compatibility with older API versions. The old `orc_*` and
 0.2 STL-specific symbols are not part of the canonical surface; hosts use the
 project-oriented API below:
 
@@ -72,48 +73,41 @@ onewasm_free / onewasm_last_error
 
 The Emscripten exports therefore use `_onewasm_*` names. The canonical header
 is vendored at [`bridge/onewasm_slicer_api.h`](bridge/onewasm_slicer_api.h) and
-is synchronized with the private
+tracks the private
 [`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
-repository at `v0.4.0`. The extra `onewasm_read_3mf` export is a geometry-only
+specification. The extra `onewasm_read_3mf` export is a geometry-only
 PoC import helper, outside the canonical project ABI. An Orca project `.3mf`
 is loaded as a native profile with
 `onewasm_init_profile(session, "project.3mf", ...)`.
 
 ## one-wasm-slicer-api compatibility
 
-| Target capability | OrcaWasm 0.4 status | Evidence |
-|---|---|---|
-| Session lifecycle | supported | `onewasm_session_create/destroy` |
-| Native config initialization | supported | `onewasm_init`, format `orca.native-json` |
-| Full native profile | supported | `onewasm_init_profile`, format `project.3mf` |
-| Native profile fragments | supported | `onewasm_apply_profile`, formats `orca.profile-json` and `orca.native-json` |
-| Progress callback | supported | `onewasm_set_progress_callback` plus worker progress messages |
-| Neutral project manifest | supported | `onewasm_project_set_objects/get_manifest` |
-| Project transforms | supported | row-major 4x4 affine matrices |
-| Auto-orient / arrange | supported | `onewasm_project_prepare` |
-| Single/multi/all-plate slice | supported | `onewasm_project_slice` with selected/all plate selection |
-| Per-plate G-code/statistics | supported | result manifest plus `onewasm_project_get_asset` |
-| Native project modifier preservation | supported for API 0.5 support enforcers/blockers | native `project.3mf` import/export retains modifier type, geometry, target object, plate, and transform; unrepresentable native volume types fail explicitly |
-| OBJ / STEP to STL | supported | `onewasm_obj_to_stl` / `onewasm_cad_to_stl` |
-| Native project export | supported with limits | `onewasm_project_export`, explicit preservation policy |
-| G-code in native 3MF | unsupported | `includeSliceArtifacts=true` returns `ONEWASM_ERR_UNSUPPORTED` |
-| Capability metadata | supported | `onewasm_get_capabilities` |
-| Stable status and ownership | supported | 0.3 status values and `onewasm_free` |
-| Cooperative cancellation | supported | `onewasm_cancel`, native `PrintBase::cancel()`, `-11` completion status |
+The nine `requiredIn: "core"` features are `core.session`,
+`core.configuration`, `project.manifest`, `project.slice`,
+`project.slice.assets`, `runtime.progress`, `runtime.capabilities`,
+`runtime.errors`, and `runtime.memory`; this source reports them as supported.
+The host must reject this engine if a required feature is absent or not
+`supported`.
 
-### 0.3 project adapter scope
+All other features are optional and are selected from `onewasm_get_capabilities`
+at runtime. This build reports profile initialization/application, modifier
+volumes and native modifier preservation, prepare/arrange, multi-plate slicing,
+project export and preservation, OBJ/STEP conversion, and cancellation as
+supported. `project.export.sliceArtifacts` is explicitly unsupported; callers
+must not infer optional support from an exported C symbol.
 
-The bridge implements the promoted 0.3 project adapter:
+Every project manifest uses `schemaVersion: "0.5"`, including ordinary
+projects with an empty `modifierVolumes` array. The `"0.3"` schema markers on
+slice, prepare, export-option, and result payloads identify those payload
+schemas; they are not older API versions and do not enable an older manifest
+adapter. The bridge rejects project manifests with any other revision.
 
-| 0.3 surface | Status | Scope |
-|---|---|---|
-| `onewasm_project_set_objects` | implemented | neutral 0.3 manifest plus owned concatenated STL blob |
-| `onewasm_project_get_manifest` | implemented | returns the neutral project state |
-| `onewasm_project_prepare` | implemented | native Orca arrange and auto-orient per plate |
-| `onewasm_project_slice` | implemented | selected/all plates, sequential adapter orchestration, exact 0.3 affine transforms, per-plate result assets/statistics; serializable native meshes are materialized into the neutral blob |
-| `onewasm_project_get_asset` | implemented | reads G-code and exported-project assets from the last successful project operation |
-| `onewasm_project_export` | implemented with limits | clean native projects can be passed through losslessly; host/dirty projects are regenerated with `require`/`best-effort`/`portable` reporting; `includeSliceArtifacts=true` is still unsupported |
-| `init_profile("project.3mf", ...)` as a full project load | implemented with limits | OrcaSlicer loads native configuration/project data and the bridge exposes a neutral manifest; serializable native meshes are copied for later prepare/slice/export |
+The bridge implements native Orca arrange and auto-orient, sequential
+selected/all-plate slicing, per-plate result assets/statistics, native project
+loading, and project export subject to its advertised preservation policies.
+Native project modifier round-tripping covers support enforcers and blockers;
+unrepresentable native volume types fail explicitly. G-code slice artifacts in
+native 3MF are unsupported.
 
 The canonical contract and schemas live in the private
 [`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
@@ -139,7 +133,7 @@ probe sizes, not engine benchmarks. The 64-bit probe reports
 8-byte pointers, so an array of 1,048,576 pointer slots uses 8 MiB instead
 of 4 MiB.
 
-The current API 0.3 uses `uint32_t` byte lengths. The extension worker also
+The versioned API payloads use `uint32_t` byte lengths. The extension worker also
 writes and reads pointer outputs through `HEAPU32` and `i32`, which assumes
 wasm32 pointers. `wasm/CMakeLists.txt` caps memory at 4 GiB as well. A
 Memory64 engine would require a coordinated API and worker ABI change and a
@@ -164,7 +158,7 @@ wasm-v2.4.2-patchN-multithreaded
 The first build for an OrcaSlicer version uses the corresponding
 `wasm-vX.Y.Z-multithreaded` tag; later engine changes use immutable patch tags.
 
-The smoke test exercises API 0.5 support enforcers and blockers both with a
+The smoke test exercises API 0.5.1 support enforcers and blockers both with a
 minimal config and with the reduced selected-profile fixture at
 `scripts/fixtures/voron-0.4-profile-smoke.json`. The profile export does not
 include the active bed surface, so this test explicitly uses `Textured PEI
@@ -172,7 +166,8 @@ Plate` as a test-only setting; it does not select a surface for the printer.
 
 A rebuild never overwrites an existing release. Consumers should resolve the
 highest patch number in the desired release family and use the JavaScript and
-WASM files from the same tag. This repository publishes engine releases only;
+WASM files from the same tag. Each release advertises one exact API version;
+these source changes do not publish a release. This repository publishes engine releases only;
 the frontend deployment is handled separately by the JustSlice-PoC Cloudflare
 Workers project.
 

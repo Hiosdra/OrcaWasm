@@ -3,7 +3,7 @@
  * WASM engine smoke test.
  *
  * Loads the built slicer-mt.js/slicer-mt.wasm and runs the stable project contract
- * end-to-end under API 0.5: onewasm_init, profile application, project
+ * end-to-end under API 0.5.1: onewasm_init, profile application, project
  * manifest/prepare/slice/assets, project export, and the geometry-only 3MF
  * import helper. The test catches broken builds before they are published as a GitHub Release
  * (build-wasm.yml) or trusted by a host after the artifacts are prepared.
@@ -63,40 +63,54 @@ function getCapabilitiesOnce(module) {
     const len = module.getValue(outLenPtr, 'i32')
     try {
       const capabilities = JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len)))
-      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.5.0') {
-        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.5.0')
+      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.5.1') {
+        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.5.1')
       }
       if (!capabilities.project?.nativeProjectFormats?.includes('project.3mf')) {
         throw new Error('capabilities document does not advertise native project.3mf support')
       }
-      const requiredFeatures = [
+      const coreRequiredFeatures = [
         'core.session',
         'core.configuration',
-        'config.fullProfile',
-        'config.profileApply',
         'project.manifest',
-        'project.modifierVolumes',
-        'project.prepare',
         'project.slice',
-        'project.slice.multiPlate',
         'project.slice.assets',
-        'project.export',
-        'project.export.preservation',
-        'format.objToStl',
-        'format.stepToStl',
         'runtime.capabilities',
         'runtime.progress',
-        'runtime.cancellation',
         'runtime.errors',
         'runtime.memory',
       ]
-      for (const feature of requiredFeatures) {
+      for (const feature of coreRequiredFeatures) {
         if (capabilities.features?.[feature] !== 'supported') {
-          throw new Error(`capabilities document does not mark ${feature} as supported`)
+          throw new Error(`capabilities document does not satisfy required core feature ${feature}`)
         }
       }
-      if (capabilities.features?.['project.modifierVolumes.nativeProject'] !== 'supported') {
-        throw new Error('capabilities document must mark native-project modifier volumes as supported')
+      const optionalFeatures = [
+        'config.fullProfile',
+        'config.profileApply',
+        'project.modifierVolumes',
+        'project.modifierVolumes.nativeProject',
+        'project.prepare',
+        'project.slice.multiPlate',
+        'project.export',
+        'project.export.sliceArtifacts',
+        'project.export.preservation',
+        'format.objToStl',
+        'format.stepToStl',
+        'runtime.cancellation',
+      ]
+      for (const feature of optionalFeatures) {
+        if (!['supported', 'partial', 'unsupported'].includes(capabilities.features?.[feature])) {
+          throw new Error(`capabilities document has no valid optional status for ${feature}`)
+        }
+      }
+      const optionalFeaturesExercisedByThisEngine = optionalFeatures.filter(
+        (feature) => feature !== 'project.export.sliceArtifacts',
+      )
+      for (const feature of optionalFeaturesExercisedByThisEngine) {
+        if (capabilities.features[feature] !== 'supported') {
+          throw new Error(`this engine smoke suite requires its advertised optional feature ${feature}`)
+        }
       }
       return capabilities
     } finally {
@@ -574,7 +588,7 @@ function collectMeshes(fixture) {
 }
 
 function projectMatrix(tx, ty, tz = 0, shearXByY = 0) {
-  // one-wasm-slicer-api 0.3 uses row-major matrices with column vectors.
+  // The API 0.5 project manifest uses row-major matrices with column vectors.
   return [
     1, shearXByY, 0, tx,
     0, 1, 0, ty,
@@ -863,7 +877,7 @@ function makeProjectFixture(meshBytes) {
   return {
     blob: new Uint8Array(meshBytes),
     manifest: {
-      schemaVersion: '0.3',
+      schemaVersion: '0.5',
       plates: [
         { id: 'plate-0', label: 'Plate 0', index: 0 },
         { id: 'plate-1', label: 'Plate 1', index: 1 },
@@ -878,12 +892,14 @@ function makeProjectFixture(meshBytes) {
         { id: 'instance-0', objectId: 'object-0', plateId: 'plate-0', transform: { matrix: projectMatrix(128, 128) } },
         { id: 'instance-1', objectId: 'object-0', plateId: 'plate-1', transform: { matrix: projectMatrix(128, 128) } },
       ],
+      modifierVolumes: [],
     },
   }
 }
 
 function assertProjectManifest(manifest, label) {
-  if (manifest?.schemaVersion !== '0.3') throw new Error(`${label}: invalid project manifest schema version`)
+  if (manifest?.schemaVersion !== '0.5') throw new Error(`${label}: invalid project manifest schema version`)
+  if (!Array.isArray(manifest.modifierVolumes)) throw new Error(`${label}: missing modifierVolumes array`)
   if (!Array.isArray(manifest.plates) || manifest.plates.length !== 2) throw new Error(`${label}: expected two plates`)
   if (!Array.isArray(manifest.instances) || manifest.instances.length !== 2) throw new Error(`${label}: expected two instances`)
   for (const instance of manifest.instances) {
@@ -923,6 +939,17 @@ function runProjectSmoke(module, session, meshBytes) {
   projectSetObjectsOnce(module, session, project.blob, project.manifest)
   assertProjectManifest(projectGetManifestOnce(module, session), 'project_set_objects/get_manifest')
 
+  const obsoleteManifest = { ...project.manifest, schemaVersion: '0.3' }
+  delete obsoleteManifest.modifierVolumes
+  let obsoleteManifestRejected = false
+  try {
+    projectSetObjectsOnce(module, session, project.blob, obsoleteManifest)
+  } catch {
+    obsoleteManifestRejected = true
+  }
+  if (!obsoleteManifestRejected) throw new Error('API 0.5.1 accepted obsolete project manifest revision 0.3')
+  assertProjectManifest(projectGetManifestOnce(module, session), 'project after obsolete manifest rejection')
+
   const prepared = projectPrepareOnce(module, session, {
     schemaVersion: '0.3',
     operation: 'arrange',
@@ -931,7 +958,7 @@ function runProjectSmoke(module, session, meshBytes) {
 
   // Arrange intentionally consumes the legacy decomposable transform shape.
   // Re-upload a valid full-affine manifest for slicing so this test also pins
-  // the 0.3 direct-matrix path (including a shear) independently of arrange.
+  // the 0.5 manifest matrix path (including a shear) independently of arrange.
   const slicedManifest = JSON.parse(JSON.stringify(project.manifest))
   slicedManifest.instances[1].transform.matrix = projectMatrix(128, 128, 0, 0.1)
   projectSetObjectsOnce(module, session, project.blob, slicedManifest)
@@ -1154,6 +1181,7 @@ function makeTransformProjectManifest(meshBytes, matrices) {
       plateId: 'transform-plate',
       transform: { matrix },
     })),
+    modifierVolumes: [],
   }
 }
 
@@ -1178,7 +1206,7 @@ function sliceTransformManifest(module, session, meshBytes, manifest, label) {
   const plate = result?.plateResults?.[0]
   if (plate?.plateId !== 'transform-plate' || plate.assets?.length !== 1
     || plate.assets[0].id !== 'gcode:transform-plate') {
-    throw new Error(label + ': API 0.3 did not return the transform plate G-code asset')
+    throw new Error(label + ': API 0.5.1 did not return the transform plate G-code asset')
   }
   const gcode = new TextDecoder().decode(projectGetAssetOnce(module, session, 'gcode:transform-plate'))
   assertSaneGcode(gcode, label)
@@ -1489,7 +1517,7 @@ async function main() {
     }
 
     for (const mesh of meshes) {
-      const stableProjectLabel = `[${mesh.label}] API 0.3 project manifest, prepare, all/selected plate slicing`
+      const stableProjectLabel = `[${mesh.label}] API 0.5.1 manifest, prepare, all/selected plate slicing`
       let stableExportedProject = null
       process.stdout.write(`[smoke-test] ${stableProjectLabel} ... `)
       try {
@@ -1502,19 +1530,19 @@ async function main() {
         console.error(`  ${err.message}`)
       }
 
-      const stableProfileLabel = `[${mesh.label}] API 0.3 native project profile load/export`
+      const stableProfileLabel = `[${mesh.label}] API 0.5.1 native project profile load/export`
       process.stdout.write(`[smoke-test] ${stableProfileLabel} ... `)
       try {
         if (!stableExportedProject) throw new Error('project export did not produce a profile package')
         initProfileOnce(module, stableSession, stableExportedProject)
         const loadedManifest = projectGetManifestOnce(module, stableSession)
-        if (loadedManifest?.schemaVersion !== '0.3'
+        if (loadedManifest?.schemaVersion !== '0.5'
           || !Array.isArray(loadedManifest.plates)
           || !Array.isArray(loadedManifest.meshes)
           || !Array.isArray(loadedManifest.objects)
           || !Array.isArray(loadedManifest.instances)
           || loadedManifest.instances.length === 0) {
-          throw new Error('native project profile did not expose a complete 0.3 manifest')
+          throw new Error('native project profile did not expose a complete 0.5 manifest')
         }
         const passthrough = projectExportOnce(module, stableSession, 'project.3mf', {
           schemaVersion: '0.3',
@@ -1560,7 +1588,7 @@ async function main() {
       }
     }
 
-    const transformLabel = 'API 0.3 asymmetric object-transform and placement regression coverage'
+    const transformLabel = 'API 0.5.1 asymmetric object-transform and placement regression coverage'
     process.stdout.write('[smoke-test] ' + transformLabel + ' ... ')
     try {
       runTransformRegressionSmoke(module, stableSession)
