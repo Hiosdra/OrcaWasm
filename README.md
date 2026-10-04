@@ -186,6 +186,13 @@ these source changes do not publish a release. This repository publishes engine 
 the frontend deployment is handled separately by the JustSlice-PoC Cloudflare
 Workers project.
 
+Pull requests from branches of this repository that pass the smoke and
+conformance tests also publish a **prerelease**
+`wasm-v2.4.2-pr<number>.<run>-multithreaded`, so JustSlice-PoC can select the
+build before merge. Prereleases never match the `-patchN` numbering and are
+skipped by consumers that resolve the newest release. Closing the PR deletes
+its prereleases and tags (`cleanup-pr-prereleases.yml`).
+
 ## Licence and notices
 
 OrcaSlicer and the linked libraries retain their upstream licences. See

@@ -784,6 +784,30 @@ jobs:
           path: wasm-artifacts/
           retention-days: 90
 
+      # ── Pull-request prerelease ──────────────────────────────────────
+      # Same-repository PR builds that passed the smoke and conformance tests
+      # are published as prereleases so JustSlice-PoC can select them before
+      # merge. Consumers resolving the latest release skip prereleases, and
+      # the tag (-pr<N>.<run>) never matches the -patchN numbering above.
+      # Fork PRs have a read-only token and only validate.
+      - name: Publish pull-request prerelease
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          TAG="wasm-${ORCA_VERSION}-pr${PR_NUMBER}.${GITHUB_RUN_NUMBER}-multithreaded"
+          printf 'Pull-request build of #%s at %s for testing before merge. Not a release: consumers keep using the newest -patchN release.\n' \
+            "$PR_NUMBER" "$HEAD_SHA" > prerelease-notes.md
+          gh release create "$TAG" wasm-artifacts/* \
+            --prerelease \
+            --target "$HEAD_SHA" \
+            --title "PR #${PR_NUMBER} build ${GITHUB_RUN_NUMBER} for OrcaSlicer $ORCA_VERSION" \
+            --notes-file prerelease-notes.md \
+            --repo "$GITHUB_REPOSITORY"
+          echo "Published prerelease: $TAG"
+
       # ── Create a new, immutable GitHub release with WASM assets ──────
       # Skip on PRs — those runs only validate compilation, not publish.
       # Releases are never overwritten in place (no --clobber on create):
@@ -813,7 +837,7 @@ jobs:
           # Use the newest multithreaded release and ignore unrelated release
           # families. `gh release list` sorts newest-first.
           PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName \
-            --jq '[.[] | .tagName | select(startswith("wasm-v")) | select(endswith("-multithreaded"))] | first // empty')
+            --jq '[.[] | .tagName | select(startswith("wasm-v")) | select(endswith("-multithreaded")) | select(test("-pr[0-9]") | not)] | first // empty')
           # Real newlines via a notes file — the previous inline
           # --notes "...\n\n..." passed the backslash-n sequences literally,
           # so published notes showed a verbatim "\n\n" instead of a blank line.
