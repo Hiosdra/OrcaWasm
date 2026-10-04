@@ -1374,6 +1374,26 @@ static nlohmann::json project_matrix_json(const std::array<double, 16>& matrix) 
     return result;
 }
 
+// Bounding box of a native printable_area, used for the session bed and for
+// desktop Orca's plate layout. Returns false when the option is absent.
+static bool native_printable_area_bounds(
+    const Slic3r::DynamicPrintConfig& config,
+    Slic3r::Vec2d& min,
+    Slic3r::Vec2d& max,
+    std::size_t& point_count
+) {
+    const auto* area = config.option<Slic3r::ConfigOptionPoints>("printable_area");
+    if (!area || area->values.empty())
+        return false;
+    min = max = area->values.front();
+    for (const auto& point : area->values) {
+        min = min.cwiseMin(point);
+        max = max.cwiseMax(point);
+    }
+    point_count = area->values.size();
+    return max.x() > min.x() && max.y() > min.y();
+}
+
 static bool append_native_model_project(
     OrcSession& session,
     Slic3r::Model& model,
@@ -1472,12 +1492,42 @@ static bool append_native_model_project(
         });
     }
 
-    auto project_matrix = [](const Slic3r::ModelInstance& instance) {
+    // Desktop Orca stores every instance in one scene where plate i sits at
+    // PartPlateList::compute_shape_position(i, cols): a grid of plates spaced
+    // by the bed size plus a 1/5 gap, rows extending towards -Y. The manifest
+    // places instances on their own plate's bed, which is also how the slicer
+    // sees them (zero_plate_origin), so remove that scene offset here.
+    std::map<std::string, Slic3r::Vec2d> plate_origins;
+    Slic3r::Vec2d bed_min, bed_max;
+    std::size_t bed_points = 0;
+    if (plate_data_list.size() > 1
+        && native_printable_area_bounds(session.config, bed_min, bed_max, bed_points)) {
+        const int plate_width = static_cast<int>((bed_max - bed_min).x());
+        const int plate_depth = static_cast<int>((bed_max - bed_min).y());
+        const float root = std::sqrt(static_cast<float>(plate_data_list.size()));
+        const int cols = static_cast<int>(root > std::round(root) ? std::round(root) + 1 : std::round(root));
+        constexpr double plate_gap = 1. / 5.;
+        for (const auto& [plate_id, plate] : plates) {
+            if (!plate || plate->plate_index < 0)
+                continue;
+            const int row = plate->plate_index / cols;
+            const int col = plate->plate_index % cols;
+            plate_origins[plate_id] = Slic3r::Vec2d(
+                col * plate_width * (1. + plate_gap),
+                -row * plate_depth * (1. + plate_gap));
+        }
+    }
+
+    auto project_matrix = [&plate_origins](const Slic3r::ModelInstance& instance, const std::string& plate_id) {
         std::array<double, 16> matrix{};
         const auto& native = instance.get_matrix().matrix();
         for (int row = 0; row < 4; ++row)
             for (int column = 0; column < 4; ++column)
                 matrix[static_cast<std::size_t>(row * 4 + column)] = native(row, column);
+        if (const auto origin = plate_origins.find(plate_id); origin != plate_origins.end()) {
+            matrix[3] -= origin->second.x();
+            matrix[7] -= origin->second.y();
+        }
         return matrix;
     };
     std::set<std::pair<std::size_t, std::size_t>> emitted;
@@ -1498,7 +1548,7 @@ static bool append_native_model_project(
             {"id", "native-instance-" + std::to_string(instance_ordinal++)},
             {"objectId", object_ids[object_index]},
             {"plateId", plate_id},
-            {"transform", {{"matrix", project_matrix(*instance)}}},
+            {"transform", {{"matrix", project_matrix(*instance, plate_id)}}},
         });
         return true;
     };
@@ -3060,6 +3110,15 @@ onewasm_status_t onewasm_init_profile(
         session->config = Slic3r::DynamicPrintConfig();
         session->config.apply(g_defaults);
         session->config.apply(loaded_config);
+        // The project's printer replaces the bed from onewasm_init, matching
+        // the printable_area convention of the JSON profile path.
+        Slic3r::Vec2d bed_min, bed_max;
+        std::size_t bed_points = 0;
+        if (native_printable_area_bounds(session->config, bed_min, bed_max, bed_points)) {
+            session->bed_cx = bed_max.x() / 2.0;
+            session->bed_cy = bed_max.y() / 2.0;
+            session->bed_shape = bed_points > 8 ? "circle" : "rectangle";
+        }
         session->remove_mixed_temp_restriction = false;
         session->adaptive_layer_height = false;
         session->adaptive_layer_height_quality = 0.5f;
