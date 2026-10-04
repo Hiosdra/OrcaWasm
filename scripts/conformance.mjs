@@ -49,7 +49,7 @@ const report = await runConformance(artifact, {
   },
   samples: {
     step: new Uint8Array(readFileSync(new URL('../wasm/onewasm/samples/red_cube_blue_cylinder.step', import.meta.url))),
-    threeMf: new Uint8Array(readFileSync(new URL('../wasm/onewasm/samples/cube-20mm.3mf', import.meta.url))),
+    threeMf: new Uint8Array(readFileSync(new URL('../wasm/onewasm/samples/box.3mf', import.meta.url))),
     obj: new TextEncoder().encode('v 0 0 0\nv 10 0 0\nv 0 10 0\nv 0 0 10\nf 1 3 2\nf 1 2 4\nf 2 3 4\nf 1 4 3\n'),
   },
 })
