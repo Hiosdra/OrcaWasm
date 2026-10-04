@@ -87,7 +87,7 @@ target_link_options(slicer PRIVATE
   # keeps MEMFS available for the bridge's /tmp STL-in / G-code-out files.
   -sFORCE_FILESYSTEM=1
   # Every C binding symbol of one-wasm-slicer-api 0.6.0, consumed by the
-  # embedded glue; onewasm_read_3mf is optional format.threeMfToStl.
+  # embedded glue; onewasm_three_mf_to_stl is optional format.threeMfToStl.
   "-sEXPORTED_FUNCTIONS=[\
 '_onewasm_session_create',\
 '_onewasm_session_destroy',\
@@ -105,7 +105,7 @@ target_link_options(slicer PRIVATE
 '_onewasm_project_export',\
 '_onewasm_obj_to_stl',\
 '_onewasm_cad_to_stl',\
-'_onewasm_read_3mf',\
+'_onewasm_three_mf_to_stl',\
 '_onewasm_free',\
 '_onewasm_last_error',\
 '_malloc',\

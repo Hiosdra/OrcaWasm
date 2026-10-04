@@ -186,7 +186,7 @@ export function translation(x, y, z = 0) {
 /** A one-plate, one-object project for a single uploaded mesh. */
 export function singleObjectManifest(meshLength, matrix = translation(100, 100)) {
     return {
-        schemaVersion: '0.5',
+        schemaVersion: '0.6.0',
         plates: [{ id: 'plate-0', index: 0 }],
         meshes: [{ id: 'mesh-0', format: 'stl', dataRange: { offset: 0, length: meshLength } }],
         objects: [{ id: 'object-0', meshId: 'mesh-0' }],
@@ -195,12 +195,14 @@ export function singleObjectManifest(meshLength, matrix = translation(100, 100))
     };
 }
 const SELECTED_PLATE = {
-    schemaVersion: '0.3',
+    schemaVersion: '0.6.0',
     plateSelection: 'selected',
     plateIds: ['plate-0'],
     includeGcode: true,
     includeStatistics: true,
 };
+/** Schema versions every engine must reject: earlier markers and near misses. */
+const OTHER_SCHEMA_VERSIONS = ['0.3', '0.5', '0.5.1', '0.6'];
 class Recorder {
     checks = [];
     async check(name, body) {
@@ -235,11 +237,11 @@ async function expectError(operation, codes, label) {
 }
 async function sliceGcode(session) {
     const result = await session.slice(SELECTED_PLATE);
-    assert(result.schemaVersion === '0.3', 'slice result must use payload marker 0.3');
+    assert(result.schemaVersion === '0.6.0', 'slice result must use schema version 0.6.0');
     const plate = result.plateResults.find((entry) => entry.plateId === 'plate-0');
     assert(plate, 'slice result has no entry for plate-0');
     assert(Array.isArray(plate.warnings), 'plate result must list warnings');
-    assert(plate.statistics === null || plate.statistics.schemaVersion === '0.3', 'statistics must be null or 0.3');
+    assert(plate.statistics === null || plate.statistics.schemaVersion === '0.6.0', 'statistics must be null or 0.6.0');
     const asset = plate.assets.find((entry) => entry.kind === 'gcode');
     assert(asset, 'slice result has no G-code asset');
     const bytes = await session.getAsset(asset.id);
@@ -295,7 +297,7 @@ export async function runConformance(artifact, input) {
         await recorder.check('project: binary STL upload and manifest round-trip', async () => {
             await live.setObjects(binary, manifest);
             const readBack = await live.getManifest();
-            assert(readBack.schemaVersion === '0.5', 'manifest readback must use revision 0.5');
+            assert(readBack.schemaVersion === '0.6.0', 'manifest readback must use schema version 0.6.0');
             assert(sameJson(readBack.instances, manifest.instances), 'instance IDs or transforms changed on readback');
             assert(Array.isArray(readBack.modifierVolumes) && readBack.modifierVolumes.length === 0, 'modifiers changed');
         });
@@ -304,11 +306,19 @@ export async function runConformance(artifact, input) {
             firstAsset = (await sliceGcode(live)).assetId;
         });
         await recorder.check('errors: unknown asset ID rejects with NO_DATA', () => expectError(() => live.getAsset('onewasm-conformance-missing-asset'), ['NO_DATA'], 'unknown asset'));
-        await recorder.check('project: old manifest revision is rejected without mutation', async () => {
+        await recorder.check('project: other schema versions are rejected without mutation', async () => {
             const before = await live.getManifest();
-            const old = { ...manifest, schemaVersion: '0.3' };
-            await expectError(() => live.setObjects(binary, old), ['VALIDATION'], 'manifest 0.3');
-            assert(sameJson(await live.getManifest(), before), 'rejected manifest changed the project');
+            for (const version of OTHER_SCHEMA_VERSIONS) {
+                const other = { ...manifest, schemaVersion: version };
+                await expectError(() => live.setObjects(binary, other), ['VALIDATION'], `manifest ${version}`);
+                assert(sameJson(await live.getManifest(), before), `rejected manifest ${version} changed the project`);
+            }
+        });
+        await recorder.check('slice: other request schema versions are rejected', async () => {
+            for (const version of OTHER_SCHEMA_VERSIONS) {
+                const other = { ...SELECTED_PLATE, schemaVersion: version };
+                await expectError(() => live.slice(other), ['VALIDATION'], `slice request ${version}`);
+            }
         });
         await recorder.check('project: out-of-range mesh bytes are rejected without mutation', async () => {
             const before = await live.getManifest();
@@ -387,10 +397,10 @@ async function optionalSuites(recorder, engine, session, input, caps) {
     const unsupportedCalls = [
         ['config.fullProfile', () => session.initProfile('onewasm.conformance', new Uint8Array([123, 125]))],
         ['config.profileApply', () => session.applyProfile('onewasm.conformance', new Uint8Array([123, 125]))],
-        ['project.prepare', () => session.prepare({ schemaVersion: '0.3', operation: 'arrange' })],
+        ['project.prepare', () => session.prepare({ schemaVersion: '0.6.0', operation: 'arrange' })],
         [
             'project.export',
-            () => session.export('project.3mf', { schemaVersion: '0.3', preservation: 'portable', includeSliceArtifacts: false }),
+            () => session.export('project.3mf', { schemaVersion: '0.6.0', preservation: 'portable', includeSliceArtifacts: false }),
         ],
         ['format.objToStl', () => engine.objToStl(encoder.encode('v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n'))],
         ['format.stepToStl', () => engine.cadToStl(new Uint8Array([0]))],
@@ -426,8 +436,8 @@ async function optionalSuites(recorder, engine, session, input, caps) {
     }
     if (!unsupported.has('project.prepare')) {
         await recorder.check('project.prepare: arrange returns the mutated manifest', async () => {
-            const prepared = await session.prepare({ schemaVersion: '0.3', operation: 'arrange' });
-            assert(prepared.schemaVersion === '0.5', 'prepare must return manifest revision 0.5');
+            const prepared = await session.prepare({ schemaVersion: '0.6.0', operation: 'arrange' });
+            assert(prepared.schemaVersion === '0.6.0', 'prepare must return schema version 0.6.0');
             assert(sameJson(prepared, await session.getManifest()), 'prepare result differs from getManifest');
         });
     }

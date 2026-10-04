@@ -81,12 +81,12 @@ onewasm_cancel
 onewasm_project_set_objects / onewasm_project_get_manifest
 onewasm_project_prepare / onewasm_project_slice
 onewasm_project_get_asset / onewasm_project_export
-onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_read_3mf
+onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_three_mf_to_stl
 onewasm_get_capabilities
 onewasm_free / onewasm_last_error
 ```
 
-`onewasm_read_3mf` is optional `format.threeMfToStl` (geometry only). An Orca
+`onewasm_three_mf_to_stl` is optional `format.threeMfToStl` (geometry only). An Orca
 project `.3mf` is loaded as a native profile with `initProfile("project.3mf", ...)`.
 
 To update the API, copy `js/glue/onewasm-emscripten-glue.js`,
@@ -109,11 +109,10 @@ project export and preservation, OBJ/STEP/3MF conversion, and cancellation
 as supported. `project.export.sliceArtifacts` is explicitly unsupported; callers
 must not infer optional support from an exported C symbol.
 
-Every project manifest uses `schemaVersion: "0.5"`, including ordinary
-projects with an empty `modifierVolumes` array. The `"0.3"` schema markers on
-slice, prepare, export-option, and result payloads identify those payload
-schemas; they are not older API versions and do not enable an older manifest
-adapter. The bridge rejects project manifests with any other revision.
+Every payload (project manifest, prepare/slice/export requests and results,
+slice statistics) uses `schemaVersion: "0.6.0"`, the API version, including
+ordinary projects with an empty `modifierVolumes` array. The bridge rejects
+any other `schemaVersion`.
 
 The bridge implements native Orca arrange and auto-orient, sequential
 selected/all-plate slicing, per-plate result assets/statistics, native project

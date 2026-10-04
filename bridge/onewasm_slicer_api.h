@@ -15,7 +15,9 @@ extern "C" {
  * One exact API version per release; core behavior is required. Every
  * declaration remains in the ABI. Optional operations may be stubs returning
  * ONEWASM_ERR_UNSUPPORTED; symbol presence is not capability support.
- * Every engine accepts project manifest 0.5 with empty modifierVolumes.
+ * Every JSON payload carries schemaVersion equal to the API version string;
+ * engines reject any other value. Every engine accepts ordinary project
+ * manifests with empty modifierVolumes.
  * Nonempty modifierVolumes requires the advertised optional capability.
  */
 #define ONEWASM_API_VERSION_MAJOR 0
@@ -28,8 +30,10 @@ typedef int32_t onewasm_status_t;
 
 /*
  * The stage string is borrowed and valid only for the duration of the
- * callback. The callback must be non-blocking and must not re-enter the
- * session. percent is 0..100, or -1 when no useful percentage is known.
+ * callback. The engine invokes the callback on the thread that called the
+ * operation; an engine reporting progress from worker threads proxies the
+ * call to that thread. The callback must be non-blocking and must not
+ * re-enter the session. percent is 0..100, or -1 when no useful percentage is known.
  */
 typedef void (*onewasm_progress_callback_t)(
     int32_t percent,
@@ -149,8 +153,10 @@ onewasm_status_t onewasm_cad_to_stl(
     uint8_t** out_stl,
     uint32_t* out_len
 );
-/* Optional format.threeMfToStl: merged geometry only, no native settings. */
-onewasm_status_t onewasm_read_3mf(
+/* Optional format.threeMfToStl: merged geometry only, no native settings.
+ * Every plate's build items are merged into one mesh in the source scene's
+ * coordinates, with transforms (including mirroring) applied. */
+onewasm_status_t onewasm_three_mf_to_stl(
     const uint8_t* mf_data,
     uint32_t mf_len,
     uint8_t** out_stl,

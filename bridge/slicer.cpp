@@ -10,12 +10,12 @@
  *   onewasm_project_prepare/slice/get_asset(session, request)
  *   onewasm_project_export(session, native format, options)
  *   onewasm_obj_to_stl / onewasm_cad_to_stl(input, output)
- *   onewasm_read_3mf(input, output)                                → optional format.threeMfToStl
+ *   onewasm_three_mf_to_stl(input, output)                                → optional format.threeMfToStl
  *   onewasm_get_capabilities(outJson, outLen)
  *   onewasm_free(ptr)
  *   onewasm_last_error(session)                                   → null-terminated UTF-8 string
  *
- * onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_read_3mf are pure format conversions
+ * onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_three_mf_to_stl are pure format conversions
  * — they never touch slicer config state, so they take no session handle.
  *
  * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.6.0:
@@ -31,7 +31,7 @@
  *   -11 active operation was cancelled
  *   -12 no optional result is available
  *
- * onewasm_read_3mf reuses the same -1/-3/-4/-5/-8/-9 meanings (input write /
+ * onewasm_three_mf_to_stl reuses the same -1/-3/-4/-5/-8/-9 meanings (input write /
  * 3MF load / no geometry / STL export / exception), decoded via
  * onewasm_last_error(0) like onewasm_obj_to_stl / onewasm_cad_to_stl.
  */
@@ -214,7 +214,7 @@ struct ProjectModifierVolumeInput {
 };
 
 struct ProjectManifestInput {
-    std::string schema_version = "0.5";
+    std::string schema_version = ONEWASM_API_VERSION_STRING;
     std::vector<std::string> plate_ids;
     std::vector<ProjectMeshInput> meshes;
     std::vector<ProjectObjectInput> objects;
@@ -224,7 +224,7 @@ struct ProjectManifestInput {
 
 static nlohmann::json empty_project_manifest() {
     return nlohmann::json{
-        {"schemaVersion", "0.5"},
+        {"schemaVersion", ONEWASM_API_VERSION_STRING},
         {"plates", nlohmann::json::array()},
         {"meshes", nlohmann::json::array()},
         {"objects", nlohmann::json::array()},
@@ -563,13 +563,13 @@ static bool parse_project_manifest(const uint8_t* manifest_data,
     }
     if (!root.is_object() || !root.contains("schemaVersion")
         || !root.at("schemaVersion").is_string()) {
-        error = "project manifest schemaVersion must be 0.5";
+        error = "project manifest schemaVersion must be " ONEWASM_API_VERSION_STRING;
         return false;
     }
     result.schema_version = root.at("schemaVersion").get<std::string>();
-    const bool has_modifier_volumes = result.schema_version == "0.5";
+    const bool has_modifier_volumes = result.schema_version == ONEWASM_API_VERSION_STRING;
     if (!has_modifier_volumes) {
-        error = "project manifest schemaVersion must be 0.5";
+        error = "project manifest schemaVersion must be " ONEWASM_API_VERSION_STRING;
         return false;
     }
     if (has_modifier_volumes) {
@@ -1693,7 +1693,7 @@ static bool append_native_model_project(
     }
 
     if (modifier_ordinal > 0)
-        manifest["schemaVersion"] = "0.5";
+        manifest["schemaVersion"] = ONEWASM_API_VERSION_STRING;
 
     if (manifest["instances"].empty()) {
         manifest = empty_project_manifest();
@@ -1796,8 +1796,8 @@ static bool parse_project_export_options(
     }
     if (!options.is_object() || !options.contains("schemaVersion")
         || !options.at("schemaVersion").is_string()
-        || options.at("schemaVersion").get<std::string>() != "0.3") {
-        error = "project export options schemaVersion must be 0.3";
+        || options.at("schemaVersion").get<std::string>() != ONEWASM_API_VERSION_STRING) {
+        error = "project export options schemaVersion must be " ONEWASM_API_VERSION_STRING;
         return false;
     }
     if (!reject_unknown_keys(
@@ -2271,8 +2271,8 @@ static bool parse_project_slice_request(const uint8_t* request_data,
     }
     if (!request.is_object() || !request.contains("schemaVersion")
         || !request.at("schemaVersion").is_string()
-        || request.at("schemaVersion").get<std::string>() != "0.3") {
-        error = "project slice request schemaVersion must be 0.3";
+        || request.at("schemaVersion").get<std::string>() != ONEWASM_API_VERSION_STRING) {
+        error = "project slice request schemaVersion must be " ONEWASM_API_VERSION_STRING;
         return false;
     }
     if (!reject_unknown_keys(
@@ -2554,7 +2554,7 @@ static std::string serialize_slice_statistics(const Slic3r::Print& print,
     map_volume_to_length(native.flush_per_filament, flush_length_mm);
 
     nlohmann::json result;
-    result["schemaVersion"] = "0.2";
+    result["schemaVersion"] = ONEWASM_API_VERSION_STRING;
     result["timeSeconds"] = {
         {"normal", normal_index < native.modes.size() ? optional_non_negative(native.modes[normal_index].time) : nlohmann::json(nullptr)},
         {"silent", silent_index < native.modes.size() && native.modes[silent_index].time > 0.0f
@@ -3353,8 +3353,8 @@ onewasm_status_t onewasm_project_prepare(
     }
     if (!request.is_object() || !request.contains("schemaVersion")
         || !request.at("schemaVersion").is_string()
-        || request.at("schemaVersion").get<std::string>() != "0.3") {
-        record_error(*session, "project prepare request schemaVersion must be 0.3");
+        || request.at("schemaVersion").get<std::string>() != ONEWASM_API_VERSION_STRING) {
+        record_error(*session, "project prepare request schemaVersion must be " ONEWASM_API_VERSION_STRING);
         return ONEWASM_ERR_VALIDATION;
     }
     std::string request_error;
@@ -3547,7 +3547,7 @@ onewasm_status_t onewasm_project_slice(
     ProjectOutputFailureGuard output_guard{*session};
     std::map<std::string, std::string> new_assets;
     nlohmann::json result = {
-        {"schemaVersion", "0.3"},
+        {"schemaVersion", ONEWASM_API_VERSION_STRING},
         {"plateResults", nlohmann::json::array()},
         {"warnings", nlohmann::json::array()},
     };
@@ -3634,7 +3634,7 @@ onewasm_status_t onewasm_project_slice(
                         record_error(*session, "OrcaSlicer returned invalid slice statistics");
                         return ONEWASM_ERR_INTERNAL;
                     }
-                    statistics["schemaVersion"] = "0.3";
+                    statistics["schemaVersion"] = ONEWASM_API_VERSION_STRING;
                     plate_result["statistics"] = std::move(statistics);
                 } catch (const std::exception& exception) {
                     std::free(statistics_data);
@@ -3986,7 +3986,7 @@ onewasm_status_t onewasm_project_export(
             return ONEWASM_ERR_OUTPUT;
         }
         nlohmann::json result = {
-            {"schemaVersion", "0.3"},
+            {"schemaVersion", ONEWASM_API_VERSION_STRING},
             {"asset", {
                 {"id", "project:export"},
                 {"kind", "project"},
@@ -4916,7 +4916,7 @@ static onewasm_status_t legacy_write_3mf(
  *   -9  unexpected C++ exception
  */
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_read_3mf(
+onewasm_status_t onewasm_three_mf_to_stl(
     const uint8_t* mf_data,
     uint32_t mf_len,
     uint8_t** out_stl,

@@ -351,7 +351,7 @@ var onewasmDefineEmscriptenEngine = (function () {
       }
       async threeMfToStl(data) {
           this.live();
-          return this.binding.convert('_onewasm_read_3mf', data);
+          return this.binding.convert('_onewasm_three_mf_to_stl', data);
       }
       async dispose() {
           // An Emscripten runtime cannot be unloaded; dropping the reference is enough.
