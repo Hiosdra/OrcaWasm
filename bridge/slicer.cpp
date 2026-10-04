@@ -62,6 +62,8 @@
 #include <sys/stat.h>
 
 #include <emscripten.h>
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
 
 // OrcaSlicer core
 // (note: an earlier attempt to cap oneTBB via tbb::global_control lived here;
@@ -339,6 +341,34 @@ struct ProgressWindow {
     int old_span;
 };
 
+// The host registers the progress callback with addFunction on the main
+// runtime thread, and a function-table entry added there is not valid on
+// other pthreads. Print status callbacks run on TBB worker threads, so the
+// call is proxied synchronously to the main runtime thread, which services
+// the proxy queue while it blocks waiting for the slice.
+struct ProgressDelivery {
+    onewasm_progress_callback_t callback;
+    int percent;
+    const char* stage;
+    void* user_data;
+};
+
+static void run_progress_delivery(void* arg) {
+    auto* delivery = static_cast<ProgressDelivery*>(arg);
+    delivery->callback(delivery->percent, delivery->stage, delivery->user_data);
+}
+
+static void deliver_progress(const OrcSession& session, int percent, const char* stage) {
+    if (!session.progress_callback)
+        return;
+    ProgressDelivery delivery{session.progress_callback, percent, stage, session.progress_user_data};
+    if (emscripten_is_main_runtime_thread())
+        run_progress_delivery(&delivery);
+    else
+        emscripten_proxy_sync(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(),
+                              run_progress_delivery, &delivery);
+}
+
 // Slicing blocks the worker's event loop. MAIN_THREAD_EM_ASM delivers this
 // from the pthread engine back to that worker, where postMessage reaches the
 // host's main thread immediately.
@@ -386,8 +416,7 @@ static void attach_progress_callback(Slic3r::Print& print, OrcSession& session) 
             const int mapped_percent = session.progress_base + static_cast<int>(std::lround(
                 static_cast<double>(percent) * static_cast<double>(session.progress_span) / 100.0
             ));
-            if (session.progress_callback)
-                session.progress_callback(mapped_percent, status.text.c_str(), session.progress_user_data);
+            deliver_progress(session, mapped_percent, status.text.c_str());
             post_slice_progress(mapped_percent, status.text);
         }
     });
@@ -400,8 +429,7 @@ static void emit_project_progress(OrcSession& session, int local_percent,
         static_cast<double>(clamped) * static_cast<double>(session.progress_span) / 100.0
     ));
     const char* safe_stage = stage ? stage : "";
-    if (session.progress_callback)
-        session.progress_callback(mapped_percent, safe_stage, session.progress_user_data);
+    deliver_progress(session, mapped_percent, safe_stage);
     post_slice_progress(mapped_percent, safe_stage);
 }
 
@@ -804,6 +832,38 @@ struct TempFileGuard {
     TempFileGuard(const TempFileGuard&) = delete;
     TempFileGuard& operator=(const TempFileGuard&) = delete;
 };
+
+// admesh classifies an STL as binary only when one of its first 128 bytes is
+// above 127. A binary STL with a zero header, zero normals and small positive
+// coordinates (a 10 mm box, for example) passes that test as ASCII and then
+// fails to parse. When the staged file has the exact binary layout
+// (84 + 50 * facet count bytes), mark the ignored header so admesh reads it as
+// binary, then load it.
+static bool load_staged_stl(const char* path, Slic3r::Model* model, const char* object_name) {
+    if (FILE* file = std::fopen(path, "r+b")) {
+        unsigned char head[128] = {};
+        const std::size_t read = std::fread(head, 1, sizeof(head), file);
+        std::fseek(file, 0, SEEK_END);
+        const long size = std::ftell(file);
+        if (read >= 84 && size >= 84) {
+            const std::uint32_t facets = static_cast<std::uint32_t>(head[80])
+                | static_cast<std::uint32_t>(head[81]) << 8
+                | static_cast<std::uint32_t>(head[82]) << 16
+                | static_cast<std::uint32_t>(head[83]) << 24;
+            const bool binary_layout =
+                static_cast<std::uint64_t>(size) == 84 + static_cast<std::uint64_t>(facets) * 50;
+            const bool looks_ascii = std::none_of(
+                head, head + read, [](unsigned char c) { return c > 127; });
+            if (binary_layout && looks_ascii) {
+                const unsigned char marker = 0xFF;
+                std::fseek(file, 0, SEEK_SET);
+                std::fwrite(&marker, 1, 1, file);
+            }
+        }
+        std::fclose(file);
+    }
+    return Slic3r::load_stl(path, model, object_name);
+}
 
 // Same rationale as TempFileGuard, for Model::remove_backup_path_if_exist()
 // (the lazily-created MEMFS "Auxiliaries"/backup scratch dir that
@@ -1753,7 +1813,7 @@ static bool build_project_export_mesh(
         }
 
         Slic3r::Model loaded;
-        if (!Slic3r::load_stl(path.c_str(), &loaded, "project-export")) {
+        if (!load_staged_stl(path.c_str(), &loaded, "project-export")) {
             error = "unable to load project export STL";
             return false;
         }
@@ -1899,7 +1959,7 @@ static onewasm_status_t build_project_plate_model(
         }
 
         const std::size_t first_object = model.objects.size();
-        if (!Slic3r::load_stl(path.c_str(), &model, object_input->id.c_str())) {
+        if (!load_staged_stl(path.c_str(), &model, object_input->id.c_str())) {
             error = "OrcaSlicer could not load project mesh " + mesh_input->id;
             return ONEWASM_ERR_INPUT_FORMAT;
         }
@@ -1973,7 +2033,7 @@ static onewasm_status_t build_project_plate_model(
         }
 
         Slic3r::Model modifier_model;
-        if (!Slic3r::load_stl(path.c_str(), &modifier_model, modifier.id.c_str())
+        if (!load_staged_stl(path.c_str(), &modifier_model, modifier.id.c_str())
             || modifier_model.objects.empty()) {
             error = "OrcaSlicer could not load project modifier mesh " + mesh_input->id;
             return ONEWASM_ERR_INPUT_FORMAT;
@@ -3930,7 +3990,7 @@ static onewasm_status_t legacy_slice_stl(
         throw_if_cancelled(operation);
         // ── load model ───────────────────────────────────────────────
         Slic3r::Model model;
-        const bool stl_ok = Slic3r::load_stl("/tmp/ow_in.stl", &model, "object");
+        const bool stl_ok = load_staged_stl("/tmp/ow_in.stl", &model, "object");
         std::remove("/tmp/ow_in.stl"); // MEMFS is RAM-backed; free it as soon as loaded
         if (!stl_ok) {
             record_error(*session, "STL load failed");
@@ -4101,7 +4161,7 @@ static onewasm_status_t legacy_prepare_plate(
                 record_error(*session, "failed to write complete STL data");
                 return -3;
             }
-            if (!Slic3r::load_stl(path.c_str(), &model, ("object_" + std::to_string(i)).c_str())) {
+            if (!load_staged_stl(path.c_str(), &model, ("object_" + std::to_string(i)).c_str())) {
                 record_error(*session, "STL load failed for file " + std::to_string(i));
                 return -4;
             }
@@ -4331,7 +4391,7 @@ static onewasm_status_t legacy_slice_stl_multi(
                 std::fclose(f);
             }
             const std::string name = "object_" + std::to_string(i);
-            const bool ok = Slic3r::load_stl(path.c_str(), &model, name.c_str());
+            const bool ok = load_staged_stl(path.c_str(), &model, name.c_str());
             std::remove(path.c_str());
             if (!ok) {
                 record_error(*session, "STL load failed for file " + std::to_string(i));
@@ -4698,7 +4758,7 @@ static onewasm_status_t legacy_write_3mf(
         }
 
         Slic3r::Model model;
-        const bool stl_ok = Slic3r::load_stl("/tmp/ow_3mf_in.stl", &model, "object");
+        const bool stl_ok = load_staged_stl("/tmp/ow_3mf_in.stl", &model, "object");
         if (!stl_ok) {
             record_error(*session, "STL load failed");
             return -4;
