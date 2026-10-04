@@ -833,30 +833,34 @@ struct TempFileGuard {
     TempFileGuard& operator=(const TempFileGuard&) = delete;
 };
 
-// admesh classifies an STL as binary only when one of its first 128 bytes is
-// above 127. A binary STL with a zero header, zero normals and small positive
-// coordinates (a 10 mm box, for example) passes that test as ASCII and then
-// fails to parse. When the staged file has the exact binary layout
-// (84 + 50 * facet count bytes), mark the ignored header so admesh reads it as
-// binary, then load it.
+// admesh classifies an STL as binary only when one of the 128 bytes after the
+// 84-byte header is above 127. Those bytes are facet data, so a binary STL
+// with zero normals and small positive coordinates (any box under 16 mm, for
+// example) passes that test as ASCII and then fails to parse. When the staged
+// file has the exact binary layout (84 + 50 * facet count bytes), set the high
+// bit of the first facet's attribute byte count, which admesh ignores, so it
+// is read as binary.
 static bool load_staged_stl(const char* path, Slic3r::Model* model, const char* object_name) {
+    constexpr long header_size = 84;
+    constexpr long facet_size = 50;
+    constexpr long attribute_high_byte = header_size + facet_size - 1;
     if (FILE* file = std::fopen(path, "r+b")) {
-        unsigned char head[128] = {};
+        unsigned char head[header_size + 128] = {};
         const std::size_t read = std::fread(head, 1, sizeof(head), file);
         std::fseek(file, 0, SEEK_END);
         const long size = std::ftell(file);
-        if (read >= 84 && size >= 84) {
+        if (read > static_cast<std::size_t>(attribute_high_byte) && size >= header_size + facet_size) {
             const std::uint32_t facets = static_cast<std::uint32_t>(head[80])
                 | static_cast<std::uint32_t>(head[81]) << 8
                 | static_cast<std::uint32_t>(head[82]) << 16
                 | static_cast<std::uint32_t>(head[83]) << 24;
-            const bool binary_layout =
-                static_cast<std::uint64_t>(size) == 84 + static_cast<std::uint64_t>(facets) * 50;
+            const bool binary_layout = static_cast<std::uint64_t>(size)
+                == header_size + static_cast<std::uint64_t>(facets) * facet_size;
             const bool looks_ascii = std::none_of(
-                head, head + read, [](unsigned char c) { return c > 127; });
+                head + header_size, head + read, [](unsigned char c) { return c > 127; });
             if (binary_layout && looks_ascii) {
-                const unsigned char marker = 0xFF;
-                std::fseek(file, 0, SEEK_SET);
+                const unsigned char marker = head[attribute_high_byte] | 0x80;
+                std::fseek(file, attribute_high_byte, SEEK_SET);
                 std::fwrite(&marker, 1, 1, file);
             }
         }
