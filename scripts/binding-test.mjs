@@ -8,7 +8,9 @@
  *   node scripts/binding-test.mjs [--wasm-dir artifacts]
  */
 
-import { loadEngineArtifact, sphereStl } from './lib/engine-harness.mjs'
+import { annotateFailuresOnGitHub, loadEngineArtifact, sphereStl } from './lib/engine-harness.mjs'
+
+annotateFailuresOnGitHub('[binding]')
 
 const wasmDirIndex = process.argv.indexOf('--wasm-dir')
 const wasmDir = wasmDirIndex >= 0 ? process.argv[wasmDirIndex + 1] : 'artifacts'

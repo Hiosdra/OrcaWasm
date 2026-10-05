@@ -30,7 +30,10 @@ import {
   initSession, applyProfileOnce,
   projectSetObjectsOnce, projectGetManifestOnce, projectPrepareOnce,
   projectSliceOnce, projectGetAssetOnce, projectExportOnce, checkedMalloc, free,
+  annotateFailuresOnGitHub,
 } from './lib/engine-harness.mjs'
+
+annotateFailuresOnGitHub('[smoke-test]')
 
 const VORON_PROFILE_FIXTURE = JSON.parse(
   readFileSync(new URL('./fixtures/voron-0.4-profile-smoke.json', import.meta.url), 'utf8'),
