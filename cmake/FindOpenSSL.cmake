@@ -1,7 +1,7 @@
 # FindOpenSSL.cmake — WASM stub.
-# OrcaSlicer uses OpenSSL::Crypto only for MD5 checksums of config files.
-# We provide stub headers + empty targets so the code compiles; the MD5
-# functions are no-ops in WASM (config validation is skipped).
+# OrcaSlicer uses OpenSSL::Crypto only for MD5 checksums (config files and the
+# Metadata/plate_N.gcode.md5 entries of sliced 3MF projects). We provide a
+# header-only MD5 implementation + empty targets, so no OpenSSL is linked.
 set(_SSL_STUB_DIR "${CMAKE_CURRENT_LIST_DIR}/../wasm/shims-common")
 
 if(NOT TARGET OpenSSL::Crypto)
