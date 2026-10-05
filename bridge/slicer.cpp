@@ -1394,6 +1394,35 @@ static bool native_printable_area_bounds(
     return max.x() > min.x() && max.y() > min.y();
 }
 
+// Desktop Orca stores every plate in one scene where plate i sits at
+// PartPlateList::compute_shape_position(i, cols): a grid of plates spaced by
+// the bed size plus a 1/5 gap, rows extending towards -Y. The manifest places
+// instances on their own plate's bed (zero_plate_origin), so native import
+// removes this offset and native multi-plate export restores it.
+static bool native_plate_origin(
+    const Slic3r::DynamicPrintConfig& config,
+    std::size_t plate_count,
+    int plate_index,
+    Slic3r::Vec2d& origin
+) {
+    Slic3r::Vec2d bed_min, bed_max;
+    std::size_t bed_points = 0;
+    if (plate_count <= 1 || plate_index < 0
+        || !native_printable_area_bounds(config, bed_min, bed_max, bed_points))
+        return false;
+    const int plate_width = static_cast<int>((bed_max - bed_min).x());
+    const int plate_depth = static_cast<int>((bed_max - bed_min).y());
+    const float root = std::sqrt(static_cast<float>(plate_count));
+    const int cols = static_cast<int>(root > std::round(root) ? std::round(root) + 1 : std::round(root));
+    constexpr double plate_gap = 1. / 5.;
+    const int row = plate_index / cols;
+    const int col = plate_index % cols;
+    origin = Slic3r::Vec2d(
+        col * plate_width * (1. + plate_gap),
+        -row * plate_depth * (1. + plate_gap));
+    return true;
+}
+
 static bool append_native_model_project(
     OrcSession& session,
     Slic3r::Model& model,
@@ -1492,30 +1521,12 @@ static bool append_native_model_project(
         });
     }
 
-    // Desktop Orca stores every instance in one scene where plate i sits at
-    // PartPlateList::compute_shape_position(i, cols): a grid of plates spaced
-    // by the bed size plus a 1/5 gap, rows extending towards -Y. The manifest
-    // places instances on their own plate's bed, which is also how the slicer
-    // sees them (zero_plate_origin), so remove that scene offset here.
+    // Remove the desktop scene offset of each plate (see native_plate_origin).
     std::map<std::string, Slic3r::Vec2d> plate_origins;
-    Slic3r::Vec2d bed_min, bed_max;
-    std::size_t bed_points = 0;
-    if (plate_data_list.size() > 1
-        && native_printable_area_bounds(session.config, bed_min, bed_max, bed_points)) {
-        const int plate_width = static_cast<int>((bed_max - bed_min).x());
-        const int plate_depth = static_cast<int>((bed_max - bed_min).y());
-        const float root = std::sqrt(static_cast<float>(plate_data_list.size()));
-        const int cols = static_cast<int>(root > std::round(root) ? std::round(root) + 1 : std::round(root));
-        constexpr double plate_gap = 1. / 5.;
-        for (const auto& [plate_id, plate] : plates) {
-            if (!plate || plate->plate_index < 0)
-                continue;
-            const int row = plate->plate_index / cols;
-            const int col = plate->plate_index % cols;
-            plate_origins[plate_id] = Slic3r::Vec2d(
-                col * plate_width * (1. + plate_gap),
-                -row * plate_depth * (1. + plate_gap));
-        }
+    for (const auto& [plate_id, plate] : plates) {
+        Slic3r::Vec2d origin;
+        if (plate && native_plate_origin(session.config, plate_data_list.size(), plate->plate_index, origin))
+            plate_origins[plate_id] = origin;
     }
 
     auto project_matrix = [&plate_origins](const Slic3r::ModelInstance& instance, const std::string& plate_id) {
@@ -3197,8 +3208,8 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
-  "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"unsupported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
+  "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
@@ -3708,7 +3719,9 @@ static onewasm_status_t legacy_write_model_3mf(
     OrcSession& session,
     Slic3r::Model& model,
     uint8_t** out_3mf,
-    uint32_t* out_len
+    uint32_t* out_len,
+    const Slic3r::PlateDataPtrs* plate_data_list = nullptr,
+    Slic3r::DynamicPrintConfig* config = nullptr
 ) {
     if (out_3mf) *out_3mf = nullptr;
     if (out_len) *out_len = 0;
@@ -3723,9 +3736,13 @@ static onewasm_status_t legacy_write_model_3mf(
         Slic3r::StoreParams store_params;
         store_params.path = path.c_str();
         store_params.model = &model;
-        store_params.config = &session.config;
+        store_params.config = config ? config : &session.config;
+        if (plate_data_list) {
+            store_params.plate_data_list = *plate_data_list;
+            store_params.strategy = Slic3r::SaveStrategy::Zip64 | Slic3r::SaveStrategy::WithGcode;
+        }
         if (!Slic3r::store_bbs_3mf(store_params)) {
-            record_error(session, "OrcaSlicer native modifier project export failed");
+            record_error(session, "OrcaSlicer native project export failed");
             return ONEWASM_ERR_OUTPUT;
         }
 
@@ -3792,6 +3809,87 @@ static bool prepare_native_modifier_model_for_export(
     return true;
 }
 
+// Writes every manifest plate as a native Orca plate and embeds the current
+// G-code of each sliced plate the way desktop Orca saves a sliced project:
+// Metadata/plate_N.gcode, its .md5, the plate's gcode_file reference and its
+// slice_info entry. Plates keep their identity instead of being flattened.
+static onewasm_status_t legacy_write_sliced_project_3mf(
+    OrcSession& session,
+    const ProjectManifestInput& manifest,
+    const std::map<std::string, std::string>& gcode_by_plate,
+    uint8_t** out_3mf,
+    uint32_t* out_len,
+    std::string& error
+) {
+    // The plate and slice-info writers read printer options that a sparse
+    // session configuration may omit, so write a complete configuration. The
+    // plate scene offsets use the same printable area that import will read.
+    Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
+    config.apply(session.config, true);
+
+    Slic3r::Model model;
+    std::vector<std::unique_ptr<Slic3r::PlateData>> plates;
+    std::vector<std::unique_ptr<TempFileGuard>> gcode_guards;
+    Slic3r::PlateDataPtrs plate_data_list;
+    for (std::size_t plate_index = 0; plate_index < manifest.plate_ids.size(); ++plate_index) {
+        const std::string& plate_id = manifest.plate_ids[plate_index];
+        const std::size_t first_object = model.objects.size();
+        if (project_plate_has_instances(manifest, plate_id)) {
+            const auto status = build_project_plate_model(session, manifest, plate_id, model, error);
+            if (status != ONEWASM_OK)
+                return status;
+        }
+
+        Slic3r::Vec2d origin;
+        const bool shifted = native_plate_origin(
+            config, manifest.plate_ids.size(), static_cast<int>(plate_index), origin);
+        std::set<std::pair<int, int>> members;
+        for (std::size_t object_index = first_object; object_index < model.objects.size(); ++object_index) {
+            auto* object = model.objects[object_index];
+            if (!object)
+                continue;
+            for (std::size_t instance_index = 0; instance_index < object->instances.size(); ++instance_index) {
+                auto* instance = object->instances[instance_index];
+                if (!instance)
+                    continue;
+                if (shifted)
+                    instance->set_offset(instance->get_offset() + Slic3r::Vec3d(origin.x(), origin.y(), 0.0));
+                members.emplace(static_cast<int>(object_index), static_cast<int>(instance_index));
+            }
+        }
+        auto plate = std::make_unique<Slic3r::PlateData>(static_cast<int>(plate_index), members, false);
+
+        const auto gcode = gcode_by_plate.find(plate_id);
+        if (gcode != gcode_by_plate.end()) {
+            const std::string path = "/tmp/ow-project-gcode-" + std::to_string(session.id)
+                + "-" + std::to_string(plate_index) + ".gcode";
+            gcode_guards.push_back(std::make_unique<TempFileGuard>(path));
+            FILE* file = std::fopen(path.c_str(), "wb");
+            if (!file) {
+                error = "unable to stage plate G-code for project export";
+                return ONEWASM_ERR_INPUT_IO;
+            }
+            const std::size_t written = std::fwrite(gcode->second.data(), 1, gcode->second.size(), file);
+            std::fclose(file);
+            if (written != gcode->second.size()) {
+                error = "unable to stage complete plate G-code for project export";
+                return ONEWASM_ERR_INPUT_IO;
+            }
+            plate->gcode_file = path;
+            plate->is_sliced_valid = true;
+        }
+        plate_data_list.push_back(plate.get());
+        plates.push_back(std::move(plate));
+    }
+    if (model.objects.empty()) {
+        error = "project contains no objects to export";
+        return ONEWASM_ERR_EMPTY_INPUT;
+    }
+    if (!manifest.modifier_volumes.empty() && !prepare_native_modifier_model_for_export(model, error))
+        return ONEWASM_ERR_VALIDATION;
+    return legacy_write_model_3mf(session, model, out_3mf, out_len, &plate_data_list, &config);
+}
+
 EMSCRIPTEN_KEEPALIVE
 onewasm_status_t onewasm_project_export(
     onewasm_session_t session_ptr,
@@ -3815,6 +3913,16 @@ onewasm_status_t onewasm_project_export(
         record_error(*session, "project export format and output pointers must not be empty");
         return ONEWASM_ERR_INVALID_ARGUMENT;
     }
+    // Export publishes only its package, but it may embed the current slice
+    // G-code, so take those assets before the previous outputs are cleared.
+    std::map<std::string, std::string> gcode_by_plate;
+    {
+        std::lock_guard<std::mutex> lock(session->control_mutex);
+        for (auto& [asset_id, bytes] : session->project_assets) {
+            if (asset_id.rfind("gcode:", 0) == 0)
+                gcode_by_plate.emplace(asset_id.substr(6), std::move(bytes));
+        }
+    }
     clear_project_outputs(*session);
     const std::string format(format_utf8, format_utf8 + format_len);
     if (format != "project.3mf") {
@@ -3828,9 +3936,9 @@ onewasm_status_t onewasm_project_export(
         record_error(*session, error);
         return ONEWASM_ERR_VALIDATION;
     }
-    if (options.include_slice_artifacts) {
-        record_error(*session, "OrcaWasm project export does not yet write slice artifacts into native 3MF");
-        return ONEWASM_ERR_UNSUPPORTED;
+    if (options.include_slice_artifacts && gcode_by_plate.empty()) {
+        record_error(*session, "includeSliceArtifacts requires a current slice result with G-code");
+        return ONEWASM_ERR_NO_DATA;
     }
 
     ProjectOutputFailureGuard output_guard{*session};
@@ -3838,8 +3946,11 @@ onewasm_status_t onewasm_project_export(
     nlohmann::json omitted_opaque_entries = nlohmann::json::array();
     std::string package;
     try {
+        // Slice artifacts are written with regenerated plate data, so an
+        // imported package cannot be passed through unchanged.
         const bool can_passthrough = !session->native_project_blob.empty()
             && !session->native_project_dirty
+            && !options.include_slice_artifacts
             && options.preservation != "portable";
         if (can_passthrough) {
             package.assign(
@@ -3859,7 +3970,7 @@ onewasm_status_t onewasm_project_export(
                 // presets, painting data, and custom per-layer data are not
                 // retained by this adapter and must be reported as opaque
                 // omissions under the optional preservation policy.
-                const std::set<std::string> regenerated_entries{
+                std::set<std::string> regenerated_entries{
                     "[Content_Types].xml",
                     "_rels/.rels",
                     "3D/3dmodel.model",
@@ -3868,6 +3979,18 @@ onewasm_status_t onewasm_project_export(
                     "Metadata/model_settings.config",
                     "Metadata/slice_info.config",
                 };
+                if (options.include_slice_artifacts) {
+                    const auto& plates = session->project_manifest["plates"];
+                    for (std::size_t plate_index = 0; plate_index < plates.size(); ++plate_index) {
+                        if (!plates[plate_index].contains("id")
+                            || gcode_by_plate.count(plates[plate_index]["id"].get<std::string>()) == 0)
+                            continue;
+                        const std::string gcode_entry = "Metadata/plate_"
+                            + std::to_string(plate_index + 1) + ".gcode";
+                        regenerated_entries.insert(gcode_entry);
+                        regenerated_entries.insert(gcode_entry + ".md5");
+                    }
+                }
                 for (const std::string& entry : source_entries) {
                     if (regenerated_entries.find(entry) != regenerated_entries.end())
                         continue;
@@ -3902,7 +4025,15 @@ onewasm_status_t onewasm_project_export(
                 record_error(*session, error);
                 return ONEWASM_ERR_VALIDATION;
             }
-            if (manifest.plate_ids.size() > 1) {
+            if (options.include_slice_artifacts) {
+                for (const auto& plate_id : manifest.plate_ids) {
+                    if (gcode_by_plate.count(plate_id) == 0 && project_plate_has_instances(manifest, plate_id))
+                        warnings.push_back({
+                            {"code", "slice-artifact-missing"},
+                            {"message", "project plate has no current G-code to embed: " + plate_id},
+                        });
+                }
+            } else if (manifest.plate_ids.size() > 1) {
                 if (options.preservation == "require") {
                     record_error(*session, "OrcaWasm portable project export cannot preserve multiple logical plates");
                     return ONEWASM_ERR_UNSUPPORTED;
@@ -3915,14 +4046,22 @@ onewasm_status_t onewasm_project_export(
             if (options.preservation == "portable") {
                 warnings.push_back({
                     {"code", "portable-export"},
-                    {"message", "export contains geometry and current OrcaSlicer configuration only"},
+                    {"message", options.include_slice_artifacts
+                        ? "export contains geometry, current OrcaSlicer configuration and current slice G-code only"
+                        : "export contains geometry and current OrcaSlicer configuration only"},
                 });
             }
 
             uint8_t* exported_data = nullptr;
             uint32_t exported_len = 0;
             onewasm_status_t export_status = ONEWASM_OK;
-            if (!manifest.modifier_volumes.empty()) {
+            if (options.include_slice_artifacts) {
+                export_status = legacy_write_sliced_project_3mf(
+                    *session, manifest, gcode_by_plate, &exported_data, &exported_len, error
+                );
+                if (export_status != ONEWASM_OK && !error.empty())
+                    record_error(*session, error);
+            } else if (!manifest.modifier_volumes.empty()) {
                 Slic3r::Model native_model;
                 for (const auto& plate_id : manifest.plate_ids) {
                     export_status = build_project_plate_model(
