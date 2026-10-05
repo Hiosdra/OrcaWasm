@@ -88,6 +88,8 @@ target_link_options(slicer PRIVATE
   -sFORCE_FILESYSTEM=1
   # Every C binding symbol of one-wasm-slicer-api 0.6.0, consumed by the
   # embedded glue; onewasm_three_mf_to_stl is optional format.threeMfToStl.
+  # orcawasm_async_* are private: engine-binding.js runs project operations
+  # on a pthread with them so a host abort can cancel a running operation.
   "-sEXPORTED_FUNCTIONS=[\
 '_onewasm_session_create',\
 '_onewasm_session_destroy',\
@@ -108,6 +110,8 @@ target_link_options(slicer PRIVATE
 '_onewasm_three_mf_to_stl',\
 '_onewasm_free',\
 '_onewasm_last_error',\
+'_orcawasm_async_start',\
+'_orcawasm_async_poll',\
 '_malloc',\
 '_free'\
 ]"

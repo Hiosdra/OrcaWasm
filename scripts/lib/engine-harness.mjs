@@ -13,6 +13,23 @@ import { createRequire } from 'node:module'
 
 // ── synthetic meshes ─────────────────────────────────────────────────────────
 
+/**
+ * On GitHub Actions, repeat test failure details as error annotations so
+ * they are visible without access to the raw job log. Only indented
+ * failure details and lines with the given prefix are annotated.
+ */
+export function annotateFailuresOnGitHub(prefix) {
+  if (!process.env.GITHUB_ACTIONS) return
+  const error = console.error.bind(console)
+  console.error = (...args) => {
+    error(...args)
+    const text = args.map((arg) => (arg instanceof Error ? arg.stack ?? arg.message : String(arg))).join(' ')
+    if (!text.startsWith('  ') && !text.trimStart().startsWith(prefix)) return
+    const escaped = text.trim().replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')
+    error(`::error title=${prefix}::${escaped}`)
+  }
+}
+
 export function icosphere(subdivisions) {
   const t = (1 + Math.sqrt(5)) / 2
   let verts = [

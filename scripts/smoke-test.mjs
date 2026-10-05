@@ -23,12 +23,17 @@
  */
 
 import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { inflateRawSync } from 'node:zlib'
 import {
   sphereStl, trianglesToStl, loadModule, writeBytes, decodeError,
   initSession, applyProfileOnce,
   projectSetObjectsOnce, projectGetManifestOnce, projectPrepareOnce,
   projectSliceOnce, projectGetAssetOnce, projectExportOnce, checkedMalloc, free,
+  annotateFailuresOnGitHub,
 } from './lib/engine-harness.mjs'
+
+annotateFailuresOnGitHub('[smoke-test]')
 
 const VORON_PROFILE_FIXTURE = JSON.parse(
   readFileSync(new URL('./fixtures/voron-0.4-profile-smoke.json', import.meta.url), 'utf8'),
@@ -104,10 +109,7 @@ function getCapabilitiesOnce(module) {
           throw new Error(`capabilities document has no valid optional status for ${feature}`)
         }
       }
-      const optionalFeaturesExercisedByThisEngine = optionalFeatures.filter(
-        (feature) => feature !== 'project.export.sliceArtifacts',
-      )
-      for (const feature of optionalFeaturesExercisedByThisEngine) {
+      for (const feature of optionalFeatures) {
         if (capabilities.features[feature] !== 'supported') {
           throw new Error(`this engine smoke suite requires its advertised optional feature ${feature}`)
         }
@@ -352,6 +354,49 @@ function listZipEntryNames(bytes) {
     pos = nameStart + nameLen + extraLen + commentLen
   }
   return names
+}
+
+// Reads one stored or deflated ZIP entry through the central directory, so
+// entries written with data descriptors (sizes after the data) work too.
+function readZipEntry(bytes, wanted) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const eocd = findEndOfCentralDirectory(bytes)
+  if (eocd < 0) throw new Error('no End Of Central Directory record found')
+  const totalEntries = dv.getUint16(eocd + 10, true)
+  let pos = dv.getUint32(eocd + 16, true)
+  for (let i = 0; i < totalEntries; i++) {
+    if (dv.getUint32(pos, true) !== 0x02014b50) throw new Error(`bad central directory entry signature at offset ${pos}`)
+    const method = dv.getUint16(pos + 10, true)
+    let compressedSize = dv.getUint32(pos + 20, true)
+    const nameLen = dv.getUint16(pos + 28, true)
+    const extraLen = dv.getUint16(pos + 30, true)
+    const commentLen = dv.getUint16(pos + 32, true)
+    let localOffset = dv.getUint32(pos + 42, true)
+    const name = new TextDecoder('utf-8').decode(bytes.subarray(pos + 46, pos + 46 + nameLen))
+    if (name === wanted) {
+      // Zip64 entries keep 0xFFFFFFFF here and the real values in extra field 0x0001.
+      let extra = pos + 46 + nameLen
+      const extraEnd = extra + extraLen
+      while (extra + 4 <= extraEnd) {
+        const id = dv.getUint16(extra, true)
+        const size = dv.getUint16(extra + 2, true)
+        if (id === 0x0001) {
+          let field = extra + 4
+          if (dv.getUint32(pos + 24, true) === 0xffffffff) field += 8
+          if (compressedSize === 0xffffffff) { compressedSize = Number(dv.getBigUint64(field, true)); field += 8 }
+          if (localOffset === 0xffffffff) localOffset = Number(dv.getBigUint64(field, true))
+        }
+        extra += 4 + size
+      }
+      const dataStart = localOffset + 30 + dv.getUint16(localOffset + 26, true) + dv.getUint16(localOffset + 28, true)
+      const data = bytes.subarray(dataStart, dataStart + compressedSize)
+      if (method === 0) return new Uint8Array(data)
+      if (method === 8) return new Uint8Array(inflateRawSync(data))
+      throw new Error(`${wanted}: unsupported ZIP compression method ${method}`)
+    }
+    pos += 46 + nameLen + extraLen + commentLen
+  }
+  return null
 }
 
 // A .3mf is a ZIP; verify that project_export returns a native package with
@@ -999,6 +1044,82 @@ function runProjectSmoke(module, session, meshBytes) {
   return exported
 }
 
+// project.export.sliceArtifacts: the current G-code of every sliced plate is
+// embedded the way desktop Orca saves a sliced project, plates stay separate
+// native plates, and the package re-imports with the original placement.
+function runSliceArtifactExportSmoke(module, session, meshBytes) {
+  const project = makeProjectFixture(meshBytes)
+  projectSetObjectsOnce(module, session, project.blob, project.manifest)
+  const exportOptions = { schemaVersion: '0.6.0', preservation: 'best-effort', includeSliceArtifacts: true }
+  assertExpectedFailure(
+    'slice artifact export without a slice',
+    () => projectExportOnce(module, session, 'project.3mf', exportOptions),
+    /failed \(-12\).*requires a current slice result/,
+  )
+
+  const sliced = projectSliceOnce(module, session, {
+    schemaVersion: '0.6.0',
+    plateSelection: 'all',
+    includeGcode: true,
+    includeStatistics: true,
+  })
+  assertProjectSlice(module, session, sliced, ['plate-0', 'plate-1'], 'slice artifact source slice')
+  const gcodes = sliced.plateResults.map((plate) => projectGetAssetOnce(module, session, plate.assets[0].id))
+
+  const result = projectExportOnce(module, session, 'project.3mf', exportOptions)
+  if (result?.schemaVersion !== '0.6.0' || result.asset?.id !== 'project:export') {
+    throw new Error('slice artifact export returned an unexpected result descriptor')
+  }
+  if (result.warnings.some((warning) => warning.code === 'logical-plates-flattened' || warning.code === 'slice-artifact-missing')) {
+    throw new Error('slice artifact export flattened plates or missed a sliced plate: ' + JSON.stringify(result.warnings))
+  }
+  const bytes = projectGetAssetOnce(module, session, 'project:export')
+  if (bytes.length !== result.asset.byteLength) throw new Error('slice artifact export byte length mismatch')
+  assertValid3mf(bytes, 'slice artifact export')
+
+  gcodes.forEach((gcode, index) => {
+    const entry = `Metadata/plate_${index + 1}.gcode`
+    const embedded = readZipEntry(bytes, entry)
+    if (!embedded || embedded.length !== gcode.length || !embedded.every((value, offset) => value === gcode[offset])) {
+      throw new Error(`slice artifact export did not embed the current G-code as ${entry}`)
+    }
+    const md5 = readZipEntry(bytes, entry + '.md5')
+    const expectedMd5 = createHash('md5').update(gcode).digest('hex').toUpperCase()
+    if (!md5 || new TextDecoder().decode(md5) !== expectedMd5) {
+      throw new Error(`slice artifact export wrote no matching ${entry}.md5`)
+    }
+  })
+  const modelSettings = new TextDecoder().decode(readZipEntry(bytes, 'Metadata/model_settings.config') ?? new Uint8Array())
+  const sliceInfo = new TextDecoder().decode(readZipEntry(bytes, 'Metadata/slice_info.config') ?? new Uint8Array())
+  for (const index of [1, 2]) {
+    if (!modelSettings.includes(`value="Metadata/plate_${index}.gcode"`)) {
+      throw new Error(`slice artifact export does not reference plate ${index} G-code from model_settings.config`)
+    }
+    if (!new RegExp(`key="index" value="${index}"`).test(sliceInfo)) {
+      throw new Error(`slice artifact export has no slice_info.config entry for plate ${index}`)
+    }
+  }
+  if (projectGetAssetOnce(module, session, 'project:export').length !== bytes.length) {
+    throw new Error('slice artifact export package is not retained')
+  }
+
+  initProfileOnce(module, session, bytes)
+  const imported = projectGetManifestOnce(module, session)
+  if (imported.plates?.length !== 2 || imported.instances?.length !== 2) {
+    throw new Error('slice artifact export did not re-import as two native plates with one instance each')
+  }
+  // Both fixture instances sit at the same spot on their own bed, so after the
+  // desktop plate offset is removed again their placements must match.
+  const [first, second] = imported.plates.map((plate) =>
+    imported.instances.find((entry) => entry.plateId === plate.id)?.transform?.matrix)
+  if (!first || !second
+    || Math.abs(first[3] - second[3]) > 0.01 || Math.abs(first[7] - second[7]) > 0.01) {
+    throw new Error('slice artifact export did not keep each instance on its own plate bed: '
+      + JSON.stringify([first, second]))
+  }
+  return gcodes.length
+}
+
 // A deliberately asymmetric triangular prism keeps transform regressions
 // cheap while making each axis observable in the real sliced toolpaths. Its
 // base is offset from the origin and its unequal dimensions expose axis swaps.
@@ -1560,6 +1681,18 @@ async function main() {
           throw new Error('preservation=require export changed the untouched native project package')
         }
         console.log(`PASS (${loadedManifest.instances.length} native instance(s))`)
+      } catch (err) {
+        stableFailures++
+        console.log('FAIL')
+        console.error(`  ${err.message}`)
+      }
+
+      const stableArtifactLabel = `[${mesh.label}] API 0.6.0 native project export with slice artifacts`
+      process.stdout.write(`[smoke-test] ${stableArtifactLabel} ... `)
+      try {
+        initSession(module, stableSession, JSON.stringify(BASE_CONFIG))
+        const plates = runSliceArtifactExportSmoke(module, stableSession, mesh.bytes)
+        console.log(`PASS (${plates} plate G-code file(s), re-imported)`)
       } catch (err) {
         stableFailures++
         console.log('FAIL')

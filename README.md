@@ -105,9 +105,20 @@ The host must reject this engine if a required feature is absent or not
 All other features are optional and are selected from `onewasm_get_capabilities`
 at runtime. This build reports profile initialization/application, modifier
 volumes and native modifier preservation, prepare/arrange, multi-plate slicing,
-project export and preservation, OBJ/STEP/3MF conversion, and cancellation
-as supported. `project.export.sliceArtifacts` is explicitly unsupported; callers
-must not infer optional support from an exported C symbol.
+project export with slice artifacts and preservation, OBJ/STEP/3MF
+conversion, and cancellation as supported. Every API feature is therefore
+`supported`; callers still select optional features from the capability
+document and must not infer support from an exported C symbol.
+
+Cancellation also covers running operations in the TypeScript binding. The
+reference glue calls the synchronous C ABI on the runtime's JS thread, where a
+host abort could only take effect before an operation starts. The artifact's
+`engine-binding.js` therefore runs `slice`, `prepare` and `export` on a pthread
+through the private `orcawasm_async_start`/`orcawasm_async_poll` exports: the
+JS thread stays responsive, delivers progress, and calls `onewasm_cancel` when
+the signal aborts. The operation then rejects with `CANCELLED` and the session
+remains usable. C callers keep the synchronous ABI and call `onewasm_cancel`
+from another thread. `scripts/binding-test.mjs` checks this in CI.
 
 Every payload (project manifest, prepare/slice/export requests and results,
 slice statistics) uses `schemaVersion: "0.6.0"`, the API version, including
@@ -118,8 +129,17 @@ The bridge implements native Orca arrange and auto-orient, sequential
 selected/all-plate slicing, per-plate result assets/statistics, native project
 loading, and project export subject to its advertised preservation policies.
 Native project modifier round-tripping covers support enforcers and blockers;
-unrepresentable native volume types fail explicitly. G-code slice artifacts in
-native 3MF are unsupported.
+unrepresentable native volume types fail explicitly.
+
+`includeSliceArtifacts: true` embeds the current G-code of each sliced plate
+the way desktop Orca saves a sliced project (`Metadata/plate_N.gcode`, its
+`.md5`, the plate's `gcode_file` reference and its `slice_info.config` entry).
+The package keeps every manifest plate as a native plate, placed in Orca's
+plate grid, and writes the complete configuration. Without a current G-code
+result the export fails with `NO_DATA`; a plate with objects but no current
+G-code (after a selected-plate slice) is reported as `slice-artifact-missing`.
+An imported project is regenerated rather than passed through, so its opaque
+entries follow the requested preservation policy.
 
 The canonical contract and schemas live in the private
 [`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
