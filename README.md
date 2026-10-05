@@ -110,6 +110,16 @@ conversion, and cancellation as supported. Every API feature is therefore
 `supported`; callers still select optional features from the capability
 document and must not infer support from an exported C symbol.
 
+Cancellation also covers running operations in the TypeScript binding. The
+reference glue calls the synchronous C ABI on the runtime's JS thread, where a
+host abort could only take effect before an operation starts. The artifact's
+`engine-binding.js` therefore runs `slice`, `prepare` and `export` on a pthread
+through the private `orcawasm_async_start`/`orcawasm_async_poll` exports: the
+JS thread stays responsive, delivers progress, and calls `onewasm_cancel` when
+the signal aborts. The operation then rejects with `CANCELLED` and the session
+remains usable. C callers keep the synchronous ABI and call `onewasm_cancel`
+from another thread. `scripts/binding-test.mjs` checks this in CI.
+
 Every payload (project manifest, prepare/slice/export requests and results,
 slice statistics) uses `schemaVersion: "0.6.0"`, the API version, including
 ordinary projects with an empty `modifierVolumes` array. The bridge rejects

@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <pthread.h>
 #include <cmath>
 #include <cctype>
 #include <cstdio>
@@ -4150,6 +4151,125 @@ onewasm_status_t onewasm_project_export(
         record_error(*session, std::string{"OrcaSlicer project export failed: "} + exception.what());
         return ONEWASM_ERR_INTERNAL;
     }
+}
+
+// ── asynchronous project operations (OrcaWasm TypeScript binding only) ──────
+//
+// The C ABI is synchronous, so a project operation called from the runtime's
+// JS thread blocks it until the operation returns, and a host abort signal can
+// never reach onewasm_cancel while it runs. These private entry points run one
+// project operation on a pthread instead: the JS thread returns to its event
+// loop, keeps servicing proxied work (progress callbacks, file system calls),
+// polls for completion and calls onewasm_cancel when the host aborts. They are
+// not part of one-wasm-slicer-api; wasm/onewasm/engine-binding.js uses them.
+
+enum OrcAsyncKind : int {
+    ORC_ASYNC_SLICE = 0,
+    ORC_ASYNC_PREPARE = 1,
+    ORC_ASYNC_EXPORT = 2,
+};
+
+struct OrcAsyncOperation {
+    int kind = ORC_ASYNC_SLICE;
+    onewasm_session_t session = nullptr;
+    std::string first;
+    std::string second;
+    onewasm_status_t status = ONEWASM_ERR_INTERNAL;
+    uint8_t* out = nullptr;
+    uint32_t out_len = 0;
+    std::atomic<int> done{0};
+};
+
+static void* run_async_operation(void* arg) {
+    auto* operation = static_cast<OrcAsyncOperation*>(arg);
+    const auto* first = reinterpret_cast<const uint8_t*>(operation->first.data());
+    const auto first_len = static_cast<uint32_t>(operation->first.size());
+    if (operation->kind == ORC_ASYNC_SLICE) {
+        operation->status = onewasm_project_slice(
+            operation->session, first, first_len, &operation->out, &operation->out_len);
+    } else if (operation->kind == ORC_ASYNC_PREPARE) {
+        operation->status = onewasm_project_prepare(
+            operation->session, first, first_len, &operation->out, &operation->out_len);
+    } else {
+        operation->status = onewasm_project_export(
+            operation->session,
+            operation->first.data(),
+            first_len,
+            reinterpret_cast<const uint8_t*>(operation->second.data()),
+            static_cast<uint32_t>(operation->second.size()),
+            &operation->out,
+            &operation->out_len);
+    }
+    operation->done.store(1, std::memory_order_release);
+    return nullptr;
+}
+
+/**
+ * Start a project operation on its own pthread. Inputs are copied before this
+ * returns. Returns an operation handle, or 0 when no thread could be started
+ * (the caller then runs the synchronous C entry point).
+ */
+EMSCRIPTEN_KEEPALIVE
+void* orcawasm_async_start(
+    int kind,
+    onewasm_session_t session,
+    const uint8_t* first,
+    uint32_t first_len,
+    const uint8_t* second,
+    uint32_t second_len
+) {
+    if (!session || kind < ORC_ASYNC_SLICE || kind > ORC_ASYNC_EXPORT)
+        return nullptr;
+    OrcAsyncOperation* operation = nullptr;
+    try {
+        operation = new OrcAsyncOperation();
+        operation->kind = kind;
+        operation->session = session;
+        if (first && first_len)
+            operation->first.assign(reinterpret_cast<const char*>(first), first_len);
+        if (second && second_len)
+            operation->second.assign(reinterpret_cast<const char*>(second), second_len);
+    } catch (const std::bad_alloc&) {
+        delete operation;
+        return nullptr;
+    }
+
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    // Same stack as the runtime thread (-sSTACK_SIZE) that ran these calls before.
+    pthread_attr_setstacksize(&attributes, 16 * 1024 * 1024);
+    pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    const int created = pthread_create(&thread, &attributes, run_async_operation, operation);
+    pthread_attr_destroy(&attributes);
+    if (created != 0) {
+        delete operation;
+        return nullptr;
+    }
+    return operation;
+}
+
+/**
+ * Return 0 while the operation runs. Once it has finished, store its status
+ * and owned output (release with onewasm_free), release the handle and
+ * return 1.
+ */
+EMSCRIPTEN_KEEPALIVE
+int orcawasm_async_poll(
+    void* handle,
+    onewasm_status_t* out_status,
+    uint8_t** out_data,
+    uint32_t* out_len
+) {
+    auto* operation = static_cast<OrcAsyncOperation*>(handle);
+    if (!operation || !operation->done.load(std::memory_order_acquire))
+        return 0;
+    if (out_status) *out_status = operation->status;
+    if (out_data) *out_data = operation->out;
+    else std::free(operation->out);
+    if (out_len) *out_len = operation->out_len;
+    delete operation;
+    return 1;
 }
 
 /**

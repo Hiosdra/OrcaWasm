@@ -777,6 +777,11 @@ jobs:
       - name: one-wasm-slicer-api conformance
         run: node scripts/conformance.mjs --wasm-dir artifacts
 
+      # OrcaWasm binding behaviour beyond the shared suite: running project
+      # operations stay off the JS thread and a host abort cancels them.
+      - name: TypeScript binding cancellation
+        run: node scripts/binding-test.mjs --wasm-dir artifacts
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
