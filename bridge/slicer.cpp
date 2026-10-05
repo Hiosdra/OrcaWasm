@@ -10,15 +10,15 @@
  *   onewasm_project_prepare/slice/get_asset(session, request)
  *   onewasm_project_export(session, native format, options)
  *   onewasm_obj_to_stl / onewasm_cad_to_stl(input, output)
- *   onewasm_read_3mf(input, output)                                → engine-specific geometry helper
+ *   onewasm_three_mf_to_stl(input, output)                                → optional format.threeMfToStl
  *   onewasm_get_capabilities(outJson, outLen)
  *   onewasm_free(ptr)
  *   onewasm_last_error(session)                                   → null-terminated UTF-8 string
  *
- * onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_read_3mf are pure format conversions
+ * onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_three_mf_to_stl are pure format conversions
  * — they never touch slicer config state, so they take no session handle.
  *
- * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.5.1:
+ * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.6.0:
  *   -1  invalid / uninitialized state (includes a null/invalid session handle)
  *   -2  JSON parse failure
  *   -3  STL write to MEMFS failed
@@ -31,7 +31,7 @@
  *   -11 active operation was cancelled
  *   -12 no optional result is available
  *
- * onewasm_read_3mf reuses the same -1/-3/-4/-5/-8/-9 meanings (input write /
+ * onewasm_three_mf_to_stl reuses the same -1/-3/-4/-5/-8/-9 meanings (input write /
  * 3MF load / no geometry / STL export / exception), decoded via
  * onewasm_last_error(0) like onewasm_obj_to_stl / onewasm_cad_to_stl.
  */
@@ -62,6 +62,8 @@
 #include <sys/stat.h>
 
 #include <emscripten.h>
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
 
 // OrcaSlicer core
 // (note: an earlier attempt to cap oneTBB via tbb::global_control lived here;
@@ -212,7 +214,7 @@ struct ProjectModifierVolumeInput {
 };
 
 struct ProjectManifestInput {
-    std::string schema_version = "0.5";
+    std::string schema_version = ONEWASM_API_VERSION_STRING;
     std::vector<std::string> plate_ids;
     std::vector<ProjectMeshInput> meshes;
     std::vector<ProjectObjectInput> objects;
@@ -222,7 +224,7 @@ struct ProjectManifestInput {
 
 static nlohmann::json empty_project_manifest() {
     return nlohmann::json{
-        {"schemaVersion", "0.5"},
+        {"schemaVersion", ONEWASM_API_VERSION_STRING},
         {"plates", nlohmann::json::array()},
         {"meshes", nlohmann::json::array()},
         {"objects", nlohmann::json::array()},
@@ -339,6 +341,34 @@ struct ProgressWindow {
     int old_span;
 };
 
+// The host registers the progress callback with addFunction on the main
+// runtime thread, and a function-table entry added there is not valid on
+// other pthreads. Print status callbacks run on TBB worker threads, so the
+// call is proxied synchronously to the main runtime thread, which services
+// the proxy queue while it blocks waiting for the slice.
+struct ProgressDelivery {
+    onewasm_progress_callback_t callback;
+    int percent;
+    const char* stage;
+    void* user_data;
+};
+
+static void run_progress_delivery(void* arg) {
+    auto* delivery = static_cast<ProgressDelivery*>(arg);
+    delivery->callback(delivery->percent, delivery->stage, delivery->user_data);
+}
+
+static void deliver_progress(const OrcSession& session, int percent, const char* stage) {
+    if (!session.progress_callback)
+        return;
+    ProgressDelivery delivery{session.progress_callback, percent, stage, session.progress_user_data};
+    if (emscripten_is_main_runtime_thread())
+        run_progress_delivery(&delivery);
+    else
+        emscripten_proxy_sync(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(),
+                              run_progress_delivery, &delivery);
+}
+
 // Slicing blocks the worker's event loop. MAIN_THREAD_EM_ASM delivers this
 // from the pthread engine back to that worker, where postMessage reaches the
 // host's main thread immediately.
@@ -386,8 +416,7 @@ static void attach_progress_callback(Slic3r::Print& print, OrcSession& session) 
             const int mapped_percent = session.progress_base + static_cast<int>(std::lround(
                 static_cast<double>(percent) * static_cast<double>(session.progress_span) / 100.0
             ));
-            if (session.progress_callback)
-                session.progress_callback(mapped_percent, status.text.c_str(), session.progress_user_data);
+            deliver_progress(session, mapped_percent, status.text.c_str());
             post_slice_progress(mapped_percent, status.text);
         }
     });
@@ -400,8 +429,7 @@ static void emit_project_progress(OrcSession& session, int local_percent,
         static_cast<double>(clamped) * static_cast<double>(session.progress_span) / 100.0
     ));
     const char* safe_stage = stage ? stage : "";
-    if (session.progress_callback)
-        session.progress_callback(mapped_percent, safe_stage, session.progress_user_data);
+    deliver_progress(session, mapped_percent, safe_stage);
     post_slice_progress(mapped_percent, safe_stage);
 }
 
@@ -535,13 +563,13 @@ static bool parse_project_manifest(const uint8_t* manifest_data,
     }
     if (!root.is_object() || !root.contains("schemaVersion")
         || !root.at("schemaVersion").is_string()) {
-        error = "project manifest schemaVersion must be 0.5";
+        error = "project manifest schemaVersion must be " ONEWASM_API_VERSION_STRING;
         return false;
     }
     result.schema_version = root.at("schemaVersion").get<std::string>();
-    const bool has_modifier_volumes = result.schema_version == "0.5";
+    const bool has_modifier_volumes = result.schema_version == ONEWASM_API_VERSION_STRING;
     if (!has_modifier_volumes) {
-        error = "project manifest schemaVersion must be 0.5";
+        error = "project manifest schemaVersion must be " ONEWASM_API_VERSION_STRING;
         return false;
     }
     if (has_modifier_volumes) {
@@ -804,6 +832,42 @@ struct TempFileGuard {
     TempFileGuard(const TempFileGuard&) = delete;
     TempFileGuard& operator=(const TempFileGuard&) = delete;
 };
+
+// admesh classifies an STL as binary only when one of the 128 bytes after the
+// 84-byte header is above 127. Those bytes are facet data, so a binary STL
+// with zero normals and small positive coordinates (any box under 16 mm, for
+// example) passes that test as ASCII and then fails to parse. When the staged
+// file has the exact binary layout (84 + 50 * facet count bytes), set the high
+// bit of the first facet's attribute byte count, which admesh ignores, so it
+// is read as binary.
+static bool load_staged_stl(const char* path, Slic3r::Model* model, const char* object_name) {
+    constexpr long header_size = 84;
+    constexpr long facet_size = 50;
+    constexpr long attribute_high_byte = header_size + facet_size - 1;
+    if (FILE* file = std::fopen(path, "r+b")) {
+        unsigned char head[header_size + 128] = {};
+        const std::size_t read = std::fread(head, 1, sizeof(head), file);
+        std::fseek(file, 0, SEEK_END);
+        const long size = std::ftell(file);
+        if (read > static_cast<std::size_t>(attribute_high_byte) && size >= header_size + facet_size) {
+            const std::uint32_t facets = static_cast<std::uint32_t>(head[80])
+                | static_cast<std::uint32_t>(head[81]) << 8
+                | static_cast<std::uint32_t>(head[82]) << 16
+                | static_cast<std::uint32_t>(head[83]) << 24;
+            const bool binary_layout = static_cast<std::uint64_t>(size)
+                == header_size + static_cast<std::uint64_t>(facets) * facet_size;
+            const bool looks_ascii = std::none_of(
+                head + header_size, head + read, [](unsigned char c) { return c > 127; });
+            if (binary_layout && looks_ascii) {
+                const unsigned char marker = head[attribute_high_byte] | 0x80;
+                std::fseek(file, attribute_high_byte, SEEK_SET);
+                std::fwrite(&marker, 1, 1, file);
+            }
+        }
+        std::fclose(file);
+    }
+    return Slic3r::load_stl(path, model, object_name);
+}
 
 // Same rationale as TempFileGuard, for Model::remove_backup_path_if_exist()
 // (the lazily-created MEMFS "Auxiliaries"/backup scratch dir that
@@ -1310,6 +1374,26 @@ static nlohmann::json project_matrix_json(const std::array<double, 16>& matrix) 
     return result;
 }
 
+// Bounding box of a native printable_area, used for the session bed and for
+// desktop Orca's plate layout. Returns false when the option is absent.
+static bool native_printable_area_bounds(
+    const Slic3r::DynamicPrintConfig& config,
+    Slic3r::Vec2d& min,
+    Slic3r::Vec2d& max,
+    std::size_t& point_count
+) {
+    const auto* area = config.option<Slic3r::ConfigOptionPoints>("printable_area");
+    if (!area || area->values.empty())
+        return false;
+    min = max = area->values.front();
+    for (const auto& point : area->values) {
+        min = min.cwiseMin(point);
+        max = max.cwiseMax(point);
+    }
+    point_count = area->values.size();
+    return max.x() > min.x() && max.y() > min.y();
+}
+
 static bool append_native_model_project(
     OrcSession& session,
     Slic3r::Model& model,
@@ -1408,12 +1492,42 @@ static bool append_native_model_project(
         });
     }
 
-    auto project_matrix = [](const Slic3r::ModelInstance& instance) {
+    // Desktop Orca stores every instance in one scene where plate i sits at
+    // PartPlateList::compute_shape_position(i, cols): a grid of plates spaced
+    // by the bed size plus a 1/5 gap, rows extending towards -Y. The manifest
+    // places instances on their own plate's bed, which is also how the slicer
+    // sees them (zero_plate_origin), so remove that scene offset here.
+    std::map<std::string, Slic3r::Vec2d> plate_origins;
+    Slic3r::Vec2d bed_min, bed_max;
+    std::size_t bed_points = 0;
+    if (plate_data_list.size() > 1
+        && native_printable_area_bounds(session.config, bed_min, bed_max, bed_points)) {
+        const int plate_width = static_cast<int>((bed_max - bed_min).x());
+        const int plate_depth = static_cast<int>((bed_max - bed_min).y());
+        const float root = std::sqrt(static_cast<float>(plate_data_list.size()));
+        const int cols = static_cast<int>(root > std::round(root) ? std::round(root) + 1 : std::round(root));
+        constexpr double plate_gap = 1. / 5.;
+        for (const auto& [plate_id, plate] : plates) {
+            if (!plate || plate->plate_index < 0)
+                continue;
+            const int row = plate->plate_index / cols;
+            const int col = plate->plate_index % cols;
+            plate_origins[plate_id] = Slic3r::Vec2d(
+                col * plate_width * (1. + plate_gap),
+                -row * plate_depth * (1. + plate_gap));
+        }
+    }
+
+    auto project_matrix = [&plate_origins](const Slic3r::ModelInstance& instance, const std::string& plate_id) {
         std::array<double, 16> matrix{};
         const auto& native = instance.get_matrix().matrix();
         for (int row = 0; row < 4; ++row)
             for (int column = 0; column < 4; ++column)
                 matrix[static_cast<std::size_t>(row * 4 + column)] = native(row, column);
+        if (const auto origin = plate_origins.find(plate_id); origin != plate_origins.end()) {
+            matrix[3] -= origin->second.x();
+            matrix[7] -= origin->second.y();
+        }
         return matrix;
     };
     std::set<std::pair<std::size_t, std::size_t>> emitted;
@@ -1434,7 +1548,7 @@ static bool append_native_model_project(
             {"id", "native-instance-" + std::to_string(instance_ordinal++)},
             {"objectId", object_ids[object_index]},
             {"plateId", plate_id},
-            {"transform", {{"matrix", project_matrix(*instance)}}},
+            {"transform", {{"matrix", project_matrix(*instance, plate_id)}}},
         });
         return true;
     };
@@ -1579,7 +1693,7 @@ static bool append_native_model_project(
     }
 
     if (modifier_ordinal > 0)
-        manifest["schemaVersion"] = "0.5";
+        manifest["schemaVersion"] = ONEWASM_API_VERSION_STRING;
 
     if (manifest["instances"].empty()) {
         manifest = empty_project_manifest();
@@ -1682,8 +1796,8 @@ static bool parse_project_export_options(
     }
     if (!options.is_object() || !options.contains("schemaVersion")
         || !options.at("schemaVersion").is_string()
-        || options.at("schemaVersion").get<std::string>() != "0.3") {
-        error = "project export options schemaVersion must be 0.3";
+        || options.at("schemaVersion").get<std::string>() != ONEWASM_API_VERSION_STRING) {
+        error = "project export options schemaVersion must be " ONEWASM_API_VERSION_STRING;
         return false;
     }
     if (!reject_unknown_keys(
@@ -1753,7 +1867,7 @@ static bool build_project_export_mesh(
         }
 
         Slic3r::Model loaded;
-        if (!Slic3r::load_stl(path.c_str(), &loaded, "project-export")) {
+        if (!load_staged_stl(path.c_str(), &loaded, "project-export")) {
             error = "unable to load project export STL";
             return false;
         }
@@ -1899,7 +2013,7 @@ static onewasm_status_t build_project_plate_model(
         }
 
         const std::size_t first_object = model.objects.size();
-        if (!Slic3r::load_stl(path.c_str(), &model, object_input->id.c_str())) {
+        if (!load_staged_stl(path.c_str(), &model, object_input->id.c_str())) {
             error = "OrcaSlicer could not load project mesh " + mesh_input->id;
             return ONEWASM_ERR_INPUT_FORMAT;
         }
@@ -1973,7 +2087,7 @@ static onewasm_status_t build_project_plate_model(
         }
 
         Slic3r::Model modifier_model;
-        if (!Slic3r::load_stl(path.c_str(), &modifier_model, modifier.id.c_str())
+        if (!load_staged_stl(path.c_str(), &modifier_model, modifier.id.c_str())
             || modifier_model.objects.empty()) {
             error = "OrcaSlicer could not load project modifier mesh " + mesh_input->id;
             return ONEWASM_ERR_INPUT_FORMAT;
@@ -2157,8 +2271,8 @@ static bool parse_project_slice_request(const uint8_t* request_data,
     }
     if (!request.is_object() || !request.contains("schemaVersion")
         || !request.at("schemaVersion").is_string()
-        || request.at("schemaVersion").get<std::string>() != "0.3") {
-        error = "project slice request schemaVersion must be 0.3";
+        || request.at("schemaVersion").get<std::string>() != ONEWASM_API_VERSION_STRING) {
+        error = "project slice request schemaVersion must be " ONEWASM_API_VERSION_STRING;
         return false;
     }
     if (!reject_unknown_keys(
@@ -2440,7 +2554,7 @@ static std::string serialize_slice_statistics(const Slic3r::Print& print,
     map_volume_to_length(native.flush_per_filament, flush_length_mm);
 
     nlohmann::json result;
-    result["schemaVersion"] = "0.2";
+    result["schemaVersion"] = ONEWASM_API_VERSION_STRING;
     result["timeSeconds"] = {
         {"normal", normal_index < native.modes.size() ? optional_non_negative(native.modes[normal_index].time) : nlohmann::json(nullptr)},
         {"silent", silent_index < native.modes.size() && native.modes[silent_index].time > 0.0f
@@ -2996,6 +3110,15 @@ onewasm_status_t onewasm_init_profile(
         session->config = Slic3r::DynamicPrintConfig();
         session->config.apply(g_defaults);
         session->config.apply(loaded_config);
+        // The project's printer replaces the bed from onewasm_init, matching
+        // the printable_area convention of the JSON profile path.
+        Slic3r::Vec2d bed_min, bed_max;
+        std::size_t bed_points = 0;
+        if (native_printable_area_bounds(session->config, bed_min, bed_max, bed_points)) {
+            session->bed_cx = bed_max.x() / 2.0;
+            session->bed_cy = bed_max.y() / 2.0;
+            session->bed_shape = bed_points > 8 ? "circle" : "rectangle";
+        }
         session->remove_mixed_temp_restriction = false;
         session->adaptive_layer_height = false;
         session->adaptive_layer_height_quality = 0.5f;
@@ -3070,12 +3193,12 @@ onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len)
     constexpr const char* threading_model = "pthreads";
     constexpr const char* requires_sab = "true";
     const std::string json = std::string(R"({
-  "api":{"name":"one-wasm-slicer-api","version":"0.5.1"},
+  "api":{"name":"one-wasm-slicer-api","version":"0.6.0"},
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
   "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"unsupported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported","runtime.memory":"supported"}
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"unsupported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
@@ -3230,8 +3353,8 @@ onewasm_status_t onewasm_project_prepare(
     }
     if (!request.is_object() || !request.contains("schemaVersion")
         || !request.at("schemaVersion").is_string()
-        || request.at("schemaVersion").get<std::string>() != "0.3") {
-        record_error(*session, "project prepare request schemaVersion must be 0.3");
+        || request.at("schemaVersion").get<std::string>() != ONEWASM_API_VERSION_STRING) {
+        record_error(*session, "project prepare request schemaVersion must be " ONEWASM_API_VERSION_STRING);
         return ONEWASM_ERR_VALIDATION;
     }
     std::string request_error;
@@ -3424,7 +3547,7 @@ onewasm_status_t onewasm_project_slice(
     ProjectOutputFailureGuard output_guard{*session};
     std::map<std::string, std::string> new_assets;
     nlohmann::json result = {
-        {"schemaVersion", "0.3"},
+        {"schemaVersion", ONEWASM_API_VERSION_STRING},
         {"plateResults", nlohmann::json::array()},
         {"warnings", nlohmann::json::array()},
     };
@@ -3511,7 +3634,7 @@ onewasm_status_t onewasm_project_slice(
                         record_error(*session, "OrcaSlicer returned invalid slice statistics");
                         return ONEWASM_ERR_INTERNAL;
                     }
-                    statistics["schemaVersion"] = "0.3";
+                    statistics["schemaVersion"] = ONEWASM_API_VERSION_STRING;
                     plate_result["statistics"] = std::move(statistics);
                 } catch (const std::exception& exception) {
                     std::free(statistics_data);
@@ -3863,7 +3986,7 @@ onewasm_status_t onewasm_project_export(
             return ONEWASM_ERR_OUTPUT;
         }
         nlohmann::json result = {
-            {"schemaVersion", "0.3"},
+            {"schemaVersion", ONEWASM_API_VERSION_STRING},
             {"asset", {
                 {"id", "project:export"},
                 {"kind", "project"},
@@ -3930,7 +4053,7 @@ static onewasm_status_t legacy_slice_stl(
         throw_if_cancelled(operation);
         // ── load model ───────────────────────────────────────────────
         Slic3r::Model model;
-        const bool stl_ok = Slic3r::load_stl("/tmp/ow_in.stl", &model, "object");
+        const bool stl_ok = load_staged_stl("/tmp/ow_in.stl", &model, "object");
         std::remove("/tmp/ow_in.stl"); // MEMFS is RAM-backed; free it as soon as loaded
         if (!stl_ok) {
             record_error(*session, "STL load failed");
@@ -4101,7 +4224,7 @@ static onewasm_status_t legacy_prepare_plate(
                 record_error(*session, "failed to write complete STL data");
                 return -3;
             }
-            if (!Slic3r::load_stl(path.c_str(), &model, ("object_" + std::to_string(i)).c_str())) {
+            if (!load_staged_stl(path.c_str(), &model, ("object_" + std::to_string(i)).c_str())) {
                 record_error(*session, "STL load failed for file " + std::to_string(i));
                 return -4;
             }
@@ -4283,7 +4406,7 @@ onewasm_status_t onewasm_obj_to_stl(
  *              rotation xyz (radians), mirror xyz, and X/Y offset in mm
  *              relative to bed centre. NaN X/Y delegates placement to arrange.
  *
- * Internal adapter used by the API 0.5.1 project implementation.
+ * Internal adapter used by the API 0.6.0 project implementation.
  */
 static onewasm_status_t legacy_slice_stl_multi(
     onewasm_session_t session_ptr,
@@ -4331,7 +4454,7 @@ static onewasm_status_t legacy_slice_stl_multi(
                 std::fclose(f);
             }
             const std::string name = "object_" + std::to_string(i);
-            const bool ok = Slic3r::load_stl(path.c_str(), &model, name.c_str());
+            const bool ok = load_staged_stl(path.c_str(), &model, name.c_str());
             std::remove(path.c_str());
             if (!ok) {
                 record_error(*session, "STL load failed for file " + std::to_string(i));
@@ -4661,7 +4784,7 @@ onewasm_status_t onewasm_cad_to_stl(
  * length, never a NUL-terminated string read). Caller must free with
  * onewasm_free().
  *
- * Internal adapter used by the API 0.5.1 project implementation; -8 means the 3MF export
+ * Internal adapter used by the API 0.6.0 project implementation; -8 means the 3MF export
  * itself (store_bbs_3mf) failed rather than gcode export.
  */
 static onewasm_status_t legacy_write_3mf(
@@ -4698,7 +4821,7 @@ static onewasm_status_t legacy_write_3mf(
         }
 
         Slic3r::Model model;
-        const bool stl_ok = Slic3r::load_stl("/tmp/ow_3mf_in.stl", &model, "object");
+        const bool stl_ok = load_staged_stl("/tmp/ow_3mf_in.stl", &model, "object");
         if (!stl_ok) {
             record_error(*session, "STL load failed");
             return -4;
@@ -4793,7 +4916,7 @@ static onewasm_status_t legacy_write_3mf(
  *   -9  unexpected C++ exception
  */
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_read_3mf(
+onewasm_status_t onewasm_three_mf_to_stl(
     const uint8_t* mf_data,
     uint32_t mf_len,
     uint8_t** out_stl,

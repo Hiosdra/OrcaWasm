@@ -1,0 +1,28 @@
+name: Clean up pull-request prereleases
+
+# Build WASM publishes wasm-<version>-pr<N>.<run>-multithreaded prereleases
+# for same-repository PRs. Delete them and their tags when the PR closes.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete this PR's prereleases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,isPrerelease \
+            --jq ".[] | select(.isPrerelease) | .tagName | select(test(\"^wasm-v[0-9.]+-pr${PR_NUMBER}\\\\.[0-9]+-multithreaded$\"))" |
+            while read -r tag; do
+              echo "Deleting $tag"
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+            done

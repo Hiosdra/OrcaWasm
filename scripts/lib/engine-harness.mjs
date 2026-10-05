@@ -1,6 +1,6 @@
 // Shared Node test harness for the OrcaSlicer WASM engine — used by
 // smoke-test.mjs. Centralizes the ABI-coupled pieces
-// (module loading + heap marshaling for API 0.5.1 project operations)
+// (module loading + heap marshaling for API 0.6.0 C binding project operations)
 // so the C bridge's calling convention lives in ONE place instead of being
 // copy-pasted and drifting between scripts.
 //
@@ -138,6 +138,28 @@ export async function loadModule(wasmDir, engine) {
     printErr: (m) => console.warn('[OrcaWASM]', m),
     onAbort: (m) => { throw new Error(`WASM module aborted: ${m}`) },
   })
+}
+
+// Load the same artifact through its one-wasm-slicer-api TypeScript binding:
+// the embedded glue exposes `OneWasmEngine`, which hosts use instead of the
+// heap-level exports above. Each call instantiates a fresh runtime.
+export async function loadEngineArtifact(wasmDir, engine) {
+  const jsPath = resolve(wasmDir, `${engine}.js`)
+  const wasmPath = resolve(wasmDir, `${engine}.wasm`)
+  if (!existsSync(jsPath) || !existsSync(wasmPath)) {
+    throw new Error(`${engine}.js/${engine}.wasm not found in ${wasmDir} — run the build workflow or build-local-wsl.sh first`)
+  }
+  const jsText = readFileSync(jsPath, 'utf8')
+  const dataUrl = 'data:text/javascript;charset=utf-8,' +
+    encodeURIComponent(`${jsText}\nexport default OneWasmEngine;`)
+  const { default: artifact } = await import(dataUrl)
+  const runtime = {
+    wasmBinary: readFileSync(wasmPath),
+    mainScriptUrlOrBlob: jsPath,
+    printErr: (m) => console.warn('[OrcaWASM]', m),
+    onAbort: (m) => { throw new Error(`WASM module aborted: ${m}`) },
+  }
+  return { artifact, runtime }
 }
 
 // ── minimal heap marshaling ────────────────────────────────────────────────────

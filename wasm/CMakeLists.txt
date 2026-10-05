@@ -26,6 +26,15 @@ target_link_options(slicer PRIVATE
   -sENVIRONMENT=web,worker,node
   -sMODULARIZE=1
   -sEXPORT_NAME=OrcaModule
+  # one-wasm-slicer-api 0.6.0 TypeScript binding: the vendored reference glue
+  # (Apache-2.0, copied unmodified from the API release) and the line binding
+  # it to OrcaModule. The artifact then exposes `OneWasmEngine`, so hosts never
+  # touch the heap. Both run outside the factory and stay valid in pthread
+  # Workers, which load this same script.
+  "--extern-post-js=${CMAKE_CURRENT_SOURCE_DIR}/onewasm/onewasm-emscripten-glue.js"
+  "--extern-post-js=${CMAKE_CURRENT_SOURCE_DIR}/onewasm/engine-binding.js"
+  # Lets the glue register a per-call progress callback with addFunction.
+  -sALLOW_TABLE_GROWTH=1
   -fwasm-exceptions
   -sSUPPORT_LONGJMP=wasm
   -pthread
@@ -77,9 +86,8 @@ target_link_options(slicer PRIVATE
   # Dropping the ~200 MB preload removes slicer.data entirely.  FORCE_FILESYSTEM
   # keeps MEMFS available for the bridge's /tmp STL-in / G-code-out files.
   -sFORCE_FILESYSTEM=1
-  # Exported C functions consumed by the JS runtime and the common
-  # one-wasm-slicer-api 0.4 contract. The geometry-only 3MF converter is a
-  # UI import helper and is intentionally outside the canonical project ABI.
+  # Every C binding symbol of one-wasm-slicer-api 0.6.0, consumed by the
+  # embedded glue; onewasm_three_mf_to_stl is optional format.threeMfToStl.
   "-sEXPORTED_FUNCTIONS=[\
 '_onewasm_session_create',\
 '_onewasm_session_destroy',\
@@ -97,7 +105,7 @@ target_link_options(slicer PRIVATE
 '_onewasm_project_export',\
 '_onewasm_obj_to_stl',\
 '_onewasm_cad_to_stl',\
-'_onewasm_read_3mf',\
+'_onewasm_three_mf_to_stl',\
 '_onewasm_free',\
 '_onewasm_last_error',\
 '_malloc',\
@@ -114,8 +122,16 @@ target_link_options(slicer PRIVATE
 'HEAP8',\
 'HEAPU8',\
 'HEAP32',\
-'HEAPU32'\
+'HEAPU32',\
+'addFunction',\
+'removeFunction'\
 ]"
+)
+
+# Relink when the vendored API glue changes.
+set_property(TARGET slicer APPEND PROPERTY LINK_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/onewasm/onewasm-emscripten-glue.js"
+  "${CMAKE_CURRENT_SOURCE_DIR}/onewasm/engine-binding.js"
 )
 
 # Rename Emscripten output to <ORCA_WEB_WASM_OUTPUT_NAME>.js/.wasm/.data

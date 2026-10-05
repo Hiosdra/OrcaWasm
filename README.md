@@ -52,12 +52,27 @@ with:
 node scripts/gen-wsl-build-script.mjs
 ```
 
-## C API
+## Engine API
 
-The module implements exactly `one-wasm-slicer-api` 0.5.1 per engine release.
-It does not negotiate or claim compatibility with older API versions. The old `orc_*` and
-0.2 STL-specific symbols are not part of the canonical surface; hosts use the
-project-oriented API below:
+The module implements exactly `one-wasm-slicer-api` 0.6.0 per engine release.
+It does not negotiate or claim compatibility with older API versions.
+
+Hosts use the **TypeScript binding**. `slicer-mt.js` embeds the reference
+Emscripten glue from the API release ([`wasm/onewasm/`](wasm/onewasm)) and
+exposes one `OneWasmEngine` object:
+
+```js
+// slicer-mt.js loaded as a classic script, or wrapped as a module with
+// `export default OneWasmEngine;`
+const engine = await OneWasmEngine.createEngine({ runtime: emscriptenModuleOverrides })
+const session = await engine.createSession()
+await session.init(nativeConfigBytes)
+```
+
+The engine itself implements the **C binding** declared by the vendored header
+[`bridge/onewasm_slicer_api.h`](bridge/onewasm_slicer_api.h), which tracks the
+private [`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
+specification. The glue is the only code that touches the heap:
 
 ```text
 onewasm_session_create / onewasm_session_destroy
@@ -66,41 +81,38 @@ onewasm_cancel
 onewasm_project_set_objects / onewasm_project_get_manifest
 onewasm_project_prepare / onewasm_project_slice
 onewasm_project_get_asset / onewasm_project_export
-onewasm_obj_to_stl / onewasm_cad_to_stl
+onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_three_mf_to_stl
 onewasm_get_capabilities
 onewasm_free / onewasm_last_error
 ```
 
-The Emscripten exports therefore use `_onewasm_*` names. The canonical header
-is vendored at [`bridge/onewasm_slicer_api.h`](bridge/onewasm_slicer_api.h) and
-tracks the private
-[`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
-specification. The extra `onewasm_read_3mf` export is a geometry-only
-PoC import helper, outside the canonical project ABI. An Orca project `.3mf`
-is loaded as a native profile with
-`onewasm_init_profile(session, "project.3mf", ...)`.
+`onewasm_three_mf_to_stl` is optional `format.threeMfToStl` (geometry only). An Orca
+project `.3mf` is loaded as a native profile with `initProfile("project.3mf", ...)`.
+
+To update the API, copy `js/glue/onewasm-emscripten-glue.js`,
+`js/glue/onewasm-conformance.mjs` and `include/onewasm_slicer_api.h` unmodified
+from the API release.
 
 ## one-wasm-slicer-api compatibility
 
-The nine `requiredIn: "core"` features are `core.session`,
+The eight `requiredIn: "core"` features are `core.session`,
 `core.configuration`, `project.manifest`, `project.slice`,
-`project.slice.assets`, `runtime.progress`, `runtime.capabilities`,
-`runtime.errors`, and `runtime.memory`; this source reports them as supported.
+`project.slice.assets`, `runtime.progress`, `runtime.capabilities` and
+`runtime.errors`; this source reports them as supported.
 The host must reject this engine if a required feature is absent or not
 `supported`.
 
 All other features are optional and are selected from `onewasm_get_capabilities`
 at runtime. This build reports profile initialization/application, modifier
 volumes and native modifier preservation, prepare/arrange, multi-plate slicing,
-project export and preservation, OBJ/STEP conversion, and cancellation as
-supported. `project.export.sliceArtifacts` is explicitly unsupported; callers
+project export and preservation, OBJ/STEP/3MF conversion, and cancellation
+as supported. `project.export.sliceArtifacts` is explicitly unsupported; callers
 must not infer optional support from an exported C symbol.
 
-Every project manifest uses `schemaVersion: "0.5"`, including ordinary
-projects with an empty `modifierVolumes` array. The `"0.3"` schema markers on
-slice, prepare, export-option, and result payloads identify those payload
-schemas; they are not older API versions and do not enable an older manifest
-adapter. The bridge rejects project manifests with any other revision.
+Every payload (project manifest, prepare/slice/export requests and results,
+slice statistics) uses `schemaVersion: "0.6.0"`, the API version, including
+ordinary projects with an empty `modifierVolumes` array. The bridge rejects
+any other `schemaVersion`.
 
 The bridge implements native Orca arrange and auto-orient, sequential
 selected/all-plate slicing, per-plate result assets/statistics, native project
@@ -148,8 +160,10 @@ and the [WebAssembly Memory64 proposal](https://github.com/WebAssembly/memory64/
 ## CI and releases
 
 The `Build WASM` workflow validates pull requests and builds the pthread-enabled
-engine on the default branch. Each successful build runs the real
-engine smoke test before publishing immutable GitHub Release assets:
+engine on the default branch. Each successful build runs the real engine smoke
+test and the one-wasm-slicer-api conformance suite (`scripts/conformance.mjs`,
+through the embedded TypeScript binding) before publishing immutable GitHub
+Release assets:
 
 ```text
 wasm-v2.4.2-patchN-multithreaded
@@ -158,7 +172,7 @@ wasm-v2.4.2-patchN-multithreaded
 The first build for an OrcaSlicer version uses the corresponding
 `wasm-vX.Y.Z-multithreaded` tag; later engine changes use immutable patch tags.
 
-The smoke test exercises API 0.5.1 support enforcers and blockers both with a
+The smoke test exercises API 0.6.0 support enforcers and blockers both with a
 minimal config and with the reduced selected-profile fixture at
 `scripts/fixtures/voron-0.4-profile-smoke.json`. The profile export does not
 include the active bed surface, so this test explicitly uses `Textured PEI
@@ -170,6 +184,13 @@ WASM files from the same tag. Each release advertises one exact API version;
 these source changes do not publish a release. This repository publishes engine releases only;
 the frontend deployment is handled separately by the JustSlice-PoC Cloudflare
 Workers project.
+
+Pull requests from branches of this repository that pass the smoke and
+conformance tests also publish a **prerelease**
+`wasm-v2.4.2-pr<number>.<run>-multithreaded`, so JustSlice-PoC can select the
+build before merge. Prereleases never match the `-patchN` numbering and are
+skipped by consumers that resolve the newest release. Closing the PR deletes
+its prereleases and tags (`cleanup-pr-prereleases.yml`).
 
 ## Licence and notices
 

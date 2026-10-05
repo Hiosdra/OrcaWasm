@@ -8,22 +8,32 @@ extern "C" {
 #endif
 
 /*
- * API 0.5.1: one exact API version per release. Core behavior is required;
- * optional behavior is reported by the capability document. Symbol presence
- * does not establish optional-feature support.
+ * API 0.6.0, C binding: the low-level binding of one-wasm-slicer-api. Hosts
+ * use the TypeScript binding; an Emscripten engine implementing this header
+ * embeds the reference glue (js/glue) to provide it. See docs/binding-c.md.
+ *
+ * One exact API version per release; core behavior is required. Every
+ * declaration remains in the ABI. Optional operations may be stubs returning
+ * ONEWASM_ERR_UNSUPPORTED; symbol presence is not capability support.
+ * Every JSON payload carries schemaVersion equal to the API version string;
+ * engines reject any other value. Every engine accepts ordinary project
+ * manifests with empty modifierVolumes.
+ * Nonempty modifierVolumes requires the advertised optional capability.
  */
 #define ONEWASM_API_VERSION_MAJOR 0
-#define ONEWASM_API_VERSION_MINOR 5
-#define ONEWASM_API_VERSION_PATCH 1
-#define ONEWASM_API_VERSION_STRING "0.5.1"
+#define ONEWASM_API_VERSION_MINOR 6
+#define ONEWASM_API_VERSION_PATCH 0
+#define ONEWASM_API_VERSION_STRING "0.6.0"
 
 typedef void* onewasm_session_t;
 typedef int32_t onewasm_status_t;
 
 /*
  * The stage string is borrowed and valid only for the duration of the
- * callback. The callback must be non-blocking and must not re-enter the
- * session. percent is 0..100, or -1 when no useful percentage is known.
+ * callback. The engine invokes the callback on the thread that called the
+ * operation; an engine reporting progress from worker threads proxies the
+ * call to that thread. The callback must be non-blocking and must not
+ * re-enter the session. percent is 0..100, or -1 when no useful percentage is known.
  */
 typedef void (*onewasm_progress_callback_t)(
     int32_t percent,
@@ -56,6 +66,7 @@ onewasm_status_t onewasm_init(
     uint32_t config_len
 );
 
+/* Replace the active configuration and logical project with a full profile. */
 onewasm_status_t onewasm_init_profile(
     onewasm_session_t session,
     const char* format_utf8,
@@ -64,6 +75,14 @@ onewasm_status_t onewasm_init_profile(
     uint32_t profile_len
 );
 
+/*
+ * Apply one engine-native profile fragment to the active configuration.
+ * The accepted format identifiers are listed in capabilities.configuration.profileApplyFormats.
+ * A successful call preserves the logical project and its geometry, while
+ * invalidating slice/export result assets and statistics derived from the
+ * previous configuration. Calls are host-serialized with other session
+ * operations and may not race a slice.
+ */
 onewasm_status_t onewasm_apply_profile(
     onewasm_session_t session,
     const char* format_utf8,
@@ -77,15 +96,8 @@ onewasm_status_t onewasm_set_progress_callback(
     onewasm_progress_callback_t callback,
     void* user_data
 );
-
 onewasm_status_t onewasm_cancel(onewasm_session_t session);
 
-/*
- * Replace the logical project's mesh objects and placement with a neutral
- * manifest. Mesh data ranges refer to the object_blob, so large meshes do not
- * pass through base64/JSON. Native settings already loaded in the session
- * remain active.
- */
 onewasm_status_t onewasm_project_set_objects(
     onewasm_session_t session,
     const uint8_t* object_blob,
@@ -93,13 +105,11 @@ onewasm_status_t onewasm_project_set_objects(
     const uint8_t* manifest_json,
     uint32_t manifest_len
 );
-
 onewasm_status_t onewasm_project_get_manifest(
     onewasm_session_t session,
     uint8_t** out_json,
     uint32_t* out_len
 );
-
 onewasm_status_t onewasm_project_prepare(
     onewasm_session_t session,
     const uint8_t* request_json,
@@ -107,7 +117,6 @@ onewasm_status_t onewasm_project_prepare(
     uint8_t** out_manifest_json,
     uint32_t* out_len
 );
-
 onewasm_status_t onewasm_project_slice(
     onewasm_session_t session,
     const uint8_t* request_json,
@@ -115,7 +124,6 @@ onewasm_status_t onewasm_project_slice(
     uint8_t** out_result_json,
     uint32_t* out_len
 );
-
 onewasm_status_t onewasm_project_get_asset(
     onewasm_session_t session,
     const char* asset_id_utf8,
@@ -123,7 +131,6 @@ onewasm_status_t onewasm_project_get_asset(
     uint8_t** out_data,
     uint32_t* out_len
 );
-
 onewasm_status_t onewasm_project_export(
     onewasm_session_t session,
     const char* format_utf8,
@@ -140,19 +147,22 @@ onewasm_status_t onewasm_obj_to_stl(
     uint8_t** out_stl,
     uint32_t* out_len
 );
-
 onewasm_status_t onewasm_cad_to_stl(
     const uint8_t* cad_data,
     uint32_t cad_len,
     uint8_t** out_stl,
     uint32_t* out_len
 );
-
-onewasm_status_t onewasm_get_capabilities(
-    uint8_t** out_json,
+/* Optional format.threeMfToStl: merged geometry only, no native settings.
+ * Every plate's build items are merged into one mesh in the source scene's
+ * coordinates, with transforms (including mirroring) applied. */
+onewasm_status_t onewasm_three_mf_to_stl(
+    const uint8_t* mf_data,
+    uint32_t mf_len,
+    uint8_t** out_stl,
     uint32_t* out_len
 );
-
+onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len);
 const char* onewasm_last_error(onewasm_session_t session);
 void onewasm_free(void* ptr);
 

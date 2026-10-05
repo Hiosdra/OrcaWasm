@@ -3,7 +3,7 @@
  * WASM engine smoke test.
  *
  * Loads the built slicer-mt.js/slicer-mt.wasm and runs the stable project contract
- * end-to-end under API 0.5.1: onewasm_init, profile application, project
+ * end-to-end under API 0.6.0: onewasm_init, profile application, project
  * manifest/prepare/slice/assets, project export, and the geometry-only 3MF
  * import helper. The test catches broken builds before they are published as a GitHub Release
  * (build-wasm.yml) or trusted by a host after the artifacts are prepared.
@@ -63,8 +63,8 @@ function getCapabilitiesOnce(module) {
     const len = module.getValue(outLenPtr, 'i32')
     try {
       const capabilities = JSON.parse(new TextDecoder().decode(module.HEAPU8.slice(ptr, ptr + len)))
-      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.5.1') {
-        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.5.1')
+      if (capabilities.api?.name !== 'one-wasm-slicer-api' || capabilities.api?.version !== '0.6.0') {
+        throw new Error('capabilities document does not identify one-wasm-slicer-api 0.6.0')
       }
       if (!capabilities.project?.nativeProjectFormats?.includes('project.3mf')) {
         throw new Error('capabilities document does not advertise native project.3mf support')
@@ -78,7 +78,6 @@ function getCapabilitiesOnce(module) {
         'runtime.capabilities',
         'runtime.progress',
         'runtime.errors',
-        'runtime.memory',
       ]
       for (const feature of coreRequiredFeatures) {
         if (capabilities.features?.[feature] !== 'supported') {
@@ -97,6 +96,7 @@ function getCapabilitiesOnce(module) {
         'project.export.preservation',
         'format.objToStl',
         'format.stepToStl',
+        'format.threeMfToStl',
         'runtime.cancellation',
       ]
       for (const feature of optionalFeatures) {
@@ -145,8 +145,8 @@ function read3mfOnce(module, mfBytes) {
     try {
       const outStlLenPtr = checkedMalloc(module, 4, 'STL output length')
       try {
-        const rc = module._onewasm_read_3mf(mfPtr, mfBytes.length, outStlPtrPtr, outStlLenPtr)
-        if (rc !== 0) throw new Error(`onewasm_read_3mf failed (${rc}): ${decodeError(module, 0)}`)
+        const rc = module._onewasm_three_mf_to_stl(mfPtr, mfBytes.length, outStlPtrPtr, outStlLenPtr)
+        if (rc !== 0) throw new Error(`onewasm_three_mf_to_stl failed (${rc}): ${decodeError(module, 0)}`)
         const stlPtr = module.getValue(outStlPtrPtr, 'i32'), stlLen = module.getValue(outStlLenPtr, 'i32')
         try { return module.HEAPU8.slice(stlPtr, stlPtr + stlLen) } finally { module._onewasm_free(stlPtr) }
       } finally { module._free(outStlLenPtr) }
@@ -634,7 +634,7 @@ function makeSupportModifierProject(meshBytes, modifier) {
   return {
     blob,
     manifest: {
-      schemaVersion: '0.5',
+      schemaVersion: '0.6.0',
       plates: [{ id: 'plate-0', index: 0 }],
       meshes,
       objects: [{ id: 'object-model', meshId: 'mesh-model' }],
@@ -671,7 +671,7 @@ function expectProjectValidationFailure(module, session, project, message, label
 
 function sliceSupportProject(module, session, label) {
   const result = projectSliceOnce(module, session, {
-    schemaVersion: '0.3',
+    schemaVersion: '0.6.0',
     plateSelection: 'selected',
     plateIds: ['plate-0'],
     includeGcode: true,
@@ -679,7 +679,7 @@ function sliceSupportProject(module, session, label) {
   })
   const plate = result.plateResults?.[0]
   const asset = plate?.assets?.find((entry) => entry.kind === 'gcode')
-  if (result.schemaVersion !== '0.3' || plate?.plateId !== 'plate-0' || !asset) {
+  if (result.schemaVersion !== '0.6.0' || plate?.plateId !== 'plate-0' || !asset) {
     throw new Error(label + ': modifier test did not return one plate G-code asset')
   }
   const gcode = new TextDecoder().decode(projectGetAssetOnce(module, session, asset.id))
@@ -701,11 +701,11 @@ function expectModifierNativeProjectRoundTrip(
   expectedTransform,
 ) {
   const result = projectExportOnce(module, session, 'project.3mf', {
-    schemaVersion: '0.3',
+    schemaVersion: '0.6.0',
     preservation: 'portable',
     includeSliceArtifacts: false,
   })
-  if (result.schemaVersion !== '0.3' || result.asset?.kind !== 'project') {
+  if (result.schemaVersion !== '0.6.0' || result.asset?.kind !== 'project') {
     throw new Error('modifier project export returned an invalid asset descriptor')
   }
   const bytes = projectGetAssetOnce(module, session, result.asset.id)
@@ -715,7 +715,7 @@ function expectModifierNativeProjectRoundTrip(
   initProfileOnce(module, session, bytes)
   const imported = projectGetManifestOnce(module, session)
   const volume = imported.modifierVolumes?.find((entry) => entry.role === role)
-  if (imported.schemaVersion !== '0.5'
+  if (imported.schemaVersion !== '0.6.0'
     || imported.modifierVolumes?.length !== 1
     || !volume
     || volume.objectId !== 'native-object-0'
@@ -757,7 +757,7 @@ function runSupportModifierSmoke(module, session, configureSession = () => {
   const baseline = makeSupportModifierProject(meshBytes, null)
   projectSetObjectsOnce(module, session, baseline.blob, baseline.manifest)
   const baselineRoundTrip = projectGetManifestOnce(module, session)
-  if (baselineRoundTrip.schemaVersion !== '0.5' || baselineRoundTrip.modifierVolumes?.length !== 0) {
+  if (baselineRoundTrip.schemaVersion !== '0.6.0' || baselineRoundTrip.modifierVolumes?.length !== 0) {
     throw new Error('API 0.5 empty modifierVolumes manifest did not round-trip')
   }
   const automaticSupports = sliceSupportProject(module, session, 'automatic support baseline')
@@ -794,7 +794,7 @@ function runSupportModifierSmoke(module, session, configureSession = () => {
     const roundTrip = projectGetManifestOnce(module, session)
     const returned = roundTrip.modifierVolumes?.[0]
     if (
-      roundTrip.schemaVersion !== '0.5' ||
+      roundTrip.schemaVersion !== '0.6.0' ||
       roundTrip.modifierVolumes?.length !== 1 ||
       !returned ||
       returned.id !== 'modifier-' + modifier.role ||
@@ -877,7 +877,7 @@ function makeProjectFixture(meshBytes) {
   return {
     blob: new Uint8Array(meshBytes),
     manifest: {
-      schemaVersion: '0.5',
+      schemaVersion: '0.6.0',
       plates: [
         { id: 'plate-0', label: 'Plate 0', index: 0 },
         { id: 'plate-1', label: 'Plate 1', index: 1 },
@@ -898,7 +898,7 @@ function makeProjectFixture(meshBytes) {
 }
 
 function assertProjectManifest(manifest, label) {
-  if (manifest?.schemaVersion !== '0.5') throw new Error(`${label}: invalid project manifest schema version`)
+  if (manifest?.schemaVersion !== '0.6.0') throw new Error(`${label}: invalid project manifest schema version`)
   if (!Array.isArray(manifest.modifierVolumes)) throw new Error(`${label}: missing modifierVolumes array`)
   if (!Array.isArray(manifest.plates) || manifest.plates.length !== 2) throw new Error(`${label}: expected two plates`)
   if (!Array.isArray(manifest.instances) || manifest.instances.length !== 2) throw new Error(`${label}: expected two instances`)
@@ -911,7 +911,7 @@ function assertProjectManifest(manifest, label) {
 }
 
 function assertProjectSlice(module, session, result, expectedPlateIds, label) {
-  if (result?.schemaVersion !== '0.3') throw new Error(`${label}: invalid project result schema version`)
+  if (result?.schemaVersion !== '0.6.0') throw new Error(`${label}: invalid project result schema version`)
   if (!Array.isArray(result.plateResults) || result.plateResults.length !== expectedPlateIds.length) {
     throw new Error(`${label}: unexpected plate result count`)
   }
@@ -928,7 +928,7 @@ function assertProjectSlice(module, session, result, expectedPlateIds, label) {
     const bytes = projectGetAssetOnce(module, session, asset.id)
     if (bytes.length !== asset.byteLength) throw new Error(`${label}: asset byte length mismatch`)
     assertSaneGcode(new TextDecoder().decode(bytes), `${label} ${plateResult.plateId}`)
-    if (plateResult.statistics?.schemaVersion !== '0.3') {
+    if (plateResult.statistics?.schemaVersion !== '0.6.0') {
       throw new Error(`${label}: statistics are not attached to ${plateResult.plateId}`)
     }
   }
@@ -939,7 +939,7 @@ function runProjectSmoke(module, session, meshBytes) {
   projectSetObjectsOnce(module, session, project.blob, project.manifest)
   assertProjectManifest(projectGetManifestOnce(module, session), 'project_set_objects/get_manifest')
 
-  const obsoleteManifest = { ...project.manifest, schemaVersion: '0.3' }
+  const obsoleteManifest = { ...project.manifest, schemaVersion: '0.5' }
   delete obsoleteManifest.modifierVolumes
   let obsoleteManifestRejected = false
   try {
@@ -947,24 +947,24 @@ function runProjectSmoke(module, session, meshBytes) {
   } catch {
     obsoleteManifestRejected = true
   }
-  if (!obsoleteManifestRejected) throw new Error('API 0.5.1 accepted obsolete project manifest revision 0.3')
+  if (!obsoleteManifestRejected) throw new Error('API 0.6.0 accepted obsolete project manifest revision 0.5')
   assertProjectManifest(projectGetManifestOnce(module, session), 'project after obsolete manifest rejection')
 
   const prepared = projectPrepareOnce(module, session, {
-    schemaVersion: '0.3',
+    schemaVersion: '0.6.0',
     operation: 'arrange',
   })
   assertProjectManifest(prepared, 'project_prepare')
 
   // Arrange intentionally consumes the legacy decomposable transform shape.
   // Re-upload a valid full-affine manifest for slicing so this test also pins
-  // the 0.5 manifest matrix path (including a shear) independently of arrange.
+  // the manifest matrix path (including a shear) independently of arrange.
   const slicedManifest = JSON.parse(JSON.stringify(project.manifest))
   slicedManifest.instances[1].transform.matrix = projectMatrix(128, 128, 0, 0.1)
   projectSetObjectsOnce(module, session, project.blob, slicedManifest)
 
   const allResult = projectSliceOnce(module, session, {
-    schemaVersion: '0.3',
+    schemaVersion: '0.6.0',
     plateSelection: 'all',
     includeGcode: true,
     includeStatistics: true,
@@ -972,7 +972,7 @@ function runProjectSmoke(module, session, meshBytes) {
   assertProjectSlice(module, session, allResult, ['plate-0', 'plate-1'], 'project_slice all')
 
   const selectedResult = projectSliceOnce(module, session, {
-    schemaVersion: '0.3',
+    schemaVersion: '0.6.0',
     plateSelection: 'selected',
     plateIds: ['plate-1'],
     includeGcode: true,
@@ -981,11 +981,11 @@ function runProjectSmoke(module, session, meshBytes) {
   assertProjectSlice(module, session, selectedResult, ['plate-1'], 'project_slice selected')
 
   const exportResult = projectExportOnce(module, session, 'project.3mf', {
-    schemaVersion: '0.3',
+    schemaVersion: '0.6.0',
     preservation: 'best-effort',
     includeSliceArtifacts: false,
   })
-  if (exportResult?.schemaVersion !== '0.3'
+  if (exportResult?.schemaVersion !== '0.6.0'
     || exportResult.asset?.id !== 'project:export'
     || exportResult.asset.kind !== 'project'
     || exportResult.asset.mimeType !== 'model/3mf') {
@@ -1167,7 +1167,7 @@ function extractExtrusionGeometry(gcode, label) {
 
 function makeTransformProjectManifest(meshBytes, matrices) {
   return {
-    schemaVersion: '0.5',
+    schemaVersion: '0.6.0',
     plates: [{ id: 'transform-plate', label: 'Transform plate', index: 0 }],
     meshes: [{
       id: 'transform-mesh',
@@ -1194,7 +1194,7 @@ function sliceTransformManifest(module, session, meshBytes, manifest, label) {
   let result
   try {
     result = projectSliceOnce(module, session, {
-      schemaVersion: '0.3',
+      schemaVersion: '0.6.0',
       plateSelection: 'selected',
       plateIds: ['transform-plate'],
       includeGcode: true,
@@ -1206,7 +1206,7 @@ function sliceTransformManifest(module, session, meshBytes, manifest, label) {
   const plate = result?.plateResults?.[0]
   if (plate?.plateId !== 'transform-plate' || plate.assets?.length !== 1
     || plate.assets[0].id !== 'gcode:transform-plate') {
-    throw new Error(label + ': API 0.5.1 did not return the transform plate G-code asset')
+    throw new Error(label + ': API 0.6.0 did not return the transform plate G-code asset')
   }
   const gcode = new TextDecoder().decode(projectGetAssetOnce(module, session, 'gcode:transform-plate'))
   assertSaneGcode(gcode, label)
@@ -1362,7 +1362,7 @@ function runTransformRegressionSmoke(module, session) {
   const arrangeManifest = makeTransformProjectManifest(TRANSFORM_MESH, arrangeMatrices)
   projectSetObjectsOnce(module, session, new Uint8Array(TRANSFORM_MESH), arrangeManifest)
   const arrangedManifest = projectPrepareOnce(module, session, {
-    schemaVersion: '0.3',
+    schemaVersion: '0.6.0',
     operation: 'arrange',
   })
   if (!Array.isArray(arrangedManifest?.instances) || arrangedManifest.instances.length !== 2) {
@@ -1420,7 +1420,7 @@ function runTransformRegressionSmoke(module, session) {
   assertExpectedFailure(
     'off-bed XY placement',
     () => projectSliceOnce(module, session, {
-      schemaVersion: '0.3',
+      schemaVersion: '0.6.0',
       plateSelection: 'selected',
       plateIds: ['transform-plate'],
       includeGcode: true,
@@ -1440,7 +1440,7 @@ function runTransformRegressionSmoke(module, session) {
   assertExpectedFailure(
     'XY placement outside circular bed printable area',
     () => projectSliceOnce(module, session, {
-      schemaVersion: '0.3',
+      schemaVersion: '0.6.0',
       plateSelection: 'selected',
       plateIds: ['transform-plate'],
       includeGcode: true,
@@ -1486,7 +1486,7 @@ async function main() {
     '_onewasm_project_export',
     '_onewasm_obj_to_stl',
     '_onewasm_cad_to_stl',
-    '_onewasm_read_3mf',
+    '_onewasm_three_mf_to_stl',
     '_onewasm_get_capabilities',
     '_onewasm_last_error',
     '_onewasm_free',
@@ -1517,7 +1517,7 @@ async function main() {
     }
 
     for (const mesh of meshes) {
-      const stableProjectLabel = `[${mesh.label}] API 0.5.1 manifest, prepare, all/selected plate slicing`
+      const stableProjectLabel = `[${mesh.label}] API 0.6.0 manifest, prepare, all/selected plate slicing`
       let stableExportedProject = null
       process.stdout.write(`[smoke-test] ${stableProjectLabel} ... `)
       try {
@@ -1530,13 +1530,13 @@ async function main() {
         console.error(`  ${err.message}`)
       }
 
-      const stableProfileLabel = `[${mesh.label}] API 0.5.1 native project profile load/export`
+      const stableProfileLabel = `[${mesh.label}] API 0.6.0 native project profile load/export`
       process.stdout.write(`[smoke-test] ${stableProfileLabel} ... `)
       try {
         if (!stableExportedProject) throw new Error('project export did not produce a profile package')
         initProfileOnce(module, stableSession, stableExportedProject)
         const loadedManifest = projectGetManifestOnce(module, stableSession)
-        if (loadedManifest?.schemaVersion !== '0.5'
+        if (loadedManifest?.schemaVersion !== '0.6.0'
           || !Array.isArray(loadedManifest.plates)
           || !Array.isArray(loadedManifest.meshes)
           || !Array.isArray(loadedManifest.objects)
@@ -1545,11 +1545,11 @@ async function main() {
           throw new Error('native project profile did not expose a complete 0.5 manifest')
         }
         const passthrough = projectExportOnce(module, stableSession, 'project.3mf', {
-          schemaVersion: '0.3',
+          schemaVersion: '0.6.0',
           preservation: 'require',
           includeSliceArtifacts: false,
         })
-        if (passthrough?.schemaVersion !== '0.3'
+        if (passthrough?.schemaVersion !== '0.6.0'
           || passthrough.asset?.kind !== 'project'
           || passthrough.asset?.byteLength !== stableExportedProject.length) {
           throw new Error('native project profile did not support preservation=require export')
@@ -1588,7 +1588,7 @@ async function main() {
       }
     }
 
-    const transformLabel = 'API 0.5.1 asymmetric object-transform and placement regression coverage'
+    const transformLabel = 'API 0.6.0 asymmetric object-transform and placement regression coverage'
     process.stdout.write('[smoke-test] ' + transformLabel + ' ... ')
     try {
       runTransformRegressionSmoke(module, stableSession)
