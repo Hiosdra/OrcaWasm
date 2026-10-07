@@ -327,6 +327,24 @@ verify_contains(
 )
 
 # =============================================================================
+# 4a.3. Boost.Filesystem copy_options compatibility in OrcaSlicer v2.4.2
+#       Boost 1.92 removed the singular copy_option enum and renamed its
+#       overwrite_if_exists value to copy_options::overwrite_existing.
+# =============================================================================
+patch("src/libslic3r/utils.cpp", [
+    (
+        r'boost::filesystem::copy_option::overwrite_if_exists',
+        r'boost::filesystem::copy_options::overwrite_existing',
+        1,
+    ),
+])
+verify_contains(
+    "src/libslic3r/utils.cpp",
+    "boost::filesystem::copy_options::overwrite_existing",
+    "Boost.Filesystem copy_options compatibility patch",
+)
+
+# =============================================================================
 # 4b. Override headers — copy into orca/ source tree
 #     GCC/Clang search the *including file's* directory before any -I path
 #     for #include "..." directives, so the only reliable way to override a
