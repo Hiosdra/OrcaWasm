@@ -110,10 +110,13 @@ project export with slice artifacts and preservation, OBJ/STEP/3MF conversion,
 and cancellation as supported. STEP project meshes are imported and tessellated
 through OrcaSlicer's native reader, then sliced through the project path;
 `project.meshFormat.step` remains `partial` while unit, sheet-body, and warning
-conformance is completed. The engine exports `getPreview` but reports
-`project.preview.stepFaces` as `unsupported`; painted face attributes are also
-`unsupported`. Hosts must read every optional status from the capability
-document and must not infer support from an exported C symbol.
+conformance is completed. The engine reports mapped STEP previews and painted
+STEP face attributes as `partial`: the preview returns the original Part 21
+face labels alongside Orca's tessellation, and seam preferences are applied
+through Orca's native seam annotations. Files whose tessellation cannot be
+mapped completely return `UNSUPPORTED`; triangle-domain attributes and other
+STEP semantics are not advertised. Hosts must read every optional status from
+the capability document and must not infer support from an exported C symbol.
 
 Cancellation also covers running operations in the TypeScript binding. The
 reference glue calls the synchronous C ABI on the runtime's JS thread, where a
@@ -126,9 +129,10 @@ remains usable. C callers keep the synchronous ABI and call `oneslicer_cancel`
 from another thread. `scripts/binding-test.mjs` checks this in CI.
 
 Engine-mapped STEP preview and per-face attributes are part of the normative
-0.7.0-pre.1 contract. This build exports the preview operation but reports both
-capabilities as unsupported until it can preserve source-face identity and
-apply advertised painted semantics through slicing.
+0.7.0-pre.1 contract. This build preserves source-face labels through the
+engine's STEP tessellation and applies the advertised seam preference to the
+corresponding triangles during slicing. The remaining face semantics stay
+unadvertised until Orca's slicing pipeline can honor them.
 
 Every payload (project manifest, prepare/slice/export requests and results,
 slice statistics) uses `schemaVersion: "0.7.0-pre.1"`, the API version, including
