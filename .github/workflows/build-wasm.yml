@@ -185,10 +185,10 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/ccache
-          key: wasm-ccache-${{ runner.os }}-mt-orca-${{ env.ORCA_VERSION }}-${{ github.run_id }}
+          key: wasm-ccache-${{ runner.os }}-mt-emsdk-${{ env.EMSDK_VERSION }}-orca-${{ env.ORCA_VERSION }}-${{ github.run_id }}
           restore-keys: |
-            wasm-ccache-${{ runner.os }}-mt-orca-${{ env.ORCA_VERSION }}-
-            wasm-ccache-${{ runner.os }}-mt-
+            wasm-ccache-${{ runner.os }}-mt-emsdk-${{ env.EMSDK_VERSION }}-orca-${{ env.ORCA_VERSION }}-
+            wasm-ccache-${{ runner.os }}-mt-emsdk-${{ env.EMSDK_VERSION }}-
 
       - name: Configure ccache
         run: |
@@ -218,10 +218,10 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: deps-install
-          key: wasm-deps-${{ runner.os }}-mt-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-onetbb-${{ env.ONETBB_VERSION }}-native-eh-v18
-          # On a key bump, fall back to the closest previous cache. Stamp files
-          # make partial deps-install safe, so only changed deps get rebuilt
-          # instead of redoing the full ~3 h build (OCCT alone is ~45 min).
+          key: wasm-deps-${{ runner.os }}-mt-emsdk-${{ env.EMSDK_VERSION }}-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-onetbb-${{ env.ONETBB_VERSION }}-native-eh-v19
+          # Reuse partial dependency caches only with the same Emscripten ABI.
+          # On a key bump, restore the closest cache for this SDK; stamp files
+          # then rebuild only libraries whose own source or flags changed.
           # NOTE: because of this fallback, bumping a dependency's pinned
           # version here is NOT enough to force a rebuild of it — the stamp
           # file for that step must also change (see the OCCT step's
@@ -230,9 +230,9 @@ jobs:
           # Eigen 3.4.0->5.0.1 in 840c260 kept resolving against a restored
           # 3.4.0 install because .headers_built wasn't version-suffixed.
           restore-keys: |
-            wasm-deps-${{ runner.os }}-mt-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-
-            wasm-deps-${{ runner.os }}-mt-orca-${{ env.ORCA_VERSION }}-
-            wasm-deps-${{ runner.os }}-mt-
+            wasm-deps-${{ runner.os }}-mt-emsdk-${{ env.EMSDK_VERSION }}-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-
+            wasm-deps-${{ runner.os }}-mt-emsdk-${{ env.EMSDK_VERSION }}-orca-${{ env.ORCA_VERSION }}-
+            wasm-deps-${{ runner.os }}-mt-emsdk-${{ env.EMSDK_VERSION }}-
 
       # ── Boost ────────────────────────────────────────────────────────
       # Build Boost using b2 with the clang-emscripten toolset.  The standard
@@ -263,15 +263,9 @@ jobs:
           BOOST_VERSION="1.90.0"
           BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
           INSTALL="$(pwd)/deps-install"
-          # _v3 suffix: manually bumped, not tied to BOOST_VERSION — the
-          # BOOST_LOG_NO_THREADS fix above changed Boost's build *flags*,
-          # not its pinned version, so BOOST_VERSION alone wouldn't
-          # invalidate a stale cached build. Restore-keys below prefix-match
-          # regardless of this suffix (see "Restore dep cache"'s own
-          # comment on why a version bump alone isn't sufficient), so
-          # without this the job could restore its OLD, wrongly-built
-          # libboost_log.a from cache and skip rebuilding it entirely.
-          STAMP="${INSTALL}/.boost_built_mt_native_eh_v3"
+          # The dependency cache is scoped to the Emscripten version; this
+          # stamp additionally records the Boost source and build flags.
+          STAMP="${INSTALL}/.boost_built_${BOOST_VERSION}_mt_native_eh_v4"
           mkdir -p "${INSTALL}"
           [[ -f "${STAMP}" ]] && echo "[boost] stamp exists — skip" && exit 0
 
@@ -344,7 +338,7 @@ jobs:
         run: |
           source "$EMSDK/emsdk_env.sh"
           INSTALL="$(pwd)/deps-install"
-          STAMP="${INSTALL}/.math_built_mt_native_eh_v2"
+          STAMP="${INSTALL}/.math_built_mt_native_eh_v3"
           [[ -f "${STAMP}" ]] && echo "[math] stamp exists — skip" && exit 0
 
           GMP_VERSION=6.3.0
@@ -418,7 +412,7 @@ jobs:
           # differ by -pthread) so that bumping either invalidates it even
           # if the cache step above only fell back to an older cache via
           # restore-keys.
-          STAMP="${INSTALL}/.headers_built_eigen5.0.1_nlohmann3.11.3_expat2.5.0_nlopt2.7.1_cereal1.3.2_mt_native_eh_v1"
+          STAMP="${INSTALL}/.headers_built_eigen5.0.1_nlohmann3.11.3_expat2.5.0_nlopt2.7.1_cereal1.3.2_mt_native_eh_v2"
           [[ -f "${STAMP}" ]] && echo "[headers+expat+nlopt] cached" && exit 0
 
           # ── Eigen3 (header-only, install cmake config) ────────────────
@@ -494,7 +488,7 @@ jobs:
         run: |
           source "$EMSDK/emsdk_env.sh"
           INSTALL="$(pwd)/deps-install"
-          STAMP="${INSTALL}/.libnoise_built_mt_native_eh_v1"
+          STAMP="${INSTALL}/.libnoise_built_mt_native_eh_v2"
           [[ -f "${STAMP}" ]] && echo "[libnoise] stamp exists — skip" && exit 0
 
           echo "[libnoise] downloading Orca-deps-libnoise 1.0…"
@@ -681,7 +675,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: deps-install
-          key: wasm-deps-${{ runner.os }}-mt-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-onetbb-${{ env.ONETBB_VERSION }}-native-eh-v18
+          key: wasm-deps-${{ runner.os }}-mt-emsdk-${{ env.EMSDK_VERSION }}-orca-${{ env.ORCA_VERSION }}-occt-${{ env.OCCT_VERSION }}-onetbb-${{ env.ONETBB_VERSION }}-native-eh-v19
 
       # ── Configure WASM build ─────────────────────────────────────────
       # Builds from OrcaSlicer's own root cmake (with our patches applied).

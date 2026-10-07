@@ -67,15 +67,9 @@ source "$EMSDK/emsdk_env.sh"
 BOOST_VERSION="1.90.0"
 BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
-# _v3 suffix: manually bumped, not tied to BOOST_VERSION — the
-# BOOST_LOG_NO_THREADS fix above changed Boost's build *flags*,
-# not its pinned version, so BOOST_VERSION alone wouldn't
-# invalidate a stale cached build. Restore-keys below prefix-match
-# regardless of this suffix (see "Restore dep cache"'s own
-# comment on why a version bump alone isn't sufficient), so
-# without this the job could restore its OLD, wrongly-built
-# libboost_log.a from cache and skip rebuilding it entirely.
-STAMP="${INSTALL}/.boost_built_mt_native_eh_v3"
+# The dependency cache is scoped to the Emscripten version; this
+# stamp additionally records the Boost source and build flags.
+STAMP="${INSTALL}/.boost_built_${BOOST_VERSION}_mt_native_eh_v4"
 mkdir -p "${INSTALL}"
 [[ -f "${STAMP}" ]] && echo "[boost] stamp exists — skip" && exit 0
 
@@ -139,7 +133,7 @@ touch "${STAMP}"
 (
 source "$EMSDK/emsdk_env.sh"
 INSTALL="$(pwd)/deps-install"
-STAMP="${INSTALL}/.math_built_mt_native_eh_v2"
+STAMP="${INSTALL}/.math_built_mt_native_eh_v3"
 [[ -f "${STAMP}" ]] && echo "[math] stamp exists — skip" && exit 0
 
 GMP_VERSION=6.3.0
@@ -211,7 +205,7 @@ INSTALL="$(pwd)/deps-install"
 # differ by -pthread) so that bumping either invalidates it even
 # if the cache step above only fell back to an older cache via
 # restore-keys.
-STAMP="${INSTALL}/.headers_built_eigen5.0.1_nlohmann3.11.3_expat2.5.0_nlopt2.7.1_cereal1.3.2_mt_native_eh_v1"
+STAMP="${INSTALL}/.headers_built_eigen5.0.1_nlohmann3.11.3_expat2.5.0_nlopt2.7.1_cereal1.3.2_mt_native_eh_v2"
 [[ -f "${STAMP}" ]] && echo "[headers+expat+nlopt] cached" && exit 0
 
 # ── Eigen3 (header-only, install cmake config) ────────────────
@@ -285,7 +279,7 @@ touch "${STAMP}"
 (
 source "$EMSDK/emsdk_env.sh"
 INSTALL="$(pwd)/deps-install"
-STAMP="${INSTALL}/.libnoise_built_mt_native_eh_v1"
+STAMP="${INSTALL}/.libnoise_built_mt_native_eh_v2"
 [[ -f "${STAMP}" ]] && echo "[libnoise] stamp exists — skip" && exit 0
 
 echo "[libnoise] downloading Orca-deps-libnoise 1.0…"
