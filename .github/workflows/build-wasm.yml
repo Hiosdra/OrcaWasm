@@ -172,9 +172,8 @@ jobs:
           for tool in cmake ninja python3 pkg-config m4 texi2any; do
             command -v "$tool"
           done
-          # Bound slow mirror responses so apt cannot hold up the whole WASM job.
+          # Keep the runner's package indexes; refreshing every Ubuntu mirror can stall.
           APT_OPTIONS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
-          timeout 5m sudo apt-get "${APT_OPTIONS[@]}" update -qq
           timeout 5m sudo apt-get "${APT_OPTIONS[@]}" install -y --no-install-recommends ccache
 
       # ── ccache ───────────────────────────────────────────────────────
