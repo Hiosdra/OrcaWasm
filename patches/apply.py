@@ -411,6 +411,7 @@ patch("src/libslic3r/Format/STEP.cpp", [
         '        m_transfer_reader.Nullify();\n'
         '        if (!m_step_model.IsNull() && !m_work_session.IsNull() && !m_work_session->TransferReader().IsNull()) {\n'
         '            m_transfer_reader = m_work_session->TransferReader();\n'
+        '            m_transfer_reader->SetTransientProcess(reader.Reader().TransientProcess());\n'
         '            for (Standard_Integer entity_index = 1; entity_index <= m_step_model->NbEntities(); ++entity_index) {\n'
         '                const Handle(Standard_Transient) entity = m_step_model->Value(entity_index);\n'
         '                if (entity.IsNull() || (!entity->IsKind(STANDARD_TYPE(StepShape_AdvancedFace)) && !entity->IsKind(STANDARD_TYPE(StepShape_FaceSurface)))) continue;\n'
