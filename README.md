@@ -112,15 +112,10 @@ project export with slice artifacts and preservation, OBJ/STEP/3MF conversion,
 and cancellation as supported. STEP project meshes are imported and tessellated
 through OrcaSlicer's native reader, then sliced through the project path;
 `project.meshFormat.step` remains `partial` while unit, sheet-body, and warning
-conformance is completed. The engine reports mapped STEP previews and painted
-STEP face attributes as `partial`: the preview returns the original Part 21
-face labels alongside Orca's tessellation, and seam preferences are applied
-through Orca's native seam annotations. A valid source face with no generated
-triangles is retained in the manifest but has no seam effect. A mapped preview
-returns `UNSUPPORTED` if any output triangle cannot be linked to an original
-face. Triangle-domain attributes and other STEP semantics are not advertised.
-Hosts must read every optional status from the capability document and must
-not infer support from an exported C symbol.
+conformance is completed. Mapped STEP previews and project face attributes are
+reported as `unsupported`; `oneslicer_project_get_preview` remains exported by
+the C ABI and returns `UNSUPPORTED`. Hosts must read every optional status from
+the capability document and must not infer support from an exported C symbol.
 
 Cancellation also covers running operations in the TypeScript binding. The
 reference glue calls the synchronous C ABI on the runtime's JS thread, where a
@@ -132,11 +127,8 @@ the signal aborts. The operation then rejects with `CANCELLED` and the session
 remains usable. C callers keep the synchronous ABI and call `oneslicer_cancel`
 from another thread. `scripts/binding-test.mjs` checks this in CI.
 
-Engine-mapped STEP preview and per-face attributes are part of the normative
-0.7.0-pre.1 contract. This build preserves source-face labels through the
-engine's STEP tessellation and applies the advertised seam preference to the
-corresponding triangles during slicing. The remaining face semantics stay
-unadvertised until Orca's slicing pipeline can honor them.
+Mapped previews and face attributes remain optional parts of the normative
+0.7.0-pre.1 contract. This engine does not advertise or implement them.
 
 Every payload (project manifest, prepare/slice/export requests and results,
 slice statistics) uses `schemaVersion: "0.7.0-pre.1"`, the API version, including

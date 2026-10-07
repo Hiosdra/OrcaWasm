@@ -908,130 +908,10 @@ struct TempFileGuard {
     TempFileGuard& operator=(const TempFileGuard&) = delete;
 };
 
-using StepFaceAttributeValues = std::map<std::string, std::map<std::uint32_t, std::uint16_t>>;
-
-static std::uint32_t read_u32_le(const std::uint8_t* bytes) {
-    return static_cast<std::uint32_t>(bytes[0])
-        | (static_cast<std::uint32_t>(bytes[1]) << 8)
-        | (static_cast<std::uint32_t>(bytes[2]) << 16)
-        | (static_cast<std::uint32_t>(bytes[3]) << 24);
-}
-
-static std::uint16_t read_u16_le(const std::uint8_t* bytes) {
-    return static_cast<std::uint16_t>(bytes[0])
-        | static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[1]) << 8);
-}
-
-static oneslicer_status_t decode_step_face_attributes(
-    const ProjectMeshInput& mesh,
-    const std::uint8_t* object_blob,
-    const std::vector<std::uint32_t>& source_face_ids,
-    StepFaceAttributeValues& values,
-    std::string& error
-) {
-    values.clear();
-    if (mesh.face_attributes.empty()) return ONESLICER_OK;
-
-    const std::set<std::uint32_t> known_face_ids(source_face_ids.begin(), source_face_ids.end());
-    for (const auto& attribute : mesh.face_attributes) {
-        if (attribute.semantic != "seam") {
-            error = "OrcaSlicer does not implement the STEP face semantic: " + attribute.semantic;
-            return ONESLICER_ERR_UNSUPPORTED;
-        }
-        const std::uint32_t value_size = attribute.format == "u8" ? 1 : 2;
-        const std::uint32_t record_size = 4 + value_size;
-        if (attribute.length == 0 || attribute.length % record_size != 0) {
-            error = "STEP face attribute data length is not a whole number of face/value records";
-            return ONESLICER_ERR_VALIDATION;
-        }
-        std::uint32_t previous_face_id = 0;
-        auto& semantic_values = values[attribute.semantic];
-        for (std::uint32_t offset = 0; offset < attribute.length; offset += record_size) {
-            const std::uint8_t* record = object_blob + attribute.offset + offset;
-            const std::uint32_t face_id = read_u32_le(record);
-            const std::uint16_t value = value_size == 1 ? record[4] : read_u16_le(record + 4);
-            if (face_id == 0 || face_id <= previous_face_id) {
-                error = "STEP face attribute entity ids must be positive and strictly ascending";
-                return ONESLICER_ERR_VALIDATION;
-            }
-            if (known_face_ids.find(face_id) == known_face_ids.end()) {
-                error = "STEP face attribute references an entity that is not a transferred face";
-                return ONESLICER_ERR_VALIDATION;
-            }
-            if (value > 2) {
-                error = "STEP seam attribute values must be 0, 1, or 2";
-                return ONESLICER_ERR_VALIDATION;
-            }
-            if (value != 0) semantic_values.emplace(face_id, value);
-            previous_face_id = face_id;
-        }
-    }
-    return ONESLICER_OK;
-}
-
-static oneslicer_status_t apply_step_face_attributes(
-    const ProjectMeshInput& mesh_input,
-    const std::uint8_t* object_blob,
-    const std::vector<std::uint32_t>& source_face_ids,
-    const std::vector<std::uint32_t>& triangle_face_ids,
-    Slic3r::Model& model,
-    std::size_t first_object,
-    std::string& error
-) {
-    StepFaceAttributeValues values;
-    const oneslicer_status_t decode_status = decode_step_face_attributes(
-        mesh_input, object_blob, source_face_ids, values, error
-    );
-    if (decode_status != ONESLICER_OK) return decode_status;
-    if (values.empty()) return ONESLICER_OK;
-
-    std::size_t triangle_offset = 0;
-    for (std::size_t object_index = first_object; object_index < model.objects.size(); ++object_index) {
-        auto* object = model.objects[object_index];
-        if (!object) continue;
-        for (auto* volume : object->volumes) {
-            if (!volume) continue;
-            const std::size_t triangle_count = volume->mesh().facets_count();
-            if (triangle_count > static_cast<std::size_t>(std::numeric_limits<int>::max())
-                || triangle_offset > triangle_face_ids.size()
-                || triangle_count > triangle_face_ids.size() - triangle_offset) {
-                error = "OrcaSlicer loaded STEP preview geometry with an unexpected triangle layout";
-                return ONESLICER_ERR_UNSUPPORTED;
-            }
-            const auto seam = values.find("seam");
-            for (std::size_t local_triangle = 0; local_triangle < triangle_count; ++local_triangle) {
-                const std::uint32_t face_id = triangle_face_ids[triangle_offset + local_triangle];
-                if (seam != values.end()) {
-                    const auto value = seam->second.find(face_id);
-                    if (value != seam->second.end()) {
-                        // TriangleSelector's state is stored in bits 2-3 of its
-                        // four-bit state code (the low two bits encode splits):
-                        // ENFORCER=1 is "4" and BLOCKER=2 is "8". Passing
-                        // "1"/"2" here is decoded as a triangle split and can
-                        // make SeamPlacer read past the selector's geometry.
-                        const char selector_code = value->second == 1 ? '4' : '8';
-                        volume->seam_facets.set_triangle_from_string(
-                            static_cast<int>(local_triangle), std::string(1, selector_code)
-                        );
-                    }
-                }
-            }
-            triangle_offset += triangle_count;
-        }
-    }
-    if (triangle_offset != triangle_face_ids.size()) {
-        error = "OrcaSlicer loaded STEP preview geometry with an unexpected triangle count";
-        return ONESLICER_ERR_UNSUPPORTED;
-    }
-    return ONESLICER_OK;
-}
-
 static oneslicer_status_t convert_project_step_to_stl(
     const char* step_path,
     const char* stl_path,
-    std::string& error,
-    std::vector<std::uint32_t>* out_triangle_face_ids = nullptr,
-    std::vector<std::uint32_t>* out_source_face_entity_ids = nullptr
+    std::string& error
 ) {
     Slic3r::Model step_model;
     try {
@@ -1046,10 +926,6 @@ static oneslicer_status_t convert_project_step_to_stl(
             error = "OrcaSlicer could not tessellate the project STEP model";
             return ONESLICER_ERR_INPUT_FORMAT;
         }
-        if (out_triangle_face_ids)
-            *out_triangle_face_ids = step_importer.triangle_face_ids();
-        if (out_source_face_entity_ids)
-            *out_source_face_entity_ids = step_importer.source_face_entity_ids();
     } catch (const std::exception& exception) {
         error = std::string("OrcaSlicer could not import project STEP mesh: ") + exception.what();
         return ONESLICER_ERR_INPUT_FORMAT;
@@ -1069,10 +945,6 @@ static oneslicer_status_t convert_project_step_to_stl(
     if (combined.facets_count() == 0) {
         error = "project STEP mesh tessellated to no printable facets";
         return ONESLICER_ERR_EMPTY_INPUT;
-    }
-    if (out_triangle_face_ids && out_triangle_face_ids->size() != combined.facets_count()) {
-        error = "OrcaSlicer STEP face mapping does not match the tessellated triangle count";
-        return ONESLICER_ERR_INTERNAL;
     }
     if (!Slic3r::store_stl(stl_path, &combined, true)) {
         error = "OrcaSlicer could not stage the project STEP tessellation";
@@ -2340,13 +2212,9 @@ static oneslicer_status_t build_project_plate_model(
         const std::string converted_path = path + ".tessellated.stl";
         TempFileGuard converted_guard(converted_path);
         const char* staged_stl_path = path.c_str();
-        std::vector<std::uint32_t> triangle_face_ids;
-        std::vector<std::uint32_t> source_face_ids;
         if (is_step_mesh) {
             const auto step_status = convert_project_step_to_stl(
-                path.c_str(), converted_path.c_str(), error,
-                mesh_input->has_face_attributes ? &triangle_face_ids : nullptr,
-                mesh_input->has_face_attributes ? &source_face_ids : nullptr
+                path.c_str(), converted_path.c_str(), error
             );
             if (step_status != ONESLICER_OK) return step_status;
             staged_stl_path = converted_path.c_str();
@@ -2361,19 +2229,6 @@ static oneslicer_status_t build_project_plate_model(
             error = "project mesh contains no printable objects: " + mesh_input->id;
             return ONESLICER_ERR_EMPTY_INPUT;
         }
-        if (is_step_mesh && mesh_input->has_face_attributes) {
-            const auto attribute_status = apply_step_face_attributes(
-                *mesh_input,
-                session.project_object_blob.data(),
-                source_face_ids,
-                triangle_face_ids,
-                model,
-                first_object,
-                error
-            );
-            if (attribute_status != ONESLICER_OK) return attribute_status;
-        }
-
         Slic3r::Transform3d matrix = Slic3r::Transform3d::Identity();
         for (int row = 0; row < 4; ++row) {
             for (int column = 0; column < 4; ++column) {
@@ -3563,8 +3418,8 @@ oneslicer_status_t oneslicer_get_capabilities(uint8_t** out_json, uint32_t* out_
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
-  "project":{"meshFormats":["stl","step"],"faceAttributeSemantics":{"triangle":[],"brepFace":["seam"]},"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.meshFormat.step":"partial","project.preview.stepFaces":"partial","project.faceAttributes":"partial","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
+  "project":{"meshFormats":["stl","step"],"faceAttributeSemantics":{"triangle":[],"brepFace":[]},"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.meshFormat.step":"partial","project.preview.stepFaces":"unsupported","project.faceAttributes":"unsupported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
@@ -3642,17 +3497,9 @@ oneslicer_status_t oneslicer_project_set_objects(
     }
 
     for (const auto& mesh : parsed.meshes) {
-        if (!mesh.has_face_attributes) continue;
-        if (mesh.format != "step") {
-            record_error(*session, "OrcaSlicer does not implement triangle-domain face attributes");
+        if (mesh.has_face_attributes) {
+            record_error(*session, "OrcaSlicer does not implement project face attributes");
             return ONESLICER_ERR_UNSUPPORTED;
-        }
-        const bool referenced_by_object = std::any_of(parsed.objects.begin(), parsed.objects.end(), [&mesh](const auto& object) {
-            return object.mesh_id == mesh.id;
-        });
-        if (!referenced_by_object) {
-            record_error(*session, "face attributes are not valid on STEP meshes used only by modifier volumes");
-            return ONESLICER_ERR_VALIDATION;
         }
     }
 
@@ -3681,25 +3528,12 @@ oneslicer_status_t oneslicer_project_set_objects(
         const std::string preview_path = step_path + ".validated.stl";
         TempFileGuard preview_guard(preview_path);
         std::string step_error;
-        std::vector<std::uint32_t> source_face_ids;
         const oneslicer_status_t step_status = convert_project_step_to_stl(
-            step_path.c_str(), preview_path.c_str(), step_error,
-            nullptr,
-            mesh.has_face_attributes ? &source_face_ids : nullptr
+            step_path.c_str(), preview_path.c_str(), step_error
         );
         if (step_status != ONESLICER_OK) {
             record_error(*session, step_error);
             return step_status;
-        }
-        if (mesh.has_face_attributes) {
-            StepFaceAttributeValues ignored_values;
-            const oneslicer_status_t attribute_status = decode_step_face_attributes(
-                mesh, object_blob, source_face_ids, ignored_values, step_error
-            );
-            if (attribute_status != ONESLICER_OK) {
-                record_error(*session, step_error);
-                return attribute_status;
-            }
         }
     }
 
@@ -3768,140 +3602,8 @@ oneslicer_status_t oneslicer_project_get_preview(
         record_error(*session, "mapped preview requires a mesh id and all output pointers");
         return ONESLICER_ERR_INVALID_ARGUMENT;
     }
-    try {
-        const std::string requested_mesh_id(mesh_id_utf8, mesh_id_len);
-        const nlohmann::json& meshes = session->project_manifest.is_object()
-            && session->project_manifest.contains("meshes")
-            ? session->project_manifest.at("meshes") : nlohmann::json::array();
-        if (!meshes.is_array()) {
-            record_error(*session, "active project mesh list is invalid");
-            return ONESLICER_ERR_INTERNAL;
-        }
-        const nlohmann::json* mesh = nullptr;
-        for (const auto& candidate : meshes) {
-            if (candidate.is_object() && candidate.value("id", std::string()) == requested_mesh_id) {
-                mesh = &candidate;
-                break;
-            }
-        }
-        if (!mesh) {
-            record_error(*session, "project mesh was not found: " + requested_mesh_id);
-            return ONESLICER_ERR_NO_DATA;
-        }
-        if (!mesh->contains("format") || !mesh->at("format").is_string()
-            || mesh->at("format").get<std::string>() != "step") {
-            record_error(*session, "mapped source-face previews are only supported for STEP project meshes");
-            return ONESLICER_ERR_UNSUPPORTED;
-        }
-        if (!mesh->contains("dataRange") || !mesh->at("dataRange").is_object()
-            || !mesh->at("dataRange").contains("offset") || !mesh->at("dataRange").contains("length")) {
-            record_error(*session, "STEP project mesh has no host-readable source range");
-            return ONESLICER_ERR_UNSUPPORTED;
-        }
-        const std::uint32_t offset = mesh->at("dataRange").at("offset").get<std::uint32_t>();
-        const std::uint32_t length = mesh->at("dataRange").at("length").get<std::uint32_t>();
-        if (length == 0 || static_cast<std::uint64_t>(offset) + length > session->project_object_blob.size()) {
-            record_error(*session, "STEP project mesh source range is unavailable");
-            return ONESLICER_ERR_NO_DATA;
-        }
-
-        const std::string step_path = "/tmp/ow-project-preview-" + std::to_string(session->id)
-            + "-" + std::to_string(session->project_preview_revision) + ".step";
-        const std::string stl_path = step_path + ".stl";
-        TempFileGuard step_guard(step_path);
-        TempFileGuard stl_guard(stl_path);
-        FILE* step_file = std::fopen(step_path.c_str(), "wb");
-        if (!step_file) {
-            record_error(*session, "unable to stage STEP project mesh for preview");
-            return ONESLICER_ERR_INPUT_IO;
-        }
-        const std::size_t written = std::fwrite(
-            session->project_object_blob.data() + offset, 1, length, step_file
-        );
-        std::fclose(step_file);
-        if (written != length) {
-            record_error(*session, "unable to stage complete STEP project mesh for preview");
-            return ONESLICER_ERR_INPUT_IO;
-        }
-
-        std::string error;
-        std::vector<std::uint32_t> triangle_face_ids;
-        const oneslicer_status_t status = convert_project_step_to_stl(
-            step_path.c_str(), stl_path.c_str(), error, &triangle_face_ids
-        );
-        if (status != ONESLICER_OK) {
-            record_error(*session, error);
-            return status;
-        }
-        if (triangle_face_ids.empty()
-            || std::any_of(triangle_face_ids.begin(), triangle_face_ids.end(), [](std::uint32_t id) { return id == 0; })) {
-            record_error(*session, "OrcaSlicer could not map every preview triangle to an original STEP face entity");
-            return ONESLICER_ERR_UNSUPPORTED;
-        }
-
-        std::vector<std::uint8_t> geometry;
-        if (!read_binary_file(stl_path.c_str(), geometry)) {
-            record_error(*session, "unable to read the generated STEP preview geometry");
-            return ONESLICER_ERR_OUTPUT;
-        }
-        const std::uint64_t expected_geometry_length = 84ULL + 50ULL * triangle_face_ids.size();
-        if (triangle_face_ids.size() > UINT32_MAX || geometry.size() != expected_geometry_length
-            || geometry.size() > UINT32_MAX) {
-            record_error(*session, "generated STEP preview has an invalid binary STL layout");
-            return ONESLICER_ERR_OUTPUT;
-        }
-        const std::uint32_t stl_triangle_count = read_u32_le(geometry.data() + 80);
-        if (stl_triangle_count != triangle_face_ids.size()) {
-            record_error(*session, "generated STEP preview triangle count disagrees with its face mapping");
-            return ONESLICER_ERR_OUTPUT;
-        }
-
-        const std::uint32_t geometry_length = static_cast<std::uint32_t>(geometry.size());
-        const std::uint32_t ids_length = static_cast<std::uint32_t>(triangle_face_ids.size() * 4ULL);
-        std::vector<std::uint8_t> preview_blob;
-        preview_blob.reserve(static_cast<std::size_t>(geometry_length) + ids_length);
-        preview_blob.insert(preview_blob.end(), geometry.begin(), geometry.end());
-        for (const std::uint32_t face_id : triangle_face_ids) {
-            preview_blob.push_back(static_cast<std::uint8_t>(face_id));
-            preview_blob.push_back(static_cast<std::uint8_t>(face_id >> 8));
-            preview_blob.push_back(static_cast<std::uint8_t>(face_id >> 16));
-            preview_blob.push_back(static_cast<std::uint8_t>(face_id >> 24));
-        }
-        if (preview_blob.size() > UINT32_MAX) {
-            record_error(*session, "mapped STEP preview exceeds the C ABI length limit");
-            return ONESLICER_ERR_OUTPUT;
-        }
-
-        nlohmann::json descriptor = {
-            {"schemaVersion", ONESLICER_API_VERSION_STRING},
-            {"meshId", requested_mesh_id},
-            {"revision", std::to_string(session->id) + ":" + std::to_string(session->project_preview_revision) + ":" + requested_mesh_id},
-            {"triangleCount", triangle_face_ids.size()},
-            {"geometryRange", {{"offset", 0}, {"length", geometry_length}}},
-            {"triangleFaceIdsRange", {{"offset", geometry_length}, {"length", ids_length}}},
-        };
-        const std::string descriptor_json = descriptor.dump();
-        if (!set_project_output(descriptor_json, out_descriptor_json, out_descriptor_len, session->last_error))
-            return ONESLICER_ERR_OUTPUT;
-        auto* preview_buffer = static_cast<std::uint8_t*>(std::malloc(std::max<std::size_t>(1, preview_blob.size())));
-        if (!preview_buffer) {
-            std::free(*out_descriptor_json);
-            *out_descriptor_json = nullptr;
-            *out_descriptor_len = 0;
-            record_error(*session, "out of memory");
-            return ONESLICER_ERR_OUTPUT;
-        }
-        std::memcpy(preview_buffer, preview_blob.data(), preview_blob.size());
-        *out_preview_blob = preview_buffer;
-        *out_preview_blob_len = static_cast<std::uint32_t>(preview_blob.size());
-        return ONESLICER_OK;
-    } catch (const std::bad_alloc&) {
-        record_error(*session, "out of memory while creating the STEP project preview");
-        return ONESLICER_ERR_OUTPUT;
-    } catch (const std::exception& exception) {
-        record_error(*session, std::string("could not create the STEP project preview: ") + exception.what());
-        return ONESLICER_ERR_INTERNAL;
-    }
+    record_error(*session, "OrcaSlicer does not implement mapped STEP previews");
+    return ONESLICER_ERR_UNSUPPORTED;
 }
 
 EMSCRIPTEN_KEEPALIVE
