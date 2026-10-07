@@ -897,6 +897,50 @@ struct TempFileGuard {
     TempFileGuard& operator=(const TempFileGuard&) = delete;
 };
 
+static oneslicer_status_t convert_project_step_to_stl(
+    const char* step_path,
+    const char* stl_path,
+    std::string& error
+) {
+    Slic3r::Model step_model;
+    try {
+        step_model = Slic3r::Model::read_from_step(
+            step_path,
+            Slic3r::LoadStrategy::AddDefaultInstances,
+            nullptr,
+            nullptr,
+            nullptr,
+            0.003,
+            0.5,
+            false
+        );
+    } catch (const std::exception& exception) {
+        error = std::string("OrcaSlicer could not import project STEP mesh: ") + exception.what();
+        return ONESLICER_ERR_INPUT_FORMAT;
+    }
+    if (step_model.objects.empty()) {
+        error = "project STEP mesh contains no printable geometry";
+        return ONESLICER_ERR_EMPTY_INPUT;
+    }
+
+    Slic3r::TriangleMesh combined;
+    for (auto* object : step_model.objects) {
+        if (!object) continue;
+        for (auto* volume : object->volumes) {
+            if (volume) combined.merge(volume->mesh());
+        }
+    }
+    if (combined.facets_count() == 0) {
+        error = "project STEP mesh tessellated to no printable facets";
+        return ONESLICER_ERR_EMPTY_INPUT;
+    }
+    if (!Slic3r::store_stl(stl_path, &combined, true)) {
+        error = "OrcaSlicer could not stage the project STEP tessellation";
+        return ONESLICER_ERR_OUTPUT;
+    }
+    return ONESLICER_OK;
+}
+
 // admesh classifies an STL as binary only when one of the 128 bytes after the
 // 84-byte header is above 127. Those bytes are facet data, so a binary STL
 // with zero normals and small positive coordinates (any box under 16 mm, for
@@ -2067,12 +2111,14 @@ static oneslicer_status_t build_project_plate_model(
             return ONESLICER_ERR_UNSUPPORTED;
         }
 
+        const bool is_step_mesh = mesh_input->format == "step";
         const std::string path = "/tmp/ow-project-slice-"
-            + std::to_string(session.id) + "-" + std::to_string(instance_index++) + ".stl";
+            + std::to_string(session.id) + "-" + std::to_string(instance_index++)
+            + (is_step_mesh ? ".step" : ".stl");
         TempFileGuard input_guard(path);
         FILE* file = std::fopen(path.c_str(), "wb");
         if (!file) {
-            error = "unable to stage project slice STL";
+            error = "unable to stage project slice mesh";
             return ONESLICER_ERR_INPUT_IO;
         }
         const std::size_t written = std::fwrite(
@@ -2083,12 +2129,23 @@ static oneslicer_status_t build_project_plate_model(
         );
         std::fclose(file);
         if (written != mesh_input->length) {
-            error = "unable to stage complete project slice STL";
+            error = "unable to stage complete project slice mesh";
             return ONESLICER_ERR_INPUT_IO;
         }
 
+        const std::string converted_path = path + ".tessellated.stl";
+        TempFileGuard converted_guard(converted_path);
+        const char* staged_stl_path = path.c_str();
+        if (is_step_mesh) {
+            const auto step_status = convert_project_step_to_stl(
+                path.c_str(), converted_path.c_str(), error
+            );
+            if (step_status != ONESLICER_OK) return step_status;
+            staged_stl_path = converted_path.c_str();
+        }
+
         const std::size_t first_object = model.objects.size();
-        if (!load_staged_stl(path.c_str(), &model, object_input->id.c_str())) {
+        if (!load_staged_stl(staged_stl_path, &model, object_input->id.c_str())) {
             error = "OrcaSlicer could not load project mesh " + mesh_input->id;
             return ONESLICER_ERR_INPUT_FORMAT;
         }
@@ -2141,12 +2198,14 @@ static oneslicer_status_t build_project_plate_model(
             return ONESLICER_ERR_UNSUPPORTED;
         }
 
+        const bool is_step_mesh = mesh_input->format == "step";
         const std::string path = "/tmp/ow-project-modifier-"
-            + std::to_string(session.id) + "-" + std::to_string(instance_index++) + ".stl";
+            + std::to_string(session.id) + "-" + std::to_string(instance_index++)
+            + (is_step_mesh ? ".step" : ".stl");
         TempFileGuard input_guard(path);
         FILE* file = std::fopen(path.c_str(), "wb");
         if (!file) {
-            error = "unable to stage project modifier STL";
+            error = "unable to stage project modifier mesh";
             return ONESLICER_ERR_INPUT_IO;
         }
         const std::size_t written = std::fwrite(
@@ -2157,12 +2216,23 @@ static oneslicer_status_t build_project_plate_model(
         );
         std::fclose(file);
         if (written != mesh_input->length) {
-            error = "unable to stage complete project modifier STL";
+            error = "unable to stage complete project modifier mesh";
             return ONESLICER_ERR_INPUT_IO;
         }
 
+        const std::string converted_path = path + ".tessellated.stl";
+        TempFileGuard converted_guard(converted_path);
+        const char* staged_stl_path = path.c_str();
+        if (is_step_mesh) {
+            const auto step_status = convert_project_step_to_stl(
+                path.c_str(), converted_path.c_str(), error
+            );
+            if (step_status != ONESLICER_OK) return step_status;
+            staged_stl_path = converted_path.c_str();
+        }
+
         Slic3r::Model modifier_model;
-        if (!load_staged_stl(path.c_str(), &modifier_model, modifier.id.c_str())
+        if (!load_staged_stl(staged_stl_path, &modifier_model, modifier.id.c_str())
             || modifier_model.objects.empty()) {
             error = "OrcaSlicer could not load project modifier mesh " + mesh_input->id;
             return ONESLICER_ERR_INPUT_FORMAT;
@@ -3272,8 +3342,8 @@ oneslicer_status_t oneslicer_get_capabilities(uint8_t** out_json, uint32_t* out_
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
-  "project":{"meshFormats":["stl"],"faceAttributeSemantics":{"triangle":[],"brepFace":[]},"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.meshFormat.step":"unsupported","project.preview.stepFaces":"unsupported","project.faceAttributes":"unsupported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
+  "project":{"meshFormats":["stl","step"],"faceAttributeSemantics":{"triangle":[],"brepFace":[]},"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.meshFormat.step":"partial","project.preview.stepFaces":"unsupported","project.faceAttributes":"unsupported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
@@ -3351,16 +3421,44 @@ oneslicer_status_t oneslicer_project_set_objects(
     }
 
     if (std::any_of(parsed.meshes.begin(), parsed.meshes.end(), [](const ProjectMeshInput& mesh) {
-            return mesh.format == "step";
-        })) {
-        record_error(*session, "STEP project meshes are not supported by this engine build");
-        return ONESLICER_ERR_UNSUPPORTED;
-    }
-    if (std::any_of(parsed.meshes.begin(), parsed.meshes.end(), [](const ProjectMeshInput& mesh) {
             return mesh.has_face_attributes;
         })) {
         record_error(*session, "project face attributes are not supported by this engine build");
         return ONESLICER_ERR_UNSUPPORTED;
+    }
+
+    std::size_t step_validation_index = 0;
+    for (const auto& mesh : parsed.meshes) {
+        if (mesh.format != "step") continue;
+        const std::string step_path = "/tmp/ow-project-validate-step-"
+            + std::to_string(session->id) + "-" + std::to_string(step_validation_index++) + ".step";
+        TempFileGuard step_guard(step_path);
+        FILE* file = std::fopen(step_path.c_str(), "wb");
+        if (!file) {
+            record_error(*session, "unable to stage project STEP mesh for validation");
+            return ONESLICER_ERR_INPUT_IO;
+        }
+        const std::size_t written = std::fwrite(
+            object_blob + mesh.offset,
+            1,
+            mesh.length,
+            file
+        );
+        std::fclose(file);
+        if (written != mesh.length) {
+            record_error(*session, "unable to stage complete project STEP mesh for validation");
+            return ONESLICER_ERR_INPUT_IO;
+        }
+        const std::string preview_path = step_path + ".validated.stl";
+        TempFileGuard preview_guard(preview_path);
+        std::string step_error;
+        const oneslicer_status_t step_status = convert_project_step_to_stl(
+            step_path.c_str(), preview_path.c_str(), step_error
+        );
+        if (step_status != ONESLICER_OK) {
+            record_error(*session, step_error);
+            return step_status;
+        }
     }
 
     try {

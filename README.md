@@ -79,6 +79,7 @@ oneslicer_session_create / oneslicer_session_destroy
 oneslicer_init / oneslicer_init_profile / oneslicer_apply_profile / oneslicer_set_progress_callback
 oneslicer_cancel
 oneslicer_project_set_objects / oneslicer_project_get_manifest
+oneslicer_project_get_preview
 oneslicer_project_prepare / oneslicer_project_slice
 oneslicer_project_get_asset / oneslicer_project_export
 oneslicer_obj_to_stl / oneslicer_cad_to_stl / oneslicer_three_mf_to_stl
@@ -91,7 +92,7 @@ project `.3mf` is loaded as a native profile with `initProfile("project.3mf", ..
 
 To update the API, copy `js/glue/oneslicer-emscripten-glue.js`,
 `js/glue/oneslicer-conformance.mjs` and `include/oneslicer_api.h` unmodified
-from the API release.
+from the API release into `wasm/oneslicer/` and `bridge/` respectively.
 
 ## one-slicer-api compatibility
 
@@ -105,9 +106,13 @@ The host must reject this engine if a required feature is absent or not
 All other features are optional and are selected from `oneslicer_get_capabilities`
 at runtime. This build reports profile initialization/application, modifier
 volumes and native modifier preservation, prepare/arrange, multi-plate slicing,
-project export with slice artifacts and preservation, OBJ/STEP/3MF
-conversion, and cancellation as supported. Every API feature is therefore
-`supported`; callers still select optional features from the capability
+project export with slice artifacts and preservation, OBJ/STEP/3MF conversion,
+and cancellation as supported. STEP project meshes are imported and tessellated
+through OrcaSlicer's native reader, then sliced through the project path;
+`project.meshFormat.step` remains `partial` while unit, sheet-body, and warning
+conformance is completed. The engine exports `getPreview` but reports
+`project.preview.stepFaces` as `unsupported`; painted face attributes are also
+`unsupported`. Hosts must read every optional status from the capability
 document and must not infer support from an exported C symbol.
 
 Cancellation also covers running operations in the TypeScript binding. The
@@ -120,7 +125,10 @@ the signal aborts. The operation then rejects with `CANCELLED` and the session
 remains usable. C callers keep the synchronous ABI and call `oneslicer_cancel`
 from another thread. `scripts/binding-test.mjs` checks this in CI.
 
-The proposed engine-mapped STEP preview and per-face attributes are not part of the normative 0.7.0-pre.1 contract. This engine does not expose those proposed capabilities.
+Engine-mapped STEP preview and per-face attributes are part of the normative
+0.7.0-pre.1 contract. This build exports the preview operation but reports both
+capabilities as unsupported until it can preserve source-face identity and
+apply advertised painted semantics through slicing.
 
 Every payload (project manifest, prepare/slice/export requests and results,
 slice statistics) uses `schemaVersion: "0.7.0-pre.1"`, the API version, including
