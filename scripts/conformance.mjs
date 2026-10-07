@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * one-wasm-slicer-api 0.6.0 conformance run for the built artifact.
+ * one-slicer-api 0.7.0-pre.1 conformance run for the built artifact.
  *
  * Loads slicer-mt.js only through its embedded TypeScript binding
- * (`OneWasmEngine`) — the path every host uses — and runs the vendored,
- * binding-neutral conformance suite (wasm/onewasm/onewasm-conformance.mjs,
+ * (`OneSlicerEngine`) — the path every host uses — and runs the vendored,
+ * binding-neutral conformance suite (wasm/oneslicer/oneslicer-conformance.mjs,
  * copied unmodified from the API release). Engine-specific behaviour stays in
  * smoke-test.mjs; this script proves the shared contract.
  *
@@ -14,7 +14,7 @@
 
 import { readFileSync } from 'node:fs'
 import { loadEngineArtifact } from './lib/engine-harness.mjs'
-import { runConformance } from '../wasm/onewasm/onewasm-conformance.mjs'
+import { runConformance } from '../wasm/oneslicer/oneslicer-conformance.mjs'
 
 const wasmDirIndex = process.argv.indexOf('--wasm-dir')
 const wasmDir = wasmDirIndex >= 0 ? process.argv[wasmDirIndex + 1] : 'artifacts'
@@ -48,8 +48,8 @@ const report = await runConformance(artifact, {
     'orca.profile-json': encode(voron.process),
   },
   samples: {
-    step: new Uint8Array(readFileSync(new URL('../wasm/onewasm/samples/red_cube_blue_cylinder.step', import.meta.url))),
-    threeMf: new Uint8Array(readFileSync(new URL('../wasm/onewasm/samples/box.3mf', import.meta.url))),
+    step: new Uint8Array(readFileSync(new URL('../wasm/oneslicer/samples/red_cube_blue_cylinder.step', import.meta.url))),
+    threeMf: new Uint8Array(readFileSync(new URL('../wasm/oneslicer/samples/box.3mf', import.meta.url))),
     obj: new TextEncoder().encode('v 0 0 0\nv 10 0 0\nv 0 10 0\nv 0 0 10\nf 1 3 2\nf 1 2 4\nf 2 3 4\nf 1 4 3\n'),
   },
 })
@@ -58,5 +58,5 @@ for (const check of report.checks) {
   const status = !check.ok ? 'FAIL' : check.skipped ? 'SKIP' : 'PASS'
   console.log(`[conformance] ${status} ${check.name}${check.detail ? ` — ${check.detail}` : ''}`)
 }
-console.log(`[conformance] ${report.engine?.family ?? 'engine'} ${report.ok ? 'conforms to' : 'does NOT conform to'} one-wasm-slicer-api ${report.apiVersion}`)
+console.log(`[conformance] ${report.engine?.family ?? 'engine'} ${report.ok ? 'conforms to' : 'does NOT conform to'} one-slicer-api ${report.apiVersion}`)
 process.exit(report.ok ? 0 : 1)

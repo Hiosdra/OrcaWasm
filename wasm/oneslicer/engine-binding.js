@@ -1,5 +1,5 @@
 // Second --extern-post-js file: expose this engine through the
-// one-wasm-slicer-api TypeScript binding (see onewasm-emscripten-glue.js).
+// one-slicer-api TypeScript binding (see oneslicer-emscripten-glue.js).
 //
 // The reference glue calls the synchronous C ABI on the runtime's JS thread,
 // which blocks that thread until a slice returns, so an abort signal could
@@ -7,7 +7,7 @@
 // abort must also stop a running operation and leave the session reusable.
 // Project operations therefore run on a pthread (orcawasm_async_* in
 // bridge/slicer.cpp) while this thread polls, delivers progress and calls
-// onewasm_cancel on abort.
+// oneslicer_cancel on abort.
 var orcawasmWithAsyncOperations = (function () {
   'use strict';
   var KIND = { slice: 0, prepare: 1, export: 2 };
@@ -18,8 +18,8 @@ var orcawasmWithAsyncOperations = (function () {
     return new Promise(function (resolve) { setTimeout(resolve, POLL_MS); });
   }
 
-  // The glue does not export OneWasmError; take its constructor from a call
-  // that fails, so rejections stay real OneWasmError instances.
+  // The glue does not export OneSlicerError; take its constructor from a call
+  // that fails, so rejections stay real OneSlicerError instances.
   function errorClass(binding) {
     try {
       binding.call(0, function () { return [-11, function () { return undefined; }]; });
@@ -29,16 +29,16 @@ var orcawasmWithAsyncOperations = (function () {
     return null;
   }
 
-  function runAsync(session, OneWasmError, kind, first, second, options) {
+  function runAsync(session, OneSlicerError, kind, first, second, options) {
     var binding = session.binding;
     var module = binding.module;
     var handle = session.live();
-    if (options && options.signal && options.signal.aborted) throw new OneWasmError('CANCELLED');
+    if (options && options.signal && options.signal.aborted) throw new OneSlicerError('CANCELLED');
 
     var onProgress = options && options.onProgress;
     var callback = 0;
     var settled = false;
-    if (onProgress && module.addFunction && typeof module._onewasm_set_progress_callback === 'function') {
+    if (onProgress && module.addFunction && typeof module._oneslicer_set_progress_callback === 'function') {
       // The bridge proxies progress to this thread, which runs it while idle.
       callback = module.addFunction(function (percent, stagePtr) {
         if (settled) return;
@@ -51,12 +51,12 @@ var orcawasmWithAsyncOperations = (function () {
           // A host callback must not unwind through the engine.
         }
       }, 'viii');
-      module._onewasm_set_progress_callback(handle, callback, 0);
+      module._oneslicer_set_progress_callback(handle, callback, 0);
     }
     var release = function () {
       settled = true;
       if (callback) {
-        module._onewasm_set_progress_callback(handle, 0, 0);
+        module._oneslicer_set_progress_callback(handle, 0, 0);
         if (module.removeFunction) module.removeFunction(callback);
         callback = 0;
       }
@@ -80,12 +80,12 @@ var orcawasmWithAsyncOperations = (function () {
     }
 
     var signal = options && options.signal;
-    var cancel = function () { module._onewasm_cancel(handle); };
+    var cancel = function () { module._oneslicer_cancel(handle); };
     if (signal) signal.addEventListener('abort', cancel);
     return (async function () {
       var state = module._malloc(12);
       try {
-        if (!state) throw new OneWasmError('OUTPUT', 'out of engine memory polling an operation');
+        if (!state) throw new OneSlicerError('OUTPUT', 'out of engine memory polling an operation');
         while (!module._orcawasm_async_poll(operation, state, state + 4, state + 8)) {
           // The operation clears earlier cancellation when it starts, so
           // repeat the request until it finishes.
@@ -110,22 +110,22 @@ var orcawasmWithAsyncOperations = (function () {
     })();
   }
 
-  function wrapSession(session, OneWasmError) {
+  function wrapSession(session, OneSlicerError) {
     if (typeof session.binding.module._orcawasm_async_start !== 'function') return session;
     var slice = session.slice.bind(session);
     var prepare = session.prepare.bind(session);
     var exportProject = session.export.bind(session);
     var empty = new Uint8Array(0);
     session.slice = async function (request, options) {
-      var run = runAsync(session, OneWasmError, KIND.slice, encoder.encode(JSON.stringify(request)), empty, options);
+      var run = runAsync(session, OneSlicerError, KIND.slice, encoder.encode(JSON.stringify(request)), empty, options);
       return run === null ? slice(request, options) : run;
     };
     session.prepare = async function (request, options) {
-      var run = runAsync(session, OneWasmError, KIND.prepare, encoder.encode(JSON.stringify(request)), empty, options);
+      var run = runAsync(session, OneSlicerError, KIND.prepare, encoder.encode(JSON.stringify(request)), empty, options);
       return run === null ? prepare(request, options) : run;
     };
     session.export = async function (format, options, operation) {
-      var run = runAsync(session, OneWasmError, KIND.export,
+      var run = runAsync(session, OneSlicerError, KIND.export,
         encoder.encode(format), encoder.encode(JSON.stringify(options)), operation);
       return run === null ? exportProject(format, options, operation) : run;
     };
@@ -137,16 +137,16 @@ var orcawasmWithAsyncOperations = (function () {
       apiVersion: artifact.apiVersion,
       createEngine: async function (options) {
         var engine = await artifact.createEngine(options);
-        var OneWasmError = errorClass(engine.binding);
-        if (!OneWasmError) return engine;
+        var OneSlicerError = errorClass(engine.binding);
+        if (!OneSlicerError) return engine;
         var createSession = engine.createSession.bind(engine);
         engine.createSession = async function () {
-          return wrapSession(await createSession(), OneWasmError);
+          return wrapSession(await createSession(), OneSlicerError);
         };
         return engine;
       },
     };
   };
 })();
-var OneWasmEngine = orcawasmWithAsyncOperations(onewasmDefineEmscriptenEngine(OrcaModule));
-if (typeof module === 'object' && module && module.exports) module.exports.OneWasmEngine = OneWasmEngine;
+var OneSlicerEngine = orcawasmWithAsyncOperations(oneslicerDefineEmscriptenEngine(OrcaModule));
+if (typeof module === 'object' && module && module.exports) module.exports.OneSlicerEngine = OneSlicerEngine;
