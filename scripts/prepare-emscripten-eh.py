@@ -167,9 +167,16 @@ def main() -> int:
     if patch_libjpeg(ports):
         changed.append("libjpeg")
     libpng = (ports / "libpng.py").read_text(encoding="utf-8")
-    for variant in ("libpng-wasm-sjlj", "libpng-mt-wasm-sjlj"):
-        if f"'{variant}'" not in libpng:
-            raise SystemExit(f"Pinned Emscripten libpng.py has no {variant} variant")
+    variants = (
+        ("libpng-wasm-sjlj", "libpng-wasmsjlj"),
+        ("libpng-mt-wasm-sjlj", "libpng-mt-wasmsjlj"),
+    )
+    for alternatives in variants:
+        if not any(f"'{variant}'" in libpng for variant in alternatives):
+            raise SystemExit(
+                "Pinned Emscripten libpng.py has no compatible variant: "
+                + " or ".join(alternatives)
+            )
 
     print("prepared native WebAssembly EH ports: " + (", ".join(changed) if changed else "already prepared"))
     return 0
