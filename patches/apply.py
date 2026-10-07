@@ -296,6 +296,37 @@ verify_contains(
 )
 
 # =============================================================================
+# 4a.2. Boost.Process v1 compatibility in OrcaSlicer v2.4.2
+#      Boost 1.88 removed the automatic v1/v2 selection from
+#      <boost/process.hpp>. Keep OrcaSlicer's existing v1 calls by including
+#      their specific headers and naming the v1 namespace explicitly.
+# =============================================================================
+patch("src/libslic3r/GCode/PostProcessor.cpp", [
+    (
+        r'#include <boost/process\.hpp>',
+        r'#include <boost/process/v1/child.hpp>\n'
+        r'#include <boost/process/v1/io.hpp>\n'
+        r'#include <boost/process/v1/pipe.hpp>',
+        1,
+    ),
+    (
+        r'namespace process = boost::process;',
+        r'namespace process = boost::process::v1;',
+        1,
+    ),
+])
+verify_contains(
+    "src/libslic3r/GCode/PostProcessor.cpp",
+    "#include <boost/process/v1/child.hpp>",
+    "Boost.Process v1 explicit header patch",
+)
+verify_contains(
+    "src/libslic3r/GCode/PostProcessor.cpp",
+    "namespace process = boost::process::v1;",
+    "Boost.Process v1 namespace patch",
+)
+
+# =============================================================================
 # 4b. Override headers — copy into orca/ source tree
 #     GCC/Clang search the *including file's* directory before any -I path
 #     for #include "..." directives, so the only reliable way to override a

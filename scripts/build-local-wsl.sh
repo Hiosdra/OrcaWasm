@@ -64,7 +64,7 @@ python3 patches/apply.py
 # ══════════════════════════════════════════════════════════
 (
 source "$EMSDK/emsdk_env.sh"
-BOOST_VERSION="1.90.0"
+BOOST_VERSION="1.92.0"
 BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
 # The dependency cache is scoped to the Emscripten version; this
