@@ -1003,8 +1003,17 @@ static oneslicer_status_t apply_step_face_attributes(
                 const std::uint32_t face_id = triangle_face_ids[triangle_offset + local_triangle];
                 if (seam != values.end()) {
                     const auto value = seam->second.find(face_id);
-                    if (value != seam->second.end())
-                        volume->seam_facets.set_triangle_from_string(static_cast<int>(local_triangle), std::string(1, static_cast<char>('0' + value->second)));
+                    if (value != seam->second.end()) {
+                        // TriangleSelector's state is stored in bits 2-3 of its
+                        // four-bit state code (the low two bits encode splits):
+                        // ENFORCER=1 is "4" and BLOCKER=2 is "8". Passing
+                        // "1"/"2" here is decoded as a triangle split and can
+                        // make SeamPlacer read past the selector's geometry.
+                        const char selector_code = value->second == 1 ? '4' : '8';
+                        volume->seam_facets.set_triangle_from_string(
+                            static_cast<int>(local_triangle), std::string(1, selector_code)
+                        );
+                    }
                 }
             }
             triangle_offset += triangle_count;
