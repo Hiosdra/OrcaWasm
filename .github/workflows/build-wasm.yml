@@ -784,13 +784,16 @@ jobs:
           retention-days: 90
 
       # ── Pull-request prerelease ──────────────────────────────────────
-      # Same-repository PR builds that passed the smoke and conformance tests
-      # are published as prereleases so JustSlice-PoC can select them before
-      # merge. Consumers resolving the latest release skip prereleases, and
-      # the tag (-pr<N>.<run>) never matches the -patchN numbering above.
-      # Fork PRs have a read-only token and only validate.
+      # Ready-for-review same-repository PR builds that passed the smoke and
+      # conformance tests are published as prereleases so JustSlice-PoC can
+      # select them before merge. Draft PRs and fork PRs only validate.
+      # Consumers resolving the latest release skip prereleases, and the tag
+      # (-pr<N>.<run>) never matches the -patchN numbering above.
       - name: Publish pull-request prerelease
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.draft != true &&
+          github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
