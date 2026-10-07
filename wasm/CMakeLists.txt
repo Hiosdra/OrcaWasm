@@ -26,6 +26,9 @@ target_link_options(slicer PRIVATE
   -sENVIRONMENT=web,worker,node
   -sMODULARIZE=1
   -sEXPORT_NAME=OrcaModule
+  # The Node smoke harness loads the factory from a data URL and supplies both
+  # the WASM bytes and the source URL needed to create pthread workers.
+  "-sINCOMING_MODULE_JS_API=['ENVIRONMENT','arguments','canvas','dynamicLibraries','elementPointerLock','instantiateWasm','locateFile','monitorRunDependencies','noExitRuntime','noInitialRun','onAbort','onExit','onRuntimeInitialized','postRun','preInit','preRun','print','printErr','setStatus','statusMessage','stderr','stdin','stdout','thisProgram','wasm','websocket','mainScriptUrlOrBlob','wasmBinary']"
   # one-wasm-slicer-api 0.6.0 TypeScript binding: the vendored reference glue
   # (Apache-2.0, copied unmodified from the API release) and the line binding
   # it to OrcaModule. The artifact then exposes `OneWasmEngine`, so hosts never
