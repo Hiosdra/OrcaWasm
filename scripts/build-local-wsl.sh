@@ -64,12 +64,13 @@ python3 patches/apply.py
 # ══════════════════════════════════════════════════════════
 (
 source "$EMSDK/emsdk_env.sh"
+PATCH_BOOST_INTERVAL_SCRIPT="$(pwd)/scripts/patch-boost-interval-wasm.py"
 BOOST_VERSION="1.92.0"
 BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
 # The dependency cache is scoped to the Emscripten version; this
 # stamp additionally records the Boost source and build flags.
-STAMP="${INSTALL}/.boost_built_${BOOST_VERSION}_mt_native_eh_v4"
+STAMP="${INSTALL}/.boost_built_${BOOST_VERSION}_mt_native_eh_v5"
 mkdir -p "${INSTALL}"
 [[ -f "${STAMP}" ]] && echo "[boost] stamp exists — skip" && exit 0
 
@@ -117,6 +118,8 @@ B2_EXTRA_CXXFLAGS="cxxflags=-fwasm-exceptions -pthread"
   "${B2_EXTRA_CXXFLAGS}" \
   -j"$(nproc)" \
   install
+
+python3 "${PATCH_BOOST_INTERVAL_SCRIPT}" --include-dir "${INSTALL}/include"
 
 echo "[boost] installed headers:"
 ls "${INSTALL}/include/boost/version.hpp" && echo "  boost/version.hpp OK"
@@ -499,7 +502,7 @@ emcmake cmake \
   -DCGAL_DIR="${DEP_INSTALL}/lib/cmake/CGAL" \
   -DNLOPT_LIBRARY="${DEP_INSTALL}/lib/libnlopt.a" \
   -DNLOPT_INCLUDE_DIR="${DEP_INSTALL}/include" \
-  "-DCMAKE_CXX_FLAGS=-I${COMMON_SHIM_DIR} -DBOOST_HAS_PTHREADS=1 -DSLIC3R_WASM=1 -DSLIC3R_NO_OPENVDB=1 -DSLIC3R_NO_OPENCV=1 ${EXTRA_CXX_FLAGS}" \
+  "-DCMAKE_CXX_FLAGS=-I${COMMON_SHIM_DIR} -DBOOST_HAS_PTHREADS=1 -DCGAL_ALWAYS_ROUND_TO_NEAREST=1 -DSLIC3R_WASM=1 -DSLIC3R_NO_OPENVDB=1 -DSLIC3R_NO_OPENCV=1 ${EXTRA_CXX_FLAGS}" \
   "-DCMAKE_C_FLAGS=-I${COMMON_SHIM_DIR} ${EXTRA_C_FLAGS}"
 
 )
