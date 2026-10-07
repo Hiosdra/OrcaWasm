@@ -3351,9 +3351,6 @@ oneslicer_status_t oneslicer_project_prepare(
         return ONESLICER_ERR_INVALID_ARGUMENT;
     }
 
-    clear_project_outputs(*session);
-    session->project_cancel_requested.store(false, std::memory_order_release);
-
     nlohmann::json request;
     try {
         request = nlohmann::json::parse(std::string(
@@ -3383,6 +3380,9 @@ oneslicer_status_t oneslicer_project_prepare(
         record_error(*session, "project prepare operation must be auto-orient or arrange");
         return ONESLICER_ERR_VALIDATION;
     }
+
+    clear_project_outputs(*session);
+    session->project_cancel_requested.store(false, std::memory_order_release);
 
     const std::string manifest_text = session->project_manifest.dump();
     if (manifest_text.size() > UINT32_MAX) {
