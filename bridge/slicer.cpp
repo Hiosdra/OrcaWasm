@@ -37,7 +37,6 @@
  */
 
 #include "oneslicer_api.h"
-#include "oneslicer_legacy.h"
 
 #include <algorithm>
 #include <array>
@@ -65,6 +64,11 @@
 #include <emscripten.h>
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
+
+enum {
+    PREPARE_AUTO_ORIENT = 1,
+    PREPARE_ARRANGE = 2,
+};
 
 // OrcaSlicer core
 // (note: an earlier attempt to cap oneTBB via tbb::global_control lived here;
@@ -139,12 +143,12 @@ struct OrcSession {
     // Opt-in override of the engine's mixed-nozzle-temperature guard, matching
     // desktop OrcaSlicer's "Remove mixed temperature restriction" preference.
     // Off by default (the guard exists to prevent nozzle clogging / damage);
-    // when set, the private legacy slice adapters call
+    // when set, the STL project-slice path calls
     // Print::set_check_multi_filaments_compatibility(false) before validate().
     // See issue #164.
     bool remove_mixed_temp_restriction = false;
     // Variable (adaptive) layer height, matching desktop OrcaSlicer's Adaptive
-    // tool: when on, the private legacy slice adapters compute a per-object layer
+    // tool: when on, the STL project-slice path computes a per-object layer
     // height profile from the mesh geometry (layer_height_profile_adaptive)
     // before slicing, so detailed regions get thinner layers and flat regions
     // thicker ones. Off by default (a fixed layer height is the engine default
@@ -178,7 +182,7 @@ struct OrcSession {
     bool native_project_dirty = false;
     int progress_base = 0;
     int progress_span = 100;
-    // A project slice may call the legacy single-plate entry point several
+    // A project slice may prepare several logical plates in sequence
     // times. Keep cancellation intent across the small gaps between those
     // calls; the active native operation is still cancelled through
     // ActiveSlice when one exists.
@@ -908,75 +912,6 @@ struct TempFileGuard {
     TempFileGuard& operator=(const TempFileGuard&) = delete;
 };
 
-static oneslicer_status_t convert_project_step_to_stl(
-    const char* step_path,
-    const char* stl_path,
-    std::string& error
-) {
-    Slic3r::Model step_model;
-    try {
-        Slic3r::Step step_importer{std::string(step_path)};
-        if (step_importer.load() != Slic3r::Step::Step_Status::LOAD_SUCCESS) {
-            error = "OrcaSlicer could not read the project STEP model";
-            return ONESLICER_ERR_INPUT_FORMAT;
-        }
-        bool cancelled = false;
-        if (step_importer.mesh(&step_model, cancelled, false, 0.003, 0.5)
-            != Slic3r::Step::Step_Status::MESH_SUCCESS) {
-            error = "OrcaSlicer could not tessellate the project STEP model";
-            return ONESLICER_ERR_INPUT_FORMAT;
-        }
-    } catch (const std::exception& exception) {
-        error = std::string("OrcaSlicer could not import project STEP mesh: ") + exception.what();
-        return ONESLICER_ERR_INPUT_FORMAT;
-    }
-    if (step_model.objects.empty()) {
-        error = "project STEP mesh contains no printable geometry";
-        return ONESLICER_ERR_EMPTY_INPUT;
-    }
-
-    Slic3r::TriangleMesh combined;
-    for (auto* object : step_model.objects) {
-        if (!object) continue;
-        for (auto* volume : object->volumes) {
-            if (volume) combined.merge(volume->mesh());
-        }
-    }
-    if (combined.facets_count() == 0) {
-        error = "project STEP mesh tessellated to no printable facets";
-        return ONESLICER_ERR_EMPTY_INPUT;
-    }
-    if (!Slic3r::store_stl(stl_path, &combined, true)) {
-        error = "OrcaSlicer could not stage the project STEP tessellation";
-        return ONESLICER_ERR_OUTPUT;
-    }
-    return ONESLICER_OK;
-}
-
-static bool read_binary_file(const char* path, std::vector<std::uint8_t>& output) {
-    output.clear();
-    FILE* file = std::fopen(path, "rb");
-    if (!file) return false;
-    if (std::fseek(file, 0, SEEK_END) != 0) {
-        std::fclose(file);
-        return false;
-    }
-    const long size = std::ftell(file);
-    if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
-        std::fclose(file);
-        return false;
-    }
-    try {
-        output.resize(static_cast<std::size_t>(size));
-    } catch (...) {
-        std::fclose(file);
-        throw;
-    }
-    const bool complete = output.empty() || std::fread(output.data(), 1, output.size(), file) == output.size();
-    std::fclose(file);
-    return complete;
-}
-
 // admesh classifies an STL as binary only when one of the 128 bytes after the
 // 84-byte header is above 127. Those bytes are facet data, so a binary STL
 // with zero normals and small positive coordinates (any box under 16 mm, for
@@ -1058,7 +993,7 @@ struct Loaded3mfResourcesGuard {
 // still pick their own record_error() overload (session-aware vs. the
 // conversion-functions' shared slot) and error code, since those differ
 // per call site — this only owns the mechanical fopen/fseek/malloc/fread
-// sequence that the private legacy 3MF writer and the geometry reader both need to read back the
+// sequence that the private 3MF writer and the geometry reader both need to read back the
 // file they just asked OrcaSlicer to produce.
 static char* read_file_to_buffer(const char* path, long* out_len, const char** out_err, bool* out_oom) {
     *out_oom = false;
@@ -1454,10 +1389,10 @@ static const ProjectObjectInput* find_project_object(const ProjectManifestInput&
     return found == manifest.objects.end() ? nullptr : &*found;
 }
 
-static bool project_matrix_to_legacy_transform(const std::array<double, 16>& values,
-                                               const OrcSession& session,
-                                               ObjectTransformInput& result,
-                                               std::string& error) {
+static bool project_matrix_to_prepare_transform(const std::array<double, 16>& values,
+                                                const OrcSession& session,
+                                                ObjectTransformInput& result,
+                                                std::string& error) {
     Slic3r::Transform3d matrix = Slic3r::Transform3d::Identity();
     for (int row = 0; row < 4; ++row) {
         for (int column = 0; column < 4; ++column)
@@ -1492,7 +1427,7 @@ static bool project_matrix_to_legacy_transform(const std::array<double, 16>& val
     return true;
 }
 
-static std::array<double, 16> legacy_transform_to_project_matrix(
+static std::array<double, 16> prepare_transform_to_project_matrix(
     const ObjectTransformInput& input, const OrcSession& session) {
     Slic3r::Geometry::Transformation transformation;
     transformation.set_scaling_factor(input.scale);
@@ -1892,53 +1827,17 @@ static bool collect_project_plate_inputs(
         const auto begin = session.project_object_blob.begin() + mesh->offset;
         const auto end = begin + mesh->length;
         const auto start = static_cast<std::uint32_t>(blob.size());
-        if (mesh->format == "step") {
-            const std::string step_path = "/tmp/ow-project-prepare-step-"
-                + std::to_string(session.id) + "-" + std::to_string(manifest_index) + ".step";
-            const std::string stl_path = step_path + ".stl";
-            std::vector<std::uint8_t> prepared_mesh;
-            {
-                TempFileGuard step_guard(step_path);
-                TempFileGuard stl_guard(stl_path);
-                FILE* step_file = std::fopen(step_path.c_str(), "wb");
-                if (!step_file) {
-                    error = "unable to stage project STEP mesh for preparation";
-                    return false;
-                }
-                const std::size_t written = std::fwrite(
-                    session.project_object_blob.data() + mesh->offset,
-                    1,
-                    mesh->length,
-                    step_file
-                );
-                std::fclose(step_file);
-                if (written != mesh->length) {
-                    error = "unable to stage complete project STEP mesh for preparation";
-                    return false;
-                }
-                const auto status = convert_project_step_to_stl(
-                    step_path.c_str(), stl_path.c_str(), error
-                );
-                if (status != ONESLICER_OK) return false;
-                if (!read_binary_file(stl_path.c_str(), prepared_mesh)) {
-                    error = "unable to read the prepared STEP mesh geometry";
-                    return false;
-                }
-            }
-            if (blob.size() > UINT32_MAX || prepared_mesh.size() > UINT32_MAX - blob.size()) {
-                error = "prepared project plate object blob exceeds the C ABI length limit";
-                return false;
-            }
-            blob.insert(blob.end(), prepared_mesh.begin(), prepared_mesh.end());
-        } else {
-            blob.insert(blob.end(), begin, end);
+        if (mesh->format != "stl") {
+            error = "OrcaSlicer project preparation supports STL meshes only";
+            return false;
         }
+        blob.insert(blob.end(), begin, end);
         offsets.push_back(start);
         offsets.push_back(static_cast<std::uint32_t>(blob.size()));
         extruders.push_back(static_cast<std::int32_t>(object->extruder_id));
 
         ObjectTransformInput transform;
-        if (!project_matrix_to_legacy_transform(instance.matrix, session, transform, error))
+        if (!project_matrix_to_prepare_transform(instance.matrix, session, transform, error))
             return false;
         transforms.push_back(static_cast<float>(transform.scale.x()));
         transforms.push_back(static_cast<float>(transform.scale.y()));
@@ -2090,14 +1989,14 @@ static bool build_project_export_mesh(
     return true;
 }
 
-// The project adapter is defined before the legacy slice entry points, while
-// these native-print helpers are shared with those entry points below.
+// The project adapter is defined before the plate-preparation implementation,
+// while these native-print helpers are shared with it below.
 static void zero_plate_origin(Slic3r::Print& print);
 static void set_is_bbl_printer(
     Slic3r::Print& print,
     const Slic3r::DynamicPrintConfig& config
 );
-static oneslicer_status_t legacy_prepare_plate(
+static oneslicer_status_t prepare_stl_plate(
     oneslicer_session_t session_ptr,
     const uint8_t* all_stl, uint32_t all_stl_len,
     const uint32_t* offsets, uint32_t n_files,
@@ -2117,6 +2016,13 @@ static void clamp_wipe_tower_to_bed(
     const Slic3r::Model& model,
     double bed_x,
     double bed_y
+);
+static oneslicer_status_t write_single_mesh_3mf(
+    oneslicer_session_t session,
+    const uint8_t* stl_data,
+    uint32_t stl_len,
+    uint8_t** out_3mf,
+    uint32_t* out_len
 );
 
 static bool validate_project_model_footprints(
@@ -2155,11 +2061,10 @@ static bool validate_project_model_footprints(
     return true;
 }
 
-// The released 0.2 multi-object entry point intentionally exposes the older
-// decomposed transform table. The 0.5 project manifest is different: its
-// matrix is the source-of-truth affine transform and may contain a valid
+// The host-facing prepare operation still returns decomposed transforms. The
+// project manifest instead treats its matrix as the source of truth and may
 // shear or a non-zero Z translation. Build the native model directly for the
-// project path so the common API does not inherit the legacy transform limit.
+// project path so the common API does not inherit the prepare transform limit.
 static oneslicer_status_t build_project_plate_model(
     OrcSession& session,
     const ProjectManifestInput& manifest,
@@ -2187,10 +2092,13 @@ static oneslicer_status_t build_project_plate_model(
             return ONESLICER_ERR_UNSUPPORTED;
         }
 
-        const bool is_step_mesh = mesh_input->format == "step";
+        if (mesh_input->format != "stl") {
+            error = "OrcaSlicer project slicing supports STL meshes only";
+            return ONESLICER_ERR_UNSUPPORTED;
+        }
         const std::string path = "/tmp/ow-project-slice-"
             + std::to_string(session.id) + "-" + std::to_string(instance_index++)
-            + (is_step_mesh ? ".step" : ".stl");
+            + ".stl";
         TempFileGuard input_guard(path);
         FILE* file = std::fopen(path.c_str(), "wb");
         if (!file) {
@@ -2209,19 +2117,8 @@ static oneslicer_status_t build_project_plate_model(
             return ONESLICER_ERR_INPUT_IO;
         }
 
-        const std::string converted_path = path + ".tessellated.stl";
-        TempFileGuard converted_guard(converted_path);
-        const char* staged_stl_path = path.c_str();
-        if (is_step_mesh) {
-            const auto step_status = convert_project_step_to_stl(
-                path.c_str(), converted_path.c_str(), error
-            );
-            if (step_status != ONESLICER_OK) return step_status;
-            staged_stl_path = converted_path.c_str();
-        }
-
         const std::size_t first_object = model.objects.size();
-        if (!load_staged_stl(staged_stl_path, &model, object_input->id.c_str())) {
+        if (!load_staged_stl(path.c_str(), &model, object_input->id.c_str())) {
             error = "OrcaSlicer could not load project mesh " + mesh_input->id;
             return ONESLICER_ERR_INPUT_FORMAT;
         }
@@ -2273,10 +2170,13 @@ static oneslicer_status_t build_project_plate_model(
             return ONESLICER_ERR_UNSUPPORTED;
         }
 
-        const bool is_step_mesh = mesh_input->format == "step";
+        if (mesh_input->format != "stl") {
+            error = "OrcaSlicer project modifier volumes support STL meshes only";
+            return ONESLICER_ERR_UNSUPPORTED;
+        }
         const std::string path = "/tmp/ow-project-modifier-"
             + std::to_string(session.id) + "-" + std::to_string(instance_index++)
-            + (is_step_mesh ? ".step" : ".stl");
+            + ".stl";
         TempFileGuard input_guard(path);
         FILE* file = std::fopen(path.c_str(), "wb");
         if (!file) {
@@ -2295,19 +2195,8 @@ static oneslicer_status_t build_project_plate_model(
             return ONESLICER_ERR_INPUT_IO;
         }
 
-        const std::string converted_path = path + ".tessellated.stl";
-        TempFileGuard converted_guard(converted_path);
-        const char* staged_stl_path = path.c_str();
-        if (is_step_mesh) {
-            const auto step_status = convert_project_step_to_stl(
-                path.c_str(), converted_path.c_str(), error
-            );
-            if (step_status != ONESLICER_OK) return step_status;
-            staged_stl_path = converted_path.c_str();
-        }
-
         Slic3r::Model modifier_model;
-        if (!load_staged_stl(staged_stl_path, &modifier_model, modifier.id.c_str())
+        if (!load_staged_stl(path.c_str(), &modifier_model, modifier.id.c_str())
             || modifier_model.objects.empty()) {
             error = "OrcaSlicer could not load project modifier mesh " + mesh_input->id;
             return ONESLICER_ERR_INPUT_FORMAT;
@@ -3238,7 +3127,7 @@ oneslicer_status_t oneslicer_apply_profile(
                 ? json_array_to_config_string(key, value)
                 : json_val_to_string(value);
             if (!Slic3r::print_config_def.get(key)) continue;
-            // Unlike the legacy initializer, API 0.5 rejects an invalid value
+            // Unlike the older compatibility initializer, API 0.7 rejects an invalid value
             // for a known option so the staged patch can fail atomically.
             candidate_config.set_deserialize_strict(key, serialized);
         }
@@ -3418,8 +3307,8 @@ oneslicer_status_t oneslicer_get_capabilities(uint8_t** out_json, uint32_t* out_
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
-  "project":{"meshFormats":["stl","step"],"faceAttributeSemantics":{"triangle":[],"brepFace":[]},"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.meshFormat.step":"partial","project.preview.stepFaces":"unsupported","project.faceAttributes":"unsupported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
+  "project":{"meshFormats":["stl"],"faceAttributeSemantics":{"triangle":[],"brepFace":[]},"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.meshFormat.step":"unsupported","project.preview.stepFaces":"unsupported","project.faceAttributes":"unsupported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
@@ -3436,7 +3325,7 @@ oneslicer_status_t oneslicer_get_capabilities(uint8_t** out_json, uint32_t* out_
     return ONESLICER_OK;
 }
 
-static oneslicer_status_t legacy_get_last_statistics(
+static oneslicer_status_t copy_last_slice_statistics(
     oneslicer_session_t session_ptr,
     uint8_t** out_json,
     uint32_t* out_len
@@ -3497,43 +3386,13 @@ oneslicer_status_t oneslicer_project_set_objects(
     }
 
     for (const auto& mesh : parsed.meshes) {
+        if (mesh.format == "step") {
+            record_error(*session, "OrcaSlicer does not support STEP project meshes; convert STEP with format.stepToStl and upload the STL mesh");
+            return ONESLICER_ERR_UNSUPPORTED;
+        }
         if (mesh.has_face_attributes) {
             record_error(*session, "OrcaSlicer does not implement project face attributes");
             return ONESLICER_ERR_UNSUPPORTED;
-        }
-    }
-
-    std::size_t step_validation_index = 0;
-    for (const auto& mesh : parsed.meshes) {
-        if (mesh.format != "step") continue;
-        const std::string step_path = "/tmp/ow-project-validate-step-"
-            + std::to_string(session->id) + "-" + std::to_string(step_validation_index++) + ".step";
-        TempFileGuard step_guard(step_path);
-        FILE* file = std::fopen(step_path.c_str(), "wb");
-        if (!file) {
-            record_error(*session, "unable to stage project STEP mesh for validation");
-            return ONESLICER_ERR_INPUT_IO;
-        }
-        const std::size_t written = std::fwrite(
-            object_blob + mesh.offset,
-            1,
-            mesh.length,
-            file
-        );
-        std::fclose(file);
-        if (written != mesh.length) {
-            record_error(*session, "unable to stage complete project STEP mesh for validation");
-            return ONESLICER_ERR_INPUT_IO;
-        }
-        const std::string preview_path = step_path + ".validated.stl";
-        TempFileGuard preview_guard(preview_path);
-        std::string step_error;
-        const oneslicer_status_t step_status = convert_project_step_to_stl(
-            step_path.c_str(), preview_path.c_str(), step_error
-        );
-        if (step_status != ONESLICER_OK) {
-            record_error(*session, step_error);
-            return step_status;
         }
     }
 
@@ -3651,8 +3510,8 @@ oneslicer_status_t oneslicer_project_prepare(
     }
     const std::string operation_name = request.value("operation", "");
     const int operation = operation_name == "auto-orient"
-        ? ONESLICER_PLATE_AUTO_ORIENT
-        : operation_name == "arrange" ? ONESLICER_PLATE_ARRANGE : 0;
+        ? PREPARE_AUTO_ORIENT
+        : operation_name == "arrange" ? PREPARE_ARRANGE : 0;
     if (operation == 0) {
         record_error(*session, "project prepare operation must be auto-orient or arrange");
         return ONESLICER_ERR_VALIDATION;
@@ -3693,7 +3552,7 @@ oneslicer_status_t oneslicer_project_prepare(
             if (!collect_project_plate_inputs(
                     *session, manifest, plate_id, blob, offsets, extruders,
                     transforms, manifest_indices,
-                    operation == ONESLICER_PLATE_AUTO_ORIENT, error)) {
+                    operation == PREPARE_AUTO_ORIENT, error)) {
                 record_error(*session, error);
                 return ONESLICER_ERR_VALIDATION;
             }
@@ -3704,7 +3563,7 @@ oneslicer_status_t oneslicer_project_prepare(
 
             uint8_t* prepared_data = nullptr;
             uint32_t prepared_len = 0;
-            const auto status = legacy_prepare_plate(
+            const auto status = prepare_stl_plate(
                 session_ptr, blob.data(), static_cast<std::uint32_t>(blob.size()),
                 offsets.data(), static_cast<std::uint32_t>(manifest_indices.size()),
                 transforms.data(), operation, &prepared_data, &prepared_len);
@@ -3736,7 +3595,7 @@ oneslicer_status_t oneslicer_project_prepare(
                     record_error(*session, error);
                     return ONESLICER_ERR_INTERNAL;
                 }
-                auto matrix = legacy_transform_to_project_matrix(transform, *session);
+                auto matrix = prepare_transform_to_project_matrix(transform, *session);
                 if (prepared[index].contains("sourceOriginCorrection")) {
                     const auto& correction = prepared[index].at("sourceOriginCorrection");
                     if (!correction.is_array() || correction.size() != 3) {
@@ -3908,7 +3767,7 @@ oneslicer_status_t oneslicer_project_slice(
             if (request.include_statistics) {
                 uint8_t* statistics_data = nullptr;
                 uint32_t statistics_len = 0;
-                const auto statistics_status = legacy_get_last_statistics(
+                const auto statistics_status = copy_last_slice_statistics(
                     session_ptr, &statistics_data, &statistics_len);
                 if (statistics_status != ONESLICER_OK) {
                     std::free(statistics_data);
@@ -3993,7 +3852,7 @@ oneslicer_status_t oneslicer_project_get_asset(
     return ONESLICER_OK;
 }
 
-static oneslicer_status_t legacy_write_model_3mf(
+static oneslicer_status_t write_project_model_3mf(
     OrcSession& session,
     Slic3r::Model& model,
     uint8_t** out_3mf,
@@ -4091,7 +3950,7 @@ static bool prepare_native_modifier_model_for_export(
 // G-code of each sliced plate the way desktop Orca saves a sliced project:
 // Metadata/plate_N.gcode, its .md5, the plate's gcode_file reference and its
 // slice_info entry. Plates keep their identity instead of being flattened.
-static oneslicer_status_t legacy_write_sliced_project_3mf(
+static oneslicer_status_t write_project_slice_artifacts_3mf(
     OrcSession& session,
     const ProjectManifestInput& manifest,
     const std::map<std::string, std::string>& gcode_by_plate,
@@ -4165,7 +4024,7 @@ static oneslicer_status_t legacy_write_sliced_project_3mf(
     }
     if (!manifest.modifier_volumes.empty() && !prepare_native_modifier_model_for_export(model, error))
         return ONESLICER_ERR_VALIDATION;
-    return legacy_write_model_3mf(session, model, out_3mf, out_len, &plate_data_list, &config);
+    return write_project_model_3mf(session, model, out_3mf, out_len, &plate_data_list, &config);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4334,7 +4193,7 @@ oneslicer_status_t oneslicer_project_export(
             uint32_t exported_len = 0;
             oneslicer_status_t export_status = ONESLICER_OK;
             if (options.include_slice_artifacts) {
-                export_status = legacy_write_sliced_project_3mf(
+                export_status = write_project_slice_artifacts_3mf(
                     *session, manifest, gcode_by_plate, &exported_data, &exported_len, error
                 );
                 if (export_status != ONESLICER_OK && !error.empty())
@@ -4354,7 +4213,7 @@ oneslicer_status_t oneslicer_project_export(
                     record_error(*session, error);
                     return ONESLICER_ERR_VALIDATION;
                 }
-                export_status = legacy_write_model_3mf(
+                export_status = write_project_model_3mf(
                     *session, native_model, &exported_data, &exported_len
                 );
             } else {
@@ -4381,7 +4240,7 @@ oneslicer_status_t oneslicer_project_export(
                         + (read_error ? read_error : "read failed"));
                     return out_of_memory ? ONESLICER_ERR_OUTPUT : ONESLICER_ERR_INPUT_IO;
                 }
-                export_status = legacy_write_3mf(
+                export_status = write_single_mesh_3mf(
                     reinterpret_cast<oneslicer_session_t>(session),
                     reinterpret_cast<const uint8_t*>(stl_data),
                     static_cast<uint32_t>(stl_size),
@@ -4550,164 +4409,6 @@ int orcawasm_async_poll(
 }
 
 /**
- * Slice an STL file (raw binary, ASCII or binary format).
- * On success *out_gcode points to a malloc'd, null-terminated G-code string
- * and *out_len contains its byte length (excluding the null terminator).
- * Caller must free the buffer with oneslicer_free().
- */
-static oneslicer_status_t legacy_slice_stl(
-    oneslicer_session_t session_ptr,
-    const uint8_t* stl_data,
-    uint32_t stl_len,
-    uint8_t** out_gcode,
-    uint32_t* out_len
-) {
-    OrcSession* session = as_session(session_ptr);
-    if (!session) return -1;
-    session->last_error.clear();
-    if (out_gcode) *out_gcode = nullptr;
-    if (out_len) *out_len = 0;
-    if (!session->initialized) { record_error(*session, "call oneslicer_init first"); return -1; }
-    if (!stl_data || stl_len == 0 || !out_gcode || !out_len)
-        return -1;
-
-    ActiveSliceGuard operation(*session);
-    if (!operation) {
-        record_error(*session, "session already has an active operation");
-        return ONESLICER_ERR_INVALID_ARGUMENT;
-    }
-
-    // Write raw STL bytes into Emscripten's MEMFS so OrcaSlicer can read it.
-    {
-        FILE* f = std::fopen("/tmp/ow_in.stl", "wb");
-        if (!f) { record_error(*session, "cannot open /tmp/ow_in.stl for writing"); return -3; }
-        std::fwrite(stl_data, 1, static_cast<std::size_t>(stl_len), f);
-        std::fclose(f);
-    }
-
-    try {
-        throw_if_cancelled(operation);
-        // ── load model ───────────────────────────────────────────────
-        Slic3r::Model model;
-        const bool stl_ok = load_staged_stl("/tmp/ow_in.stl", &model, "object");
-        std::remove("/tmp/ow_in.stl"); // MEMFS is RAM-backed; free it as soon as loaded
-        if (!stl_ok) {
-            record_error(*session, "STL load failed");
-            return -4;
-        }
-        if (model.objects.empty()) {
-            record_error(*session, "model contains no objects");
-            return -5;
-        }
-        throw_if_cancelled(operation);
-
-        // ── place model on bed ───────────────────────────────────────
-        // Center the mesh in X/Y, then offset to bed centre. Per-object
-        // transforms use the multi-object entry point in the common ABI.
-        for (auto* obj : model.objects) {
-            center_object_xy_only(obj);
-            if (obj->instances.empty()) {
-                auto* inst = obj->add_instance();
-                // Place at bed centre, derived from bed_size_x / bed_size_y in config.
-                inst->set_offset(Slic3r::Vec3d(session->bed_cx, session->bed_cy, 0.0));
-            }
-        }
-
-        // ── configure & slice ────────────────────────────────────────
-        Slic3r::Print print;
-        operation.attach(print);
-        ActivePrintGuard print_guard(operation);
-        print.apply(model, session->config);
-        zero_plate_origin(print);
-        set_is_bbl_printer(print, session->config);
-        // When the user opts in (issue #164), turn off the engine's
-        // mixed-nozzle-temperature guard so a single-nozzle AMS plate with
-        // filaments whose recommended ranges don't overlap (e.g. PLA + PETG)
-        // slices instead of failing validation. The incompatible-temperature
-        // case then surfaces through validate()'s `warning` out-param (below)
-        // rather than as a fatal error.
-        if (session->remove_mixed_temp_restriction)
-            print.set_check_multi_filaments_compatibility(false);
-        // Variable (adaptive) layer height (issue #138) — compute after apply()
-        // (slicing parameters are populated), before validate()/process().
-        if (session->adaptive_layer_height)
-            apply_adaptive_layer_height(print, session->adaptive_layer_height_quality);
-        attach_progress_callback(print, *session);
-
-        {
-            // Print::validate() returns a StringObjectException whose
-            // `string` member holds the error message ("" when valid). The
-            // `warning` out-param catches the non-fatal mixed-temperature
-            // notice raised once the guard above is disabled — without a
-            // non-null pointer to absorb it, validate() would still return
-            // that notice as a fatal error. It is intentionally ignored.
-            Slic3r::StringObjectException warning;
-            Slic3r::StringObjectException err = print.validate(&warning);
-            if (!err.string.empty()) { record_error(*session, err.string); return -6; }
-        }
-
-        try {
-            throw_if_cancelled(operation);
-            print.process();
-            throw_if_cancelled(operation);
-        } catch (const Slic3r::CanceledException&) {
-            record_error(*session, "slice cancelled");
-            return ONESLICER_ERR_CANCELLED;
-        } catch (const Slic3r::SlicingError& e) {
-            record_error(*session, e.what());
-            return -7;
-        }
-
-        // ── export G-code to MEMFS ───────────────────────────────────
-        // Guard covers the do_export() call too: if it throws partway through
-        // writing, the partial file is still removed on the way out.
-        TempFileGuard out_guard("/tmp/ow_out.gcode");
-        Slic3r::GCodeProcessorResult processor_result;
-        {
-            Slic3r::GCode gcode_gen;
-            gcode_gen.do_export(&print, "/tmp/ow_out.gcode", &processor_result, nullptr);
-        }
-        throw_if_cancelled(operation);
-        const std::string statistics_json = serialize_slice_statistics(print, processor_result);
-
-        // ── read result back ─────────────────────────────────────────
-        FILE* gf = std::fopen("/tmp/ow_out.gcode", "rb");
-        if (!gf) { record_error(*session, "gcode export produced no output"); return -8; }
-
-        std::fseek(gf, 0, SEEK_END);
-        long sz = std::ftell(gf);
-        std::rewind(gf);
-
-        char* buf = static_cast<char*>(std::malloc(static_cast<std::size_t>(sz) + 1));
-        if (!buf) {
-            std::fclose(gf);
-            record_error(*session, "out of memory");
-            return -9;
-        }
-        std::fread(buf, 1, static_cast<std::size_t>(sz), gf);
-        std::fclose(gf);
-        buf[sz] = '\0';
-
-        if (sz < 0 || static_cast<unsigned long long>(sz) > UINT32_MAX) {
-            std::free(buf);
-            record_error(*session, "G-code output exceeds the C ABI length limit");
-            return ONESLICER_ERR_OUTPUT;
-        }
-        *out_gcode = reinterpret_cast<uint8_t*>(buf);
-        *out_len   = static_cast<uint32_t>(sz);
-        publish_slice_statistics(*session, statistics_json);
-        return ONESLICER_OK;
-
-    } catch (const Slic3r::CanceledException&) {
-        record_error(*session, "slice cancelled");
-        return ONESLICER_ERR_CANCELLED;
-    } catch (const std::exception& e) {
-        record_error(*session, e.what());
-        return -9;
-    }
-}
-
-/**
  * Prepare the current plate without slicing it.
  *
  * operation 1 = auto-orient each object, operation 2 = arrange the plate.
@@ -4716,7 +4417,7 @@ static oneslicer_status_t legacy_slice_stl(
  * means identity transforms. In the arrange operation finite input offsets
  * are pinned and NaN offsets remain movable.
  */
-static oneslicer_status_t legacy_prepare_plate(
+static oneslicer_status_t prepare_stl_plate(
     oneslicer_session_t session_ptr,
     const uint8_t* all_stl, uint32_t all_stl_len,
     const uint32_t* offsets, uint32_t n_files,
@@ -4731,7 +4432,8 @@ static oneslicer_status_t legacy_prepare_plate(
     if (out_len) *out_len = 0;
     if (!session->initialized) { record_error(*session, "call oneslicer_init first"); return -1; }
     if (!all_stl || all_stl_len == 0 || !offsets || n_files == 0 ||
-        !out_transforms || !out_len || (operation != 1 && operation != 2)) {
+        !out_transforms || !out_len
+        || (operation != PREPARE_AUTO_ORIENT && operation != PREPARE_ARRANGE)) {
         record_error(*session, "invalid current-plate arguments");
         return -1;
     }
@@ -4919,262 +4621,6 @@ oneslicer_status_t oneslicer_obj_to_stl(
 }
 
 /**
- * Slice multiple STL files arranged on a single plate.
- *
- * all_stl      concatenation of all STL file bytes
- * offsets      uint32 pairs [start0, end0, start1, end1, …] — one per file
- * n_files      number of files (= offsets length / 2)
- * extruder_ids nullable int32 array of length n_files — 1-based "extruder"
- *              override per object (0 = inherit the config's default),
- *              forwarded to OrcaSlicer's per-object `extruder` config key
- *              (PrintConfig.cpp: coInt, min 0 = inherit; normalize_fdm()
- *              resolves it to the per-region *_filament_id fields). Names a
- *              *filament* slot, not a nozzle: whether two slots share one
- *              nozzle (AMS-style) or drive genuine T0/T1 tool changes is
- *              decided by `filament_map` in the config, which the host integration
- *              builds in withFilamentSlots() (host profile adapter). Real
- *              multi-nozzle profiles work here as of #160 — the crash this
- *              used to be gated against was our own array serialization, see
- *              json_array_to_config_string() above.
- *              Ignored (no-op) when null, so existing single-extruder callers
- *              are unaffected.
- * transforms   nullable float table of 11 values per file: scale xyz,
- *              rotation xyz (radians), mirror xyz, and X/Y offset in mm
- *              relative to bed centre. NaN X/Y delegates placement to arrange.
- *
- * Internal adapter used by the API 0.7.0-pre.1 project implementation.
- */
-static oneslicer_status_t legacy_slice_stl_multi(
-    oneslicer_session_t session_ptr,
-    const uint8_t* all_stl, uint32_t all_stl_len,
-    const uint32_t* offsets, uint32_t n_files,
-    const int32_t* extruder_ids,
-    const float* transforms,
-    uint8_t** out_gcode, uint32_t* out_len)
-{
-    OrcSession* session = as_session(session_ptr);
-    if (!session) return -1;
-    session->last_error.clear();
-    if (out_gcode) *out_gcode = nullptr;
-    if (out_len) *out_len = 0;
-    if (!session->initialized) { record_error(*session, "call oneslicer_init first"); return -1; }
-    if (!all_stl || all_stl_len == 0 || !offsets || n_files == 0 || !out_gcode || !out_len)
-        return -1;
-
-    ActiveSliceGuard operation(*session);
-    if (!operation) {
-        record_error(*session, "session already has an active operation");
-        return ONESLICER_ERR_INVALID_ARGUMENT;
-    }
-
-    const char* base = reinterpret_cast<const char*>(all_stl);
-
-    try {
-        throw_if_cancelled(operation);
-        Slic3r::Model model;
-
-        // ── load each STL segment into the shared model ───────────────────────
-        for (uint32_t i = 0; i < n_files; i++) {
-            const uint32_t start = offsets[i * 2];
-            const uint32_t end   = offsets[i * 2 + 1];
-            if (end <= start || end > all_stl_len) {
-                record_error(*session, "invalid offset table");
-                return -1;
-            }
-            const uint32_t len = end - start;
-            const std::string path = "/tmp/ow_multi_" + std::to_string(i) + ".stl";
-            {
-                FILE* f = std::fopen(path.c_str(), "wb");
-                if (!f) { record_error(*session, "cannot write temp STL"); return -3; }
-                std::fwrite(base + start, 1, static_cast<std::size_t>(len), f);
-                std::fclose(f);
-            }
-            const std::string name = "object_" + std::to_string(i);
-            const bool ok = load_staged_stl(path.c_str(), &model, name.c_str());
-            std::remove(path.c_str());
-            if (!ok) {
-                record_error(*session, "STL load failed for file " + std::to_string(i));
-                return -4;
-            }
-            throw_if_cancelled(operation);
-        }
-
-        if (model.objects.empty()) { record_error(*session, "no objects loaded"); return -5; }
-
-        // The transform table is parallel to input files. A malformed or
-        // unusual STL load must not make the transform loop read past that
-        // table if one file expands into multiple model objects.
-        if (transforms && model.objects.size() != static_cast<std::size_t>(n_files)) {
-            record_error(*session, "current-plate transforms require one printable object per STL file");
-            return -1;
-        }
-
-        // Per-object extruder override requires an exact 1:1 file→object
-        // correspondence (true for the common case of one watertight solid
-        // per STL). If any file expanded into more than one object, skip the
-        // mapping entirely rather than guess a wrong association.
-        const bool can_map_extruders =
-            extruder_ids != nullptr && model.objects.size() == static_cast<std::size_t>(n_files);
-
-        // ── centre each mesh; give each one an instance; optional extruder override ──
-        if (!transforms) {
-            // Keep the legacy path untouched when no transform table is sent.
-            for (std::size_t i = 0; i < model.objects.size(); i++) {
-                auto* obj = model.objects[i];
-                center_object_xy_only(obj);
-                if (obj->instances.empty())
-                    obj->add_instance();
-                if (can_map_extruders && extruder_ids[i] > 0) {
-                    obj->config.set("extruder", extruder_ids[i]);
-                }
-            }
-        } else {
-            std::vector<bool> pinned(model.objects.size(), false);
-            for (std::size_t i = 0; i < model.objects.size(); i++) {
-                ObjectTransformInput transform;
-                std::string transform_error;
-                if (!read_object_transform(transforms, i, transform, transform_error)) {
-                    record_error(*session, transform_error);
-                    return -1;
-                }
-                pinned[i] = transform.has_offset;
-                auto* obj = model.objects[i];
-                center_object_xy_only(obj);
-                add_transformed_instance(obj, *session, transform, false);
-                obj->ensure_on_bed();
-                if (can_map_extruders && extruder_ids[i] > 0)
-                    obj->config.set("extruder", extruder_ids[i]);
-            }
-            arrange_transformed_model(model, *session, &pinned);
-        }
-
-        // ── auto-arrange on the bed ───────────────────────────────────────
-        if (!transforms) {
-            // coord_t uses 1 µm resolution: 1 mm = 1,000,000 units.
-            // For circular beds the arrangement boundary is the largest axis-aligned
-            // square inscribed in the circle (half-side = radius / √2) so objects are
-            // never placed in the rectangle corners that fall outside the printable area.
-            const double half_w = (session->bed_shape == "circle")
-                ? session->bed_cx / std::sqrt(2.0)
-                : session->bed_cx;
-            const double half_h = (session->bed_shape == "circle")
-                ? session->bed_cy / std::sqrt(2.0)
-                : session->bed_cy;
-            const Slic3r::BoundingBox bed(
-                Slic3r::Point(
-                    static_cast<coord_t>((session->bed_cx - half_w) * 1e6),
-                    static_cast<coord_t>((session->bed_cy - half_h) * 1e6)
-                ),
-                Slic3r::Point(
-                    static_cast<coord_t>((session->bed_cx + half_w) * 1e6),
-                    static_cast<coord_t>((session->bed_cy + half_h) * 1e6)
-                )
-            );
-
-            Slic3r::ArrangeParams params;
-            params.min_obj_distance = static_cast<coord_t>(2.0 * 1e6); // 2 mm gap
-            params.parallel         = true;
-
-            // Objects that don't fit land at bed centre instead of throwing
-            Slic3r::arrange_objects(model, bed, params,
-                [session](Slic3r::arrangement::ArrangePolygon& ap) {
-                    ap.translation = Slic3r::Vec2crd(
-                        static_cast<coord_t>(session->bed_cx * 1e6),
-                        static_cast<coord_t>(session->bed_cy * 1e6)
-                    );
-                });
-        }
-
-        // ── configure & slice ─────────────────────────────────────────────
-        // Fit the prime tower onto the bed before applying the config — the
-        // model is loaded and arranged now, so its height is known (see
-        // clamp_wipe_tower_to_bed). bed_cx/cy are half-extents.
-        clamp_wipe_tower_to_bed(session->config, model, 2.0 * session->bed_cx, 2.0 * session->bed_cy);
-        Slic3r::Print print;
-        operation.attach(print);
-        ActivePrintGuard print_guard(operation);
-        print.apply(model, session->config);
-        zero_plate_origin(print);
-        set_is_bbl_printer(print, session->config);
-        // See the private single-object adapter: opt-in override of the mixed-nozzle-temperature guard
-        // for single-nozzle multi-material plates (issue #164).
-        if (session->remove_mixed_temp_restriction)
-            print.set_check_multi_filaments_compatibility(false);
-        // Variable (adaptive) layer height (issue #138); see the private single-object adapter. With a
-        // multi-object plate the engine requires all objects share the same
-        // layering when a prime tower is on (Print::validate), so an adaptive
-        // multi-material plate with a tower surfaces that as a -6 validation
-        // error rather than silently ignoring the setting.
-        if (session->adaptive_layer_height)
-            apply_adaptive_layer_height(print, session->adaptive_layer_height_quality);
-        attach_progress_callback(print, *session);
-
-        {
-            // `warning` absorbs the non-fatal mixed-temperature notice when the
-            // guard above is off; see the private single-object adapter for why the pointer is required.
-            Slic3r::StringObjectException warning;
-            Slic3r::StringObjectException err = print.validate(&warning);
-            if (!err.string.empty()) { record_error(*session, err.string); return -6; }
-        }
-
-        try {
-            throw_if_cancelled(operation);
-            print.process();
-            throw_if_cancelled(operation);
-        } catch (const Slic3r::CanceledException&) {
-            record_error(*session, "slice cancelled");
-            return ONESLICER_ERR_CANCELLED;
-        } catch (const Slic3r::SlicingError& e) {
-            record_error(*session, e.what());
-            return -7;
-        }
-
-        TempFileGuard out_guard("/tmp/ow_out.gcode");
-        Slic3r::GCodeProcessorResult processor_result;
-        {
-            Slic3r::GCode gcode_gen;
-            gcode_gen.do_export(&print, "/tmp/ow_out.gcode", &processor_result, nullptr);
-        }
-        throw_if_cancelled(operation);
-        const std::string statistics_json = serialize_slice_statistics(print, processor_result);
-
-        FILE* gf = std::fopen("/tmp/ow_out.gcode", "rb");
-        if (!gf) { record_error(*session, "gcode export produced no output"); return -8; }
-
-        std::fseek(gf, 0, SEEK_END);
-        long sz = std::ftell(gf);
-        std::rewind(gf);
-
-        char* buf = static_cast<char*>(std::malloc(static_cast<std::size_t>(sz) + 1));
-        if (!buf) {
-            std::fclose(gf);
-            record_error(*session, "out of memory");
-            return -9;
-        }
-        std::fread(buf, 1, static_cast<std::size_t>(sz), gf);
-        std::fclose(gf);
-        buf[sz] = '\0';
-
-        if (sz < 0 || static_cast<unsigned long long>(sz) > UINT32_MAX) {
-            std::free(buf);
-            record_error(*session, "G-code output exceeds the C ABI length limit");
-            return ONESLICER_ERR_OUTPUT;
-        }
-        *out_gcode = reinterpret_cast<uint8_t*>(buf);
-        *out_len   = static_cast<uint32_t>(sz);
-        publish_slice_statistics(*session, statistics_json);
-        return ONESLICER_OK;
-
-    } catch (const Slic3r::CanceledException&) {
-        record_error(*session, "slice cancelled");
-        return ONESLICER_ERR_CANCELLED;
-    } catch (const std::exception& e) {
-        record_error(*session, e.what());
-        return -9;
-    }
-}
-
-/**
  * Convert a STEP file to binary STL using OrcaSlicer's OCCT reader.
  *
  * Only STEP is supported: OrcaSlicer's load_step() uses STEPCAFControl_Reader,
@@ -5320,10 +4766,10 @@ oneslicer_status_t oneslicer_cad_to_stl(
  * length, never a NUL-terminated string read). Caller must free with
  * oneslicer_free().
  *
- * Internal adapter used by the API 0.7.0-pre.1 project implementation; -8 means the 3MF export
+ * Internal single-mesh export used by the API 0.7 project implementation; -8 means the 3MF export
  * itself (store_bbs_3mf) failed rather than gcode export.
  */
-static oneslicer_status_t legacy_write_3mf(
+static oneslicer_status_t write_single_mesh_3mf(
     oneslicer_session_t session_ptr,
     const uint8_t* stl_data,
     uint32_t stl_len,
@@ -5367,7 +4813,7 @@ static oneslicer_status_t legacy_write_3mf(
             return -5;
         }
 
-        // Same placement convention as the private single-object adapter, so the mesh lands back in
+        // Place the model using the same convention as project slicing, so the mesh lands back in
         // the same spot on re-import instead of at the model-space origin.
         for (auto* obj : model.objects) {
             center_object_xy_only(obj);

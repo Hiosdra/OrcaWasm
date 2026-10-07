@@ -109,13 +109,13 @@ All other features are optional and are selected from `oneslicer_get_capabilitie
 at runtime. This build reports profile initialization/application, modifier
 volumes and native modifier preservation, prepare/arrange, multi-plate slicing,
 project export with slice artifacts and preservation, OBJ/STEP/3MF conversion,
-and cancellation as supported. STEP project meshes are imported and tessellated
-through OrcaSlicer's native reader, then sliced through the project path;
-`project.meshFormat.step` remains `partial` while unit, sheet-body, and warning
-conformance is completed. Mapped STEP previews and project face attributes are
-reported as `unsupported`; `oneslicer_project_get_preview` remains exported by
-the C ABI and returns `UNSUPPORTED`. Hosts must read every optional status from
-the capability document and must not infer support from an exported C symbol.
+and cancellation as supported. OrcaWasm does not accept STEP as a project mesh:
+hosts should convert it with `format.stepToStl`, then send the resulting STL to
+project operations while retaining the original `.step` or `.stp` display name.
+Mapped STEP previews and project face attributes are reported as `unsupported`;
+`oneslicer_project_get_preview` remains exported by the C ABI and returns
+`UNSUPPORTED`. Hosts must read every optional status from the capability
+document and must not infer support from an exported C symbol.
 
 Cancellation also covers running operations in the TypeScript binding. The
 reference glue calls the synchronous C ABI on the runtime's JS thread, where a
