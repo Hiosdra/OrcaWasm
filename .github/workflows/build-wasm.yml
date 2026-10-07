@@ -338,12 +338,12 @@ jobs:
         run: |
           source "$EMSDK/emsdk_env.sh"
           INSTALL="$(pwd)/deps-install"
-          STAMP="${INSTALL}/.math_built_mt_native_eh_v3"
+          STAMP="${INSTALL}/.math_built_mt_native_eh_v4"
           [[ -f "${STAMP}" ]] && echo "[math] stamp exists — skip" && exit 0
 
           GMP_VERSION=6.3.0
           MPFR_VERSION=4.2.2
-          CGAL_VERSION=6.2
+          CGAL_VERSION=6.2.1
           DL=/tmp/math-dl
           mkdir -p "${DL}"
 

@@ -247,6 +247,55 @@ patch("src/libslic3r/AABBTreeLines.hpp", [
 ])
 
 # =============================================================================
+# 4a.1. CGAL 6.x compatibility in OrcaSlicer v2.4.2
+#      Surface_mesh::property_map() now returns std::optional, and
+#      extract_boundary_cycles moved from Polygon_mesh_processing to CGAL.
+#      CGAL 6.2 also requires the explicit 3D AABB traits name used here.
+#      The workflow pins CGAL 6.2.1, whose Gmpzf double-comparison overloads
+#      also fix a compile ambiguity present in CGAL 6.2.
+# =============================================================================
+patch("src/libslic3r/CutSurface.cpp", [
+    (
+        r'(\.property_map<[^>\n]+>\([^;\n]*?\))\.first',
+        r'\1.value()',
+        1,
+    ),
+    (
+        r'CGAL::AABB_traits<',
+        r'CGAL::AABB_traits_3<',
+        1,
+    ),
+])
+verify_contains(
+    "src/libslic3r/CutSurface.cpp",
+    "property_map<EI, IntersectingElement>(edge_shape_map_name).value()",
+    "CGAL 6 property_map compatibility patch",
+)
+verify_contains(
+    "src/libslic3r/CutSurface.cpp",
+    "CGAL::AABB_traits_3<EpicKernel, Primitive>",
+    "CGAL 6 AABB traits compatibility patch",
+)
+
+patch("src/libslic3r/MeshBoolean.cpp", [
+    (
+        r'CGAL::Polygon_mesh_processing::extract_boundary_cycles',
+        r'CGAL::extract_boundary_cycles',
+        1,
+    ),
+    (
+        r'\bPMP::extract_boundary_cycles',
+        r'CGAL::extract_boundary_cycles',
+        1,
+    ),
+])
+verify_contains(
+    "src/libslic3r/MeshBoolean.cpp",
+    "CGAL::extract_boundary_cycles(out, std::back_inserter(border_cycles))",
+    "CGAL 6 extract_boundary_cycles compatibility patch",
+)
+
+# =============================================================================
 # 4b. Override headers — copy into orca/ source tree
 #     GCC/Clang search the *including file's* directory before any -I path
 #     for #include "..." directives, so the only reliable way to override a

@@ -112,7 +112,6 @@ B2_EXTRA_CXXFLAGS="cxxflags=-fwasm-exceptions -pthread"
   --with-nowide \
   --with-program_options \
   --with-regex \
-  --with-system \
   --with-thread \
   "${B2_DEFINES[@]}" \
   "${B2_EXTRA_CXXFLAGS}" \
@@ -121,8 +120,9 @@ B2_EXTRA_CXXFLAGS="cxxflags=-fwasm-exceptions -pthread"
 
 echo "[boost] installed headers:"
 ls "${INSTALL}/include/boost/version.hpp" && echo "  boost/version.hpp OK"
-echo "[boost] installed libs (sample):"
-ls "${INSTALL}/lib/libboost_system"* 2>/dev/null | head -3 || echo "  no libboost_system found!"
+echo "[boost] Boost.System is header-only; no libboost_system archive is required."
+echo "[boost] installed compiled libs (sample):"
+ls "${INSTALL}/lib/libboost_filesystem"* 2>/dev/null | head -3 || echo "  no libboost_filesystem found!"
 touch "${STAMP}"
 
 )
@@ -133,12 +133,12 @@ touch "${STAMP}"
 (
 source "$EMSDK/emsdk_env.sh"
 INSTALL="$(pwd)/deps-install"
-STAMP="${INSTALL}/.math_built_mt_native_eh_v3"
+STAMP="${INSTALL}/.math_built_mt_native_eh_v4"
 [[ -f "${STAMP}" ]] && echo "[math] stamp exists — skip" && exit 0
 
 GMP_VERSION=6.3.0
 MPFR_VERSION=4.2.2
-CGAL_VERSION=6.2
+CGAL_VERSION=6.2.1
 DL=/tmp/math-dl
 mkdir -p "${DL}"
 
