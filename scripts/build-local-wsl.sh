@@ -70,7 +70,7 @@ BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
 # The dependency cache is scoped to the Emscripten version; this
 # stamp additionally records the Boost source and build flags.
-STAMP="${INSTALL}/.boost_built_${BOOST_VERSION}_mt_native_eh_v5"
+STAMP="${INSTALL}/.boost_built_${BOOST_VERSION}_mt_native_eh_v6"
 mkdir -p "${INSTALL}"
 [[ -f "${STAMP}" ]] && echo "[boost] stamp exists — skip" && exit 0
 
@@ -476,6 +476,8 @@ mkdir -p build-wasm
 # Compile the full tree with pthreads and use real oneTBB headers.
 COMMON_SHIM_DIR="${WORK}/wasm/shims-common"
 
+# WebAssembly has fixed round-to-nearest arithmetic; CGAL's interval mode
+# uses conservative nextafter bounds instead of directed fenv modes.
 emcmake cmake \
   -S orca \
   -B build-wasm \

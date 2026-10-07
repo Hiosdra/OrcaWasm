@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Enable Boost.Interval's C99 rounding adapter on Emscripten.
+"""Make Boost.Interval headers parse on Emscripten without fake fenv support.
 
-Boost 1.92 marks WebAssembly as lacking the C++11 fenv extensions.  Its
-Boost.Interval header uses that broad feature macro to reject the platform,
-even though Emscripten's C++17 target supplies the C99 fenv API used by the
-adapter.  CGAL is compiled with CGAL_ALWAYS_ROUND_TO_NEAREST on WASM, so its
-own interval arithmetic does not rely on directed hardware rounding modes.
+CGAL's surface-sweep umbrella header includes algebraic-kernel templates that
+mention Boost.Interval even when this build only instantiates segment traits.
+WebAssembly has no floating-point environment, so this patch lets those
+templates parse but makes any actual Boost.Interval arithmetic fail at compile
+time.  CGAL itself is built with its supported round-to-nearest interval mode.
 """
 
 import argparse
@@ -13,15 +13,70 @@ import sys
 from pathlib import Path
 
 
-OLD_GUARD = (
-    "#if defined(BOOST_NUMERIC_INTERVAL_NO_HARDWARE) "
-    "&& !defined(BOOST_NO_FENV_H)"
-)
-NEW_GUARD = (
-    "#if defined(BOOST_NUMERIC_INTERVAL_NO_HARDWARE) "
-    "&& (!defined(BOOST_NO_FENV_H) "
-    "|| (defined(__EMSCRIPTEN__) && __cplusplus >= 201103L))"
-)
+OLD_ROUNDING_BLOCK = """#if defined(BOOST_NUMERIC_INTERVAL_NO_HARDWARE) && !defined(BOOST_NO_FENV_H)
+#  include <boost/numeric/interval/detail/c99_rounding_control.hpp>
+#endif
+
+#if defined(BOOST_NUMERIC_INTERVAL_NO_HARDWARE)
+#  undef BOOST_NUMERIC_INTERVAL_NO_HARDWARE
+#  error Boost.Numeric.Interval: Please specify rounding control mechanism.
+#endif"""
+NEW_ROUNDING_BLOCK = """#if defined(BOOST_NUMERIC_INTERVAL_NO_HARDWARE) && defined(__EMSCRIPTEN__)
+#  include <boost/numeric/interval/detail/emscripten_rounding_unavailable.hpp>
+#  undef BOOST_NUMERIC_INTERVAL_NO_HARDWARE
+#elif defined(BOOST_NUMERIC_INTERVAL_NO_HARDWARE) && !defined(BOOST_NO_FENV_H)
+#  include <boost/numeric/interval/detail/c99_rounding_control.hpp>
+#endif
+#if defined(BOOST_NUMERIC_INTERVAL_NO_HARDWARE)
+#  undef BOOST_NUMERIC_INTERVAL_NO_HARDWARE
+#  error Boost.Numeric.Interval: Please specify rounding control mechanism.
+#endif"""
+OLD_SPECIALIZATIONS = """template<>
+struct rounded_math<float>
+  : save_state<rounded_arith_opp<float> >
+{};
+
+template<>
+struct rounded_math<double>
+  : save_state<rounded_arith_opp<double> >
+{};
+
+template<>
+struct rounded_math<long double>
+  : save_state<rounded_arith_opp<long double> >
+{};"""
+NEW_SPECIALIZATIONS = """#if defined(__EMSCRIPTEN__)
+template<>
+struct rounded_math<float>
+  : save_state<rounded_arith_opp<float, detail::emscripten_rounding_unavailable<float> > >
+{};
+
+template<>
+struct rounded_math<double>
+  : save_state<rounded_arith_opp<double, detail::emscripten_rounding_unavailable<double> > >
+{};
+
+template<>
+struct rounded_math<long double>
+  : save_state<rounded_arith_opp<long double, detail::emscripten_rounding_unavailable<long double> > >
+{};
+#else
+template<>
+struct rounded_math<float>
+  : save_state<rounded_arith_opp<float> >
+{};
+
+template<>
+struct rounded_math<double>
+  : save_state<rounded_arith_opp<double> >
+{};
+
+template<>
+struct rounded_math<long double>
+  : save_state<rounded_arith_opp<long double> >
+{};
+#endif"""
+NEW_MARKER = "detail::emscripten_rounding_unavailable<double>"
 
 
 def main() -> int:
@@ -35,20 +90,24 @@ def main() -> int:
         return 1
 
     contents = header.read_text(encoding="utf-8")
-    if NEW_GUARD in contents:
-        print("[boost] Boost.Interval Emscripten rounding guard already patched")
+    if NEW_MARKER in contents:
+        print("[boost] Boost.Interval Emscripten guard already patched")
         return 0
 
-    count = contents.count(OLD_GUARD)
-    if count != 1:
+    guard_count = contents.count(OLD_ROUNDING_BLOCK)
+    specialization_count = contents.count(OLD_SPECIALIZATIONS)
+    if guard_count != 1 or specialization_count != 1:
         print(
-            f"FATAL: expected one Boost.Interval rounding guard in {header}, found {count}",
+            "FATAL: expected one upstream Boost.Interval rounding block and "
+            f"specialization block in {header}; found {guard_count} and {specialization_count}",
             file=sys.stderr,
         )
         return 1
 
-    header.write_text(contents.replace(OLD_GUARD, NEW_GUARD), encoding="utf-8")
-    print("[boost] enabled the C99 rounding adapter for Emscripten")
+    contents = contents.replace(OLD_ROUNDING_BLOCK, NEW_ROUNDING_BLOCK)
+    contents = contents.replace(OLD_SPECIALIZATIONS, NEW_SPECIALIZATIONS)
+    header.write_text(contents, encoding="utf-8")
+    print("[boost] disabled unsafe Boost.Interval arithmetic on Emscripten")
     return 0
 
 
