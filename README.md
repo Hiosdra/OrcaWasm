@@ -90,9 +90,11 @@ oneslicer_free / oneslicer_last_error
 `oneslicer_three_mf_to_stl` is optional `format.threeMfToStl` (geometry only). An Orca
 project `.3mf` is loaded as a native profile with `initProfile("project.3mf", ...)`.
 
-To update the API, copy `js/glue/oneslicer-emscripten-glue.js`,
-`js/glue/oneslicer-conformance.mjs` and `include/oneslicer_api.h` unmodified
-from the API release into `wasm/oneslicer/` and `bridge/` respectively.
+To update the API, copy `js/glue/oneslicer-emscripten-glue.js` and
+`include/oneslicer_api.h` unmodified from the API release into
+`wasm/oneslicer/` and `bridge/`. The vendored conformance suite is based on
+`js/glue/oneslicer-conformance.mjs`; its `sameJson` helper canonicalizes object
+keys because JSON member order is not part of the API contract.
 
 ## one-slicer-api compatibility
 
@@ -113,10 +115,12 @@ through OrcaSlicer's native reader, then sliced through the project path;
 conformance is completed. The engine reports mapped STEP previews and painted
 STEP face attributes as `partial`: the preview returns the original Part 21
 face labels alongside Orca's tessellation, and seam preferences are applied
-through Orca's native seam annotations. Files whose tessellation cannot be
-mapped completely return `UNSUPPORTED`; triangle-domain attributes and other
-STEP semantics are not advertised. Hosts must read every optional status from
-the capability document and must not infer support from an exported C symbol.
+through Orca's native seam annotations. A valid source face with no generated
+triangles is retained in the manifest but has no seam effect. A mapped preview
+returns `UNSUPPORTED` if any output triangle cannot be linked to an original
+face. Triangle-domain attributes and other STEP semantics are not advertised.
+Hosts must read every optional status from the capability document and must
+not infer support from an exported C symbol.
 
 Cancellation also covers running operations in the TypeScript binding. The
 reference glue calls the synchronous C ABI on the runtime's JS thread, where a

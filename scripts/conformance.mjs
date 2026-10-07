@@ -4,9 +4,10 @@
  *
  * Loads slicer-mt.js only through its embedded TypeScript binding
  * (`OneSlicerEngine`) — the path every host uses — and runs the vendored,
- * binding-neutral conformance suite (wasm/oneslicer/oneslicer-conformance.mjs,
- * copied unmodified from the API release). Engine-specific behaviour stays in
- * smoke-test.mjs; this script proves the shared contract.
+ * binding-neutral conformance suite (wasm/oneslicer/oneslicer-conformance.mjs),
+ * based on the API release. The vendored copy compares JSON objects without
+ * depending on member order. Engine-specific behaviour stays in smoke-test.mjs;
+ * this script proves the shared contract.
  *
  * Usage:
  *   node scripts/conformance.mjs [--wasm-dir artifacts]

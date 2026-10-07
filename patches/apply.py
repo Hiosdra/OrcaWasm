@@ -255,7 +255,7 @@ patch("src/libslic3r/Format/STEP.hpp", [
     (
         r'(#include <atomic>)',
         r'\1\n#include <cstdint>\n#include <utility>\n#include <vector>\n'
-        r'#include "NCollection_IndexedDataMap.hxx"\n#include "TopTools_ShapeMapHasher.hxx"\n#include "TopoDS_Shape.hxx"',
+        r'#include "TopoDS_Shape.hxx"',
         1,
     ),
     (
@@ -270,11 +270,6 @@ patch("src/libslic3r/Format/STEP.hpp", [
         1,
     ),
     (
-        r'(struct NamedSolid\s*\{)',
-        r'\1\n    using FaceEntityMap = NCollection_IndexedDataMap<TopoDS_Shape, std::uint32_t, TopTools_ShapeMapHasher>;',
-        1,
-    ),
-    (
         r'(Step_Status mesh\(Model\* model,.*?double angle_defletion = 0\.5\);)',
         r'\1\n    const std::vector<std::uint32_t>& triangle_face_ids() const { return m_triangle_face_ids; }\n'
         r'    const std::vector<std::uint32_t>& source_face_entity_ids() const { return m_source_face_entity_ids; }',
@@ -283,8 +278,7 @@ patch("src/libslic3r/Format/STEP.hpp", [
     (
         r'(std::vector<NamedSolid> m_name_solids;)',
         r'\1\n    std::vector<std::uint32_t> m_triangle_face_ids;\n'
-        r'    std::vector<std::uint32_t> m_source_face_entity_ids;\n'
-        r'    NamedSolid::FaceEntityMap m_face_entities;',
+        r'    std::vector<std::uint32_t> m_source_face_entity_ids;',
         1,
     ),
 ])
@@ -299,13 +293,32 @@ patch("src/libslic3r/Format/STEP.cpp", [
     ),
     (
         r'static void getNamedSolids\(const TopLoc_Location& location,\s*const std::string& prefix,\s*unsigned int& id,\s*const Handle\(XCAFDoc_ShapeTool\) shapeTool,\s*const TDF_Label label,\s*std::vector<NamedSolid>& namedSolids,\s*bool isSplitCompound = false\) \{',
+        'static std::uint32_t getFaceEntityId(\n'
+        '    const TopoDS_Shape& face,\n'
+        '    const Handle(XSControl_TransferReader)& transfer_reader,\n'
+        '    const Handle(Interface_InterfaceModel)& step_model) {\n'
+        '    if (transfer_reader.IsNull() || step_model.IsNull()) return 0;\n'
+        '    const Handle(Standard_Transient) entity = transfer_reader->EntityFromShapeResult(face, 3);\n'
+        '    if (entity.IsNull() || (!entity->IsKind(STANDARD_TYPE(StepShape_AdvancedFace)) && !entity->IsKind(STANDARD_TYPE(StepShape_FaceSurface)))) return 0;\n'
+        '    const Handle(TCollection_HAsciiString) source_label = step_model->StringLabel(entity);\n'
+        '    const char* label_text = source_label.IsNull() ? nullptr : source_label->ToCString();\n'
+        '    if (label_text == nullptr || label_text[0] != \'#\' || label_text[1] == 0) return 0;\n'
+        '    std::uint64_t entity_id = 0;\n'
+        '    for (const char* digit = label_text + 1; *digit; ++digit) {\n'
+        '        const unsigned value = static_cast<unsigned>(*digit - \'0\');\n'
+        '        if (*digit < \'0\' || *digit > \'9\' || entity_id > (0xffffffffULL - value) / 10) return 0;\n'
+        '        entity_id = entity_id * 10 + value;\n'
+        '    }\n'
+        '    return entity_id > 0 ? static_cast<std::uint32_t>(entity_id) : 0;\n'
+        '}\n\n'
         'static std::vector<std::uint32_t> getFaceEntityIds(\n'
         '    const TopoDS_Shape& shape,\n'
-        '    const NamedSolid::FaceEntityMap& face_entities) {\n'
+        '    const Handle(XSControl_TransferReader)& transfer_reader,\n'
+        '    const Handle(Interface_InterfaceModel)& step_model) {\n'
         '    std::vector<std::uint32_t> ids;\n'
         '    for (TopExp_Explorer explorer(shape, TopAbs_FACE); explorer.More(); explorer.Next()) {\n'
         '        const TopoDS_Shape& face = explorer.Current();\n'
-        '        ids.push_back(face_entities.Contains(face) ? face_entities.FindFromKey(face) : 0);\n'
+        '        ids.push_back(getFaceEntityId(face, transfer_reader, step_model));\n'
         '    }\n'
         '    return ids;\n'
         '}\n\n'
@@ -314,25 +327,26 @@ patch("src/libslic3r/Format/STEP.cpp", [
         '                           unsigned int& id,\n'
         '                           const Handle(XCAFDoc_ShapeTool) shapeTool,\n'
         '                           const TDF_Label label,\n'
-        '                           const NamedSolid::FaceEntityMap& face_entities,\n'
+        '                           const Handle(XSControl_TransferReader)& transfer_reader,\n'
+        '                           const Handle(Interface_InterfaceModel)& step_model,\n'
         '                           std::vector<NamedSolid>& namedSolids,\n'
         '                           bool isSplitCompound = false) {',
         1,
     ),
     (
         r'getNamedSolids\(localLocation, fullName, id, shapeTool, components\.Value\(compIndex\), namedSolids, isSplitCompound\);',
-        r'getNamedSolids(localLocation, fullName, id, shapeTool, components.Value(compIndex), face_entities, namedSolids, isSplitCompound);',
+        r'getNamedSolids(localLocation, fullName, id, shapeTool, components.Value(compIndex), transfer_reader, step_model, namedSolids, isSplitCompound);',
         1,
     ),
     (
         r'getNamedSolids\(TopLoc_Location\{\}, "", id, m_shape_tool, topLevelShapes\.Value\(iLabel\), namedSolids, isSplitCompound\);',
-        r'getNamedSolids(TopLoc_Location{}, "", id, m_shape_tool, topLevelShapes.Value(iLabel), m_face_entities, namedSolids, isSplitCompound);',
+        r'getNamedSolids(TopLoc_Location{}, "", id, m_shape_tool, topLevelShapes.Value(iLabel), transfer_reader, step_model, namedSolids);',
         1,
     ),
     (
         r'if \(!isSplitCompound\) \{\s*namedSolids\.emplace_back\(TopoDS::Compound\(transform\.Shape\(\)\), fullName\);\s*break;\s*\}',
         'if (!isSplitCompound) {\n'
-        '                namedSolids.emplace_back(TopoDS::Compound(transform.Shape()), fullName, getFaceEntityIds(shape, face_entities));\n'
+        '                namedSolids.emplace_back(TopoDS::Compound(transform.Shape()), fullName, getFaceEntityIds(shape, transfer_reader, step_model));\n'
         '                break;\n'
         '            }',
         1,
@@ -340,25 +354,25 @@ patch("src/libslic3r/Format/STEP.cpp", [
     (
         r'if \(!isSplitCompound\) \{\s*namedSolids\.emplace_back\(TopoDS::CompSolid\(transform\.Shape\(\)\), fullName\);\s*\} else \{\s*for \(explorer\.Init\(transform\.Shape\(\), TopAbs_SOLID\); explorer\.More\(\); explorer\.Next\(\)\) \{\s*i\+\+;\s*const TopoDS_Shape& currentShape = explorer\.Current\(\);\s*namedSolids\.emplace_back\(TopoDS::Solid\(currentShape\), fullName \+ "-SOLID-" \+ std::to_string\(i\)\);\s*\}\s*\}',
         'if (!isSplitCompound) {\n'
-        '                namedSolids.emplace_back(TopoDS::CompSolid(transform.Shape()), fullName, getFaceEntityIds(shape, face_entities));\n'
+        '                namedSolids.emplace_back(TopoDS::CompSolid(transform.Shape()), fullName, getFaceEntityIds(shape, transfer_reader, step_model));\n'
         '            } else {\n'
         '                TopExp_Explorer source_solid(shape, TopAbs_SOLID);\n'
         '                for (explorer.Init(transform.Shape(), TopAbs_SOLID); explorer.More() && source_solid.More(); explorer.Next(), source_solid.Next()) {\n'
         '                    i++;\n'
         '                    const TopoDS_Shape& currentShape = explorer.Current();\n'
-        '                    namedSolids.emplace_back(TopoDS::Solid(currentShape), fullName + "-SOLID-" + std::to_string(i), getFaceEntityIds(source_solid.Current(), face_entities));\n'
+        '                    namedSolids.emplace_back(TopoDS::Solid(currentShape), fullName + "-SOLID-" + std::to_string(i), getFaceEntityIds(source_solid.Current(), transfer_reader, step_model));\n'
         '                }\n'
         '            }',
         1,
     ),
     (
         r'namedSolids\.emplace_back\(TopoDS::Solid\(transform\.Shape\(\)\), fullName\);',
-        r'namedSolids.emplace_back(TopoDS::Solid(transform.Shape()), fullName, getFaceEntityIds(shape, face_entities));',
+        r'namedSolids.emplace_back(TopoDS::Solid(transform.Shape()), fullName, getFaceEntityIds(shape, transfer_reader, step_model));',
         1,
     ),
     (
         r'namedSolids\.emplace_back\(TopoDS::Shell\(transform\.Shape\(\)\), fullName\);',
-        r'namedSolids.emplace_back(TopoDS::Shell(transform.Shape()), fullName, getFaceEntityIds(shape, face_entities));',
+        r'namedSolids.emplace_back(TopoDS::Shell(transform.Shape()), fullName, getFaceEntityIds(shape, transfer_reader, step_model));',
         1,
     ),
     (
@@ -375,16 +389,16 @@ patch("src/libslic3r/Format/STEP.cpp", [
         r'        Standard_Integer topShapeLength = topLevelShapes\.Length\(\) \+ 1;\s*'
         r'        for \(Standard_Integer iLabel = 1; iLabel < topShapeLength; \+\+iLabel\) \{\s*'
         r'            if \(cb_cancel\) return;\s*'
-        r'            getNamedSolids\(TopLoc_Location\{\}, "", id, m_shape_tool, topLevelShapes\.Value\(iLabel\), m_name_solids\);\s*'
+        r'            getNamedSolids\(TopLoc_Location\{\}, "", id, m_shape_tool, topLevelShapes\.Value\(iLabel\), transfer_reader, step_model, m_name_solids\);\s*'
         r'        \}',
         '        m_shape_tool = XCAFDoc_DocumentTool::ShapeTool(m_doc->Main());\n'
         '        m_name_solids.clear();\n'
-        '        m_face_entities.Clear();\n'
         '        m_source_face_entity_ids.clear();\n'
         '        const Handle(Interface_InterfaceModel) step_model = reader.Reader().Model();\n'
         '        const Handle(XSControl_WorkSession) work_session = reader.Reader().WS();\n'
+        '        Handle(XSControl_TransferReader) transfer_reader;\n'
         '        if (!step_model.IsNull() && !work_session.IsNull() && !work_session->TransferReader().IsNull()) {\n'
-        '            const Handle(XSControl_TransferReader) transfer_reader = work_session->TransferReader();\n'
+        '            transfer_reader = work_session->TransferReader();\n'
         '            for (Standard_Integer entity_index = 1; entity_index <= step_model->NbEntities(); ++entity_index) {\n'
         '                const Handle(Standard_Transient) entity = step_model->Value(entity_index);\n'
         '                if (entity.IsNull() || (!entity->IsKind(STANDARD_TYPE(StepShape_AdvancedFace)) && !entity->IsKind(STANDARD_TYPE(StepShape_FaceSurface)))) continue;\n'
@@ -397,11 +411,8 @@ patch("src/libslic3r/Format/STEP.cpp", [
         '                    if (*digit < \'0\' || *digit > \'9\' || entity_id > (0xffffffffULL - value) / 10) { valid_entity_id = false; break; }\n'
         '                    entity_id = entity_id * 10 + value;\n'
         '                }\n'
-        '                const TopoDS_Shape transferred = transfer_reader->ShapeResult(entity);\n'
         '                if (valid_entity_id && entity_id > 0) {\n'
         '                    m_source_face_entity_ids.push_back(static_cast<std::uint32_t>(entity_id));\n'
-        '                    if (!transferred.IsNull() && transferred.ShapeType() == TopAbs_FACE && !m_face_entities.Contains(transferred))\n'
-        '                        m_face_entities.Add(transferred, static_cast<std::uint32_t>(entity_id));\n'
         '                }\n'
         '            }\n'
         '        }\n'
@@ -411,7 +422,7 @@ patch("src/libslic3r/Format/STEP.cpp", [
         '        Standard_Integer topShapeLength = topLevelShapes.Length() + 1;\n'
         '        for (Standard_Integer iLabel = 1; iLabel < topShapeLength; ++iLabel) {\n'
         '            if (cb_cancel) return;\n'
-        '            getNamedSolids(TopLoc_Location{}, "", id, m_shape_tool, topLevelShapes.Value(iLabel), m_face_entities, m_name_solids);\n'
+        '            getNamedSolids(TopLoc_Location{}, "", id, m_shape_tool, topLevelShapes.Value(iLabel), transfer_reader, step_model, m_name_solids);\n'
         '        }',
         1,
     ),
@@ -465,8 +476,8 @@ patch("src/libslic3r/Format/STEP.cpp", [
 if not DRY_RUN:
     verify_contains(
         "src/libslic3r/Format/STEP.cpp",
-        "transfer_reader->ShapeResult(entity)",
-        "STEP face entity mapping was not installed in OrcaSlicer's importer.",
+        "EntityFromShapeResult(face, 3)",
+        "STEP face entity reverse mapping was not installed in OrcaSlicer's importer.",
     )
     verify_contains(
         "src/libslic3r/Format/STEP.cpp",

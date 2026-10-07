@@ -926,7 +926,6 @@ static oneslicer_status_t decode_step_face_attributes(
     const ProjectMeshInput& mesh,
     const std::uint8_t* object_blob,
     const std::vector<std::uint32_t>& source_face_ids,
-    const std::vector<std::uint32_t>& triangle_face_ids,
     StepFaceAttributeValues& values,
     std::string& error
 ) {
@@ -967,17 +966,6 @@ static oneslicer_status_t decode_step_face_attributes(
             previous_face_id = face_id;
         }
     }
-    std::set<std::uint32_t> tessellated_face_ids(triangle_face_ids.begin(), triangle_face_ids.end());
-    for (const auto& [semantic, semantic_values] : values) {
-        (void)semantic;
-        for (const auto& [face_id, value] : semantic_values) {
-            (void)value;
-            if (tessellated_face_ids.find(face_id) == tessellated_face_ids.end()) {
-                error = "OrcaSlicer cannot apply a STEP face attribute to a face with no mapped preview triangles";
-                return ONESLICER_ERR_UNSUPPORTED;
-            }
-        }
-    }
     return ONESLICER_OK;
 }
 
@@ -992,7 +980,7 @@ static oneslicer_status_t apply_step_face_attributes(
 ) {
     StepFaceAttributeValues values;
     const oneslicer_status_t decode_status = decode_step_face_attributes(
-        mesh_input, object_blob, source_face_ids, triangle_face_ids, values, error
+        mesh_input, object_blob, source_face_ids, values, error
     );
     if (decode_status != ONESLICER_OK) return decode_status;
     if (values.empty()) return ONESLICER_OK;
@@ -2023,7 +2011,47 @@ static bool collect_project_plate_inputs(
         const auto begin = session.project_object_blob.begin() + mesh->offset;
         const auto end = begin + mesh->length;
         const auto start = static_cast<std::uint32_t>(blob.size());
-        blob.insert(blob.end(), begin, end);
+        if (mesh->format == "step") {
+            const std::string step_path = "/tmp/ow-project-prepare-step-"
+                + std::to_string(session.id) + "-" + std::to_string(manifest_index) + ".step";
+            const std::string stl_path = step_path + ".stl";
+            std::vector<std::uint8_t> prepared_mesh;
+            {
+                TempFileGuard step_guard(step_path);
+                TempFileGuard stl_guard(stl_path);
+                FILE* step_file = std::fopen(step_path.c_str(), "wb");
+                if (!step_file) {
+                    error = "unable to stage project STEP mesh for preparation";
+                    return false;
+                }
+                const std::size_t written = std::fwrite(
+                    session.project_object_blob.data() + mesh->offset,
+                    1,
+                    mesh->length,
+                    step_file
+                );
+                std::fclose(step_file);
+                if (written != mesh->length) {
+                    error = "unable to stage complete project STEP mesh for preparation";
+                    return false;
+                }
+                const auto status = convert_project_step_to_stl(
+                    step_path.c_str(), stl_path.c_str(), error
+                );
+                if (status != ONESLICER_OK) return false;
+                if (!read_binary_file(stl_path.c_str(), prepared_mesh)) {
+                    error = "unable to read the prepared STEP mesh geometry";
+                    return false;
+                }
+            }
+            if (blob.size() > UINT32_MAX || prepared_mesh.size() > UINT32_MAX - blob.size()) {
+                error = "prepared project plate object blob exceeds the C ABI length limit";
+                return false;
+            }
+            blob.insert(blob.end(), prepared_mesh.begin(), prepared_mesh.end());
+        } else {
+            blob.insert(blob.end(), begin, end);
+        }
         offsets.push_back(start);
         offsets.push_back(static_cast<std::uint32_t>(blob.size()));
         extruders.push_back(static_cast<std::int32_t>(object->extruder_id));
@@ -3644,11 +3672,10 @@ oneslicer_status_t oneslicer_project_set_objects(
         const std::string preview_path = step_path + ".validated.stl";
         TempFileGuard preview_guard(preview_path);
         std::string step_error;
-        std::vector<std::uint32_t> triangle_face_ids;
         std::vector<std::uint32_t> source_face_ids;
         const oneslicer_status_t step_status = convert_project_step_to_stl(
             step_path.c_str(), preview_path.c_str(), step_error,
-            mesh.has_face_attributes ? &triangle_face_ids : nullptr,
+            nullptr,
             mesh.has_face_attributes ? &source_face_ids : nullptr
         );
         if (step_status != ONESLICER_OK) {
@@ -3658,7 +3685,7 @@ oneslicer_status_t oneslicer_project_set_objects(
         if (mesh.has_face_attributes) {
             StepFaceAttributeValues ignored_values;
             const oneslicer_status_t attribute_status = decode_step_face_attributes(
-                mesh, object_blob, source_face_ids, triangle_face_ids, ignored_values, step_error
+                mesh, object_blob, source_face_ids, ignored_values, step_error
             );
             if (attribute_status != ONESLICER_OK) {
                 record_error(*session, step_error);

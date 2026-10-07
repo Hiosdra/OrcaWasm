@@ -378,7 +378,17 @@ async function sliceGcode(session) {
     return { assetId: asset.id, gcode };
 }
 function sameJson(left, right) {
-    return JSON.stringify(left) === JSON.stringify(right);
+    const canonicalize = (value) => {
+        if (Array.isArray(value))
+            return value.map(canonicalize);
+        if (value && typeof value === 'object') {
+            return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]));
+        }
+        return value;
+    };
+    // JSON object member order is not part of the manifest contract. Engines
+    // may serialize the same project with a different key order.
+    return JSON.stringify(canonicalize(left)) === JSON.stringify(canonicalize(right));
 }
 /** Run the core suite and every optional suite the engine advertises. */
 export async function runConformance(artifact, input) {
