@@ -110,6 +110,17 @@ oneslicer_status_t oneslicer_project_get_manifest(
     uint8_t** out_json,
     uint32_t* out_len
 );
+/* Optional project.preview.stepFaces. Every engine exports this symbol;
+ * engines without mapped STEP previews return ONESLICER_ERR_UNSUPPORTED. */
+oneslicer_status_t oneslicer_project_get_preview(
+    oneslicer_session_t session,
+    const char* mesh_id_utf8,
+    uint32_t mesh_id_len,
+    uint8_t** out_descriptor_json,
+    uint32_t* out_descriptor_len,
+    uint8_t** out_preview_blob,
+    uint32_t* out_preview_blob_len
+);
 oneslicer_status_t oneslicer_project_prepare(
     oneslicer_session_t session,
     const uint8_t* request_json,

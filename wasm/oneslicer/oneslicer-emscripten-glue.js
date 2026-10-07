@@ -98,6 +98,7 @@ var oneslicerDefineEmscriptenEngine = (function () {
       '_oneslicer_project_export',
       '_oneslicer_project_get_asset',
       '_oneslicer_project_get_manifest',
+      '_oneslicer_project_get_preview',
       '_oneslicer_project_prepare',
       '_oneslicer_project_set_objects',
       '_oneslicer_project_slice',
@@ -212,6 +213,71 @@ var oneslicerDefineEmscriptenEngine = (function () {
       if (options?.signal?.aborted)
           throw new OneSlicerError('CANCELLED');
   }
+  function decodePreview(descriptorBytes, previewBlob, requestedMeshId) {
+      let descriptor;
+      try {
+          descriptor = JSON.parse(decoder.decode(descriptorBytes));
+      }
+      catch {
+          throw new OneSlicerError('OUTPUT', 'engine returned an invalid project-preview descriptor');
+      }
+      const exactKeys = [
+          'geometryRange',
+          'meshId',
+          'revision',
+          'schemaVersion',
+          'triangleCount',
+          'triangleFaceIdsRange',
+      ];
+      if (Object.keys(descriptor).sort().join('|') !== exactKeys.join('|')
+          || descriptor.schemaVersion !== ONESLICER_API_VERSION
+          || descriptor.meshId !== requestedMeshId
+          || typeof descriptor.revision !== 'string'
+          || descriptor.revision.length === 0
+          || !Number.isSafeInteger(descriptor.triangleCount)
+          || descriptor.triangleCount < 1
+          || descriptor.triangleCount > 0xffff_ffff) {
+          throw new OneSlicerError('OUTPUT', 'engine returned an invalid project-preview descriptor');
+      }
+      const triangleCount = descriptor.triangleCount;
+      const geometryRange = descriptor.geometryRange;
+      const idsRange = descriptor.triangleFaceIdsRange;
+      const validRange = (range) => !!range
+          && Number.isSafeInteger(range.offset)
+          && Number.isSafeInteger(range.length)
+          && range.offset >= 0
+          && range.length > 0
+          && range.offset <= previewBlob.byteLength
+          && range.length <= previewBlob.byteLength - range.offset;
+      if (!validRange(geometryRange) || !validRange(idsRange)
+          || geometryRange.offset !== 0
+          || geometryRange.length !== 84 + 50 * triangleCount
+          || idsRange.offset !== geometryRange.length
+          || idsRange.length !== 4 * triangleCount
+          || idsRange.offset + idsRange.length !== previewBlob.byteLength) {
+          throw new OneSlicerError('OUTPUT', 'engine returned out-of-bounds or inconsistent project-preview ranges');
+      }
+      const geometry = previewBlob.slice(geometryRange.offset, geometryRange.offset + geometryRange.length);
+      const stlTriangleCount = new DataView(geometry.buffer, geometry.byteOffset, geometry.byteLength).getUint32(80, true);
+      if (stlTriangleCount !== triangleCount) {
+          throw new OneSlicerError('OUTPUT', 'project-preview STL triangle count disagrees with its descriptor');
+      }
+      const idView = new DataView(previewBlob.buffer, previewBlob.byteOffset + idsRange.offset, idsRange.length);
+      const triangleFaceIds = new Uint32Array(triangleCount);
+      for (let index = 0; index < triangleCount; index += 1) {
+          const faceId = idView.getUint32(index * 4, true);
+          if (faceId === 0)
+              throw new OneSlicerError('OUTPUT', 'project-preview contains a zero STEP face id');
+          triangleFaceIds[index] = faceId;
+      }
+      return {
+          schemaVersion: ONESLICER_API_VERSION,
+          meshId: requestedMeshId,
+          revision: descriptor.revision,
+          geometry,
+          triangleFaceIds,
+      };
+  }
   class EmscriptenSession {
       binding;
       handle;
@@ -246,6 +312,23 @@ var oneslicerDefineEmscriptenEngine = (function () {
               const outPtr = heap.outPointer();
               const outLen = heap.outPointer();
               return [getManifest(session, outPtr, outLen), () => this.binding.takeJson(outPtr, outLen)];
+          });
+      }
+      async getPreview(meshId) {
+          const getPreview = this.binding.symbol('_oneslicer_project_get_preview');
+          const session = this.live();
+          const meshIdBytes = encoder.encode(meshId);
+          return this.binding.call(session, (heap) => {
+              const descriptorPtr = heap.outPointer();
+              const descriptorLen = heap.outPointer();
+              const blobPtr = heap.outPointer();
+              const blobLen = heap.outPointer();
+              const status = getPreview(session, heap.bytes(meshIdBytes), meshIdBytes.byteLength, descriptorPtr, descriptorLen, blobPtr, blobLen);
+              return [status, () => {
+                      const descriptor = this.binding.takeOwned(descriptorPtr, descriptorLen);
+                      const blob = this.binding.takeOwned(blobPtr, blobLen);
+                      return decodePreview(descriptor, blob, meshId);
+                  }];
           });
       }
       async prepare(request, options) {

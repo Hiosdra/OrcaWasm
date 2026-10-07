@@ -88,6 +88,9 @@ export const OPTIONAL_FEATURES = [
     'config.profileApply',
     'project.modifierVolumes',
     'project.modifierVolumes.nativeProject',
+    'project.meshFormat.step',
+    'project.preview.stepFaces',
+    'project.faceAttributes',
     'project.prepare',
     'project.slice.multiPlate',
     'project.export',
@@ -117,6 +120,66 @@ export function capabilityIssues(capabilities) {
         const status = document.features?.[feature];
         if (status !== 'supported')
             issues.push(`required feature ${feature} is ${status ?? 'missing'}`);
+    }
+    const project = document.project;
+    const features = document.features;
+    const extensionFeatures = ['project.meshFormat.step', 'project.preview.stepFaces', 'project.faceAttributes'];
+    for (const feature of extensionFeatures) {
+        if (!['supported', 'partial', 'unsupported'].includes(String(features?.[feature]))) {
+            issues.push(`required capability status ${feature} is missing or invalid`);
+        }
+    }
+    if (!Array.isArray(project?.meshFormats) || !project.meshFormats.includes('stl')) {
+        issues.push('project.meshFormats must include stl');
+    }
+    const supportsStep = features?.['project.meshFormat.step'] !== 'unsupported';
+    if (Array.isArray(project?.meshFormats) && project.meshFormats.includes('step') !== supportsStep) {
+        issues.push('project.meshFormats step entry disagrees with project.meshFormat.step');
+    }
+    const semantics = project?.faceAttributeSemantics;
+    const faceSupported = features?.['project.faceAttributes'] !== 'unsupported';
+    if (!semantics || !Array.isArray(semantics.triangle) || !Array.isArray(semantics.brepFace)) {
+        issues.push('project.faceAttributeSemantics must declare triangle and brepFace lists');
+    }
+    else {
+        const anyFaceSemantic = semantics.triangle.length > 0 || semantics.brepFace.length > 0;
+        if (anyFaceSemantic !== faceSupported)
+            issues.push('faceAttributeSemantics disagree with project.faceAttributes');
+        if (semantics.brepFace.length > 0 && !supportsStep) {
+            issues.push('brepFace semantics require project.meshFormat.step support');
+        }
+    }
+    if (features?.['project.preview.stepFaces'] !== 'unsupported' && !supportsStep) {
+        issues.push('project.preview.stepFaces requires project.meshFormat.step support');
+    }
+    return issues;
+}
+/**
+ * Check project formats and per-domain face semantics against one engine.
+ * Partial feature support is reported as an issue: this generic gate cannot
+ * inspect opaque mesh bytes or infer engine-specific subset rules.
+ */
+export function projectRequirementIssues(manifest, capabilities) {
+    const issues = [];
+    const project = capabilities.project;
+    const features = capabilities.features;
+    for (const mesh of manifest.meshes) {
+        const status = mesh.format === 'step' ? features['project.meshFormat.step'] : 'supported';
+        if (!project.meshFormats.includes(mesh.format) || status === 'unsupported') {
+            issues.push(`mesh ${mesh.id} requires unsupported ${mesh.format} project geometry`);
+        }
+        else if (status === 'partial') {
+            issues.push(`mesh ${mesh.id} requires a partial ${mesh.format} capability that needs engine-specific validation`);
+        }
+        for (const attribute of mesh.faceAttributes ?? []) {
+            const semantics = project.faceAttributeSemantics[attribute.domain];
+            if (!semantics?.includes(attribute.semantic)) {
+                issues.push(`mesh ${mesh.id} requires unsupported ${attribute.domain} semantic ${attribute.semantic}`);
+            }
+            else if (features['project.faceAttributes'] === 'partial') {
+                issues.push(`mesh ${mesh.id} requires a partial face-attribute capability that needs engine-specific validation`);
+            }
+        }
     }
     return issues;
 }
@@ -193,6 +256,69 @@ export function singleObjectManifest(meshLength, matrix = translation(100, 100))
         instances: [{ id: 'instance-0', objectId: 'object-0', plateId: 'plate-0', transform: { matrix } }],
         modifierVolumes: [],
     };
+}
+export function singleStepManifest(meshLength) {
+    const manifest = singleObjectManifest(meshLength);
+    manifest.meshes[0].format = 'step';
+    return manifest;
+}
+function trianglesInBinaryStl(bytes) {
+    if (bytes.byteLength < 84)
+        throw new Error('binary STL is shorter than its header');
+    const count = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(80, true);
+    if (bytes.byteLength !== 84 + count * 50)
+        throw new Error('binary STL length does not match its triangle count');
+    return count;
+}
+function sourceStepFaceIds(bytes) {
+    const step = decoder.decode(bytes);
+    const ids = new Set();
+    for (const match of step.matchAll(/#(\d+)\s*=\s*(?:ADVANCED_FACE|FACE_SURFACE)\b/gi)) {
+        const id = Number(match[1]);
+        if (Number.isSafeInteger(id) && id > 0 && id <= 0xffff_ffff)
+            ids.add(id);
+    }
+    return [...ids].sort((left, right) => left - right);
+}
+function projectWithAttributes(geometry, meshFormat, domain, semantics, storageFormat, entityIds = []) {
+    const manifest = meshFormat === 'step' ? singleStepManifest(geometry.byteLength) : singleObjectManifest(geometry.byteLength);
+    const attributes = [];
+    const chunks = [geometry];
+    let offset = geometry.byteLength;
+    const valueBytes = storageFormat === 'u8' ? 1 : 2;
+    const valueCount = domain === 'triangle' ? trianglesInBinaryStl(geometry) : entityIds.length;
+    for (const semantic of semantics) {
+        const recordBytes = domain === 'triangle' ? valueBytes : 4 + valueBytes;
+        const data = new Uint8Array(valueCount * recordBytes);
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        for (let index = 0; index < valueCount; index += 1) {
+            const recordOffset = index * recordBytes;
+            let value = semantic === 'material-slot' ? 1 : index % 2 === 0 ? 1 : 2;
+            if (domain === 'brepFace') {
+                view.setUint32(recordOffset, entityIds[index], true);
+            }
+            if (storageFormat === 'u8')
+                data[recordOffset + (domain === 'brepFace' ? 4 : 0)] = value;
+            else
+                view.setUint16(recordOffset + (domain === 'brepFace' ? 4 : 0), value, true);
+        }
+        attributes.push({
+            semantic,
+            domain,
+            format: storageFormat,
+            dataRange: { offset, length: data.byteLength },
+        });
+        chunks.push(data);
+        offset += data.byteLength;
+    }
+    manifest.meshes[0].faceAttributes = attributes;
+    const blob = new Uint8Array(offset);
+    let cursor = 0;
+    for (const chunk of chunks) {
+        blob.set(chunk, cursor);
+        cursor += chunk.byteLength;
+    }
+    return { blob, manifest };
 }
 const SELECTED_PLATE = {
     schemaVersion: '0.7.0-pre.1',
@@ -398,6 +524,7 @@ async function optionalSuites(recorder, engine, session, input, caps) {
         ['config.fullProfile', () => session.initProfile('oneslicer.conformance', new Uint8Array([123, 125]))],
         ['config.profileApply', () => session.applyProfile('oneslicer.conformance', new Uint8Array([123, 125]))],
         ['project.prepare', () => session.prepare({ schemaVersion: '0.7.0-pre.1', operation: 'arrange' })],
+        ['project.preview.stepFaces', () => session.getPreview('mesh-0')],
         [
             'project.export',
             () => session.export('project.3mf', { schemaVersion: '0.7.0-pre.1', preservation: 'portable', includeSliceArtifacts: false }),
@@ -413,6 +540,110 @@ async function optionalSuites(recorder, engine, session, input, caps) {
             const before = await session.getManifest();
             await expectError(call, ['UNSUPPORTED'], feature);
             assert(sameJson(await session.getManifest(), before), `${feature} changed the project`);
+        });
+    }
+    const assertFailedSetObjectsIsAtomic = async (label, call, codes) => {
+        const before = await session.getManifest();
+        const { assetId } = await sliceGcode(session);
+        const oldAsset = await session.getAsset(assetId);
+        await expectError(call, codes, label);
+        assert(sameJson(await session.getManifest(), before), `${label} changed the active project`);
+        const retained = await session.getAsset(assetId);
+        assert(retained.byteLength === oldAsset.byteLength && retained.every((byte, index) => byte === oldAsset[index]), `${label} invalidated or changed existing results`);
+    };
+    if (unsupported.has('project.meshFormat.step')) {
+        await recorder.check('project.meshFormat.step: unsupported upload is atomic', () => assertFailedSetObjectsIsAtomic('unsupported STEP mesh', () => session.setObjects(new Uint8Array([0]), singleStepManifest(1)), ['UNSUPPORTED']));
+    }
+    else if (input.samples?.step) {
+        await recorder.check('project.meshFormat.step: STEP upload, round-trip, and slice', async () => {
+            const stepManifest = singleStepManifest(input.samples.step.byteLength);
+            await session.setObjects(input.samples.step, stepManifest);
+            const readBack = await session.getManifest();
+            assert(sameJson(readBack, stepManifest), 'STEP manifest or data ranges changed on readback');
+            await sliceGcode(session);
+        });
+    }
+    else {
+        recorder.skip('project.meshFormat.step: STEP upload, round-trip, and slice', 'no STEP project sample supplied');
+    }
+    if (unsupported.has('project.faceAttributes')) {
+        const attributed = projectWithAttributes(boxStl(), 'stl', 'triangle', ['seam'], 'u8');
+        await recorder.check('project.faceAttributes: unsupported attributes preserve project and assets', () => assertFailedSetObjectsIsAtomic('unsupported face attributes', () => session.setObjects(attributed.blob, attributed.manifest), ['UNSUPPORTED']));
+    }
+    if (!unsupported.has('project.faceAttributes')) {
+        const domainSemantics = caps.project.faceAttributeSemantics;
+        for (const [domain, semantics] of Object.entries(domainSemantics)) {
+            if (semantics.length === 0)
+                continue;
+            const geometry = domain === 'triangle' ? boxStl() : input.samples?.step;
+            if (!geometry) {
+                recorder.skip(`project.faceAttributes ${domain}: u8/u16 round-trip`, 'no geometry sample supplied');
+                continue;
+            }
+            const ids = domain === 'brepFace' ? sourceStepFaceIds(geometry) : [];
+            if (domain === 'brepFace' && ids.length === 0) {
+                recorder.check(`project.faceAttributes ${domain}: source face fixture`, () => {
+                    throw new Error('STEP sample contains no ADVANCED_FACE or FACE_SURFACE entities');
+                });
+                continue;
+            }
+            for (const storageFormat of ['u8', 'u16']) {
+                await recorder.check(`project.faceAttributes ${domain}/${storageFormat}: round-trip and slice`, async () => {
+                    const fixture = projectWithAttributes(geometry, domain === 'triangle' ? 'stl' : 'step', domain, semantics, storageFormat, ids);
+                    await session.setObjects(fixture.blob, fixture.manifest);
+                    assert(sameJson(await session.getManifest(), fixture.manifest), 'face attributes changed on readback');
+                    await sliceGcode(session);
+                });
+            }
+            const omitted = ['material-slot', 'seam', 'support', 'fuzzy-skin', 'ironing', 'brim']
+                .find((semantic) => !semantics.includes(semantic));
+            if (omitted) {
+                const fixture = projectWithAttributes(geometry, domain === 'triangle' ? 'stl' : 'step', domain, [omitted], 'u8', ids);
+                await recorder.check(`project.faceAttributes ${domain}: unadvertised semantic is rejected atomically`, () => assertFailedSetObjectsIsAtomic(`unadvertised ${domain} semantic`, () => session.setObjects(fixture.blob, fixture.manifest), ['UNSUPPORTED']));
+            }
+        }
+    }
+    if (!unsupported.has('project.preview.stepFaces')) {
+        if (!input.samples?.step) {
+            recorder.skip('project.preview.stepFaces: mapped preview', 'no STEP project sample supplied');
+        }
+        else {
+            const stepManifest = singleStepManifest(input.samples.step.byteLength);
+            await recorder.check('project.preview.stepFaces: mapped preview and invalid targets', async () => {
+                await session.setObjects(input.samples.step, stepManifest);
+                const preview = await session.getPreview('mesh-0');
+                const triangleCount = trianglesInBinaryStl(preview.geometry);
+                assert(preview.schemaVersion === '0.7.0-pre.1', 'preview schemaVersion is incorrect');
+                assert(preview.meshId === 'mesh-0', 'preview meshId differs from the request');
+                assert(preview.revision.length > 0, 'preview revision is empty');
+                assert(preview.triangleFaceIds.length === triangleCount, 'face-id count differs from STL triangle count');
+                assert(preview.triangleFaceIds.every((id) => id > 0), 'preview contains a zero STEP face id');
+                await expectError(() => session.getPreview('oneslicer-conformance-missing-mesh'), ['NO_DATA'], 'unknown preview mesh');
+                await session.setObjects(boxStl(), singleObjectManifest(boxStl().byteLength));
+                await expectError(() => session.getPreview('mesh-0'), ['UNSUPPORTED'], 'STL preview target');
+            });
+        }
+    }
+    if (!unsupported.has('project.meshFormat.step')
+        && featureStatus(caps, 'project.modifierVolumes') === 'supported'
+        && input.samples?.step) {
+        await recorder.check('project.meshFormat.step: STEP modifier geometry slices', async () => {
+            const step = input.samples.step;
+            const blob = new Uint8Array(step.byteLength * 2);
+            blob.set(step);
+            blob.set(step, step.byteLength);
+            const manifest = singleStepManifest(step.byteLength);
+            manifest.meshes.push({ id: 'modifier-mesh', format: 'step', dataRange: { offset: step.byteLength, length: step.byteLength } });
+            manifest.modifierVolumes.push({
+                id: 'step-blocker',
+                meshId: 'modifier-mesh',
+                role: 'support-blocker',
+                objectId: 'object-0',
+                plateId: 'plate-0',
+                transform: { matrix: translation(0, 0) },
+            });
+            await session.setObjects(blob, manifest);
+            await sliceGcode(session);
         });
     }
     if (!unsupported.has('config.profileApply')) {

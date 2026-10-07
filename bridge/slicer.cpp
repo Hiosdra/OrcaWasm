@@ -186,7 +186,9 @@ struct OrcSession {
 
 struct ProjectMeshInput {
     std::string id;
+    std::string format = "stl";
     bool has_data_range = false;
+    bool has_face_attributes = false;
     std::uint32_t offset = 0;
     std::uint32_t length = 0;
 };
@@ -625,14 +627,75 @@ static bool parse_project_manifest(const uint8_t* manifest_data,
             error = "project mesh must contain id and format";
             return false;
         }
-        if (!reject_unknown_keys(mesh, {"id", "format", "dataRange"}, "project mesh", error))
+        if (!reject_unknown_keys(mesh, {"id", "format", "dataRange", "faceAttributes"}, "project mesh", error))
             return false;
         ProjectMeshInput parsed;
         if (!valid_project_id(mesh.at("id"), parsed.id, "mesh.id", error))
             return false;
-        if (!mesh.at("format").is_string() || mesh.at("format").get<std::string>() != "stl") {
-            error = "project mesh format must be stl";
+        if (!mesh.at("format").is_string()) {
+            error = "project mesh format must be stl or step";
             return false;
+        }
+        parsed.format = mesh.at("format").get<std::string>();
+        if (parsed.format != "stl" && parsed.format != "step") {
+            error = "project mesh format must be stl or step";
+            return false;
+        }
+        if (mesh.contains("faceAttributes")) {
+            if (!mesh.at("faceAttributes").is_array()) {
+                error = "mesh.faceAttributes must be an array";
+                return false;
+            }
+            std::set<std::string> attribute_semantics;
+            for (const auto& attribute : mesh.at("faceAttributes")) {
+                if (!attribute.is_object()
+                    || !reject_unknown_keys(attribute, {"semantic", "domain", "format", "dataRange"},
+                                            "mesh.faceAttributes item", error)
+                    || !attribute.contains("semantic") || !attribute.at("semantic").is_string()
+                    || !attribute.contains("domain") || !attribute.at("domain").is_string()
+                    || !attribute.contains("format") || !attribute.at("format").is_string()
+                    || !attribute.contains("dataRange") || !attribute.at("dataRange").is_object()) {
+                    if (error.empty()) error = "mesh.faceAttributes items require semantic, domain, format, and dataRange";
+                    return false;
+                }
+                const std::string semantic = attribute.at("semantic").get<std::string>();
+                const std::string domain = attribute.at("domain").get<std::string>();
+                const std::string storage = attribute.at("format").get<std::string>();
+                if (semantic != "material-slot" && semantic != "seam" && semantic != "support"
+                    && semantic != "fuzzy-skin" && semantic != "ironing" && semantic != "brim") {
+                    error = "mesh.faceAttributes semantic is unknown";
+                    return false;
+                }
+                if (!attribute_semantics.insert(semantic).second) {
+                    error = "mesh.faceAttributes contains a duplicate semantic";
+                    return false;
+                }
+                if ((parsed.format == "stl" && domain != "triangle")
+                    || (parsed.format == "step" && domain != "brepFace")) {
+                    error = "mesh.faceAttributes domain does not match the mesh format";
+                    return false;
+                }
+                if (storage != "u8" && storage != "u16") {
+                    error = "mesh.faceAttributes format must be u8 or u16";
+                    return false;
+                }
+                const auto& range = attribute.at("dataRange");
+                if (!range.contains("offset") || !range.contains("length")
+                    || !reject_unknown_keys(range, {"offset", "length"}, "faceAttribute.dataRange", error)) {
+                    if (error.empty()) error = "faceAttribute.dataRange must contain offset and length";
+                    return false;
+                }
+                std::uint32_t offset = 0;
+                std::uint32_t length = 0;
+                if (!project_uint32(range.at("offset"), offset, "faceAttribute.dataRange.offset", error)
+                    || !project_uint32(range.at("length"), length, "faceAttribute.dataRange.length", error))
+                    return false;
+                if (length == 0 || static_cast<std::uint64_t>(offset) + length > object_blob_len) {
+                    error = "faceAttribute.dataRange is outside object_blob";
+                    return false;
+                }
+            }
+            parsed.has_face_attributes = !mesh.at("faceAttributes").empty();
         }
         if (!mesh_ids.insert(parsed.id).second) {
             error = "project manifest contains a duplicate mesh id: " + parsed.id;
@@ -3209,8 +3272,8 @@ oneslicer_status_t oneslicer_get_capabilities(uint8_t** out_json, uint32_t* out_
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
-  "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
+  "project":{"meshFormats":["stl"],"faceAttributeSemantics":{"triangle":[],"brepFace":[]},"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.meshFormat.step":"unsupported","project.preview.stepFaces":"unsupported","project.faceAttributes":"unsupported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
@@ -3269,7 +3332,6 @@ oneslicer_status_t oneslicer_project_set_objects(
     OrcSession* session = as_session(session_ptr);
     if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
-    clear_project_outputs(*session);
     if (!session->initialized) {
         record_error(*session, "call oneslicer_init or oneslicer_init_profile first");
         return ONESLICER_ERR_INVALID_ARGUMENT;
@@ -3288,8 +3350,22 @@ oneslicer_status_t oneslicer_project_set_objects(
         return ONESLICER_ERR_VALIDATION;
     }
 
+    if (std::any_of(parsed.meshes.begin(), parsed.meshes.end(), [](const ProjectMeshInput& mesh) {
+            return mesh.format == "step";
+        })) {
+        record_error(*session, "STEP project meshes are not supported by this engine build");
+        return ONESLICER_ERR_UNSUPPORTED;
+    }
+    if (std::any_of(parsed.meshes.begin(), parsed.meshes.end(), [](const ProjectMeshInput& mesh) {
+            return mesh.has_face_attributes;
+        })) {
+        record_error(*session, "project face attributes are not supported by this engine build");
+        return ONESLICER_ERR_UNSUPPORTED;
+    }
+
     try {
         std::vector<std::uint8_t> retained_blob(object_blob, object_blob + object_blob_len);
+        clear_project_outputs(*session);
         session->project_object_blob = std::move(retained_blob);
         session->project_manifest = std::move(normalized);
         session->native_project_blob.clear();
@@ -3327,6 +3403,32 @@ oneslicer_status_t oneslicer_project_get_manifest(
     if (!set_project_output(output, out_json, out_len, session->last_error))
         return ONESLICER_ERR_OUTPUT;
     return ONESLICER_OK;
+}
+
+EMSCRIPTEN_KEEPALIVE
+oneslicer_status_t oneslicer_project_get_preview(
+    oneslicer_session_t session_ptr,
+    const char* mesh_id_utf8,
+    uint32_t mesh_id_len,
+    uint8_t** out_descriptor_json,
+    uint32_t* out_descriptor_len,
+    uint8_t** out_preview_blob,
+    uint32_t* out_preview_blob_len
+) {
+    if (out_descriptor_json) *out_descriptor_json = nullptr;
+    if (out_descriptor_len) *out_descriptor_len = 0;
+    if (out_preview_blob) *out_preview_blob = nullptr;
+    if (out_preview_blob_len) *out_preview_blob_len = 0;
+    OrcSession* session = as_session(session_ptr);
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
+    session->last_error.clear();
+    if (!mesh_id_utf8 || mesh_id_len == 0 || !out_descriptor_json || !out_descriptor_len
+        || !out_preview_blob || !out_preview_blob_len) {
+        record_error(*session, "mapped preview requires a mesh id and all output pointers");
+        return ONESLICER_ERR_INVALID_ARGUMENT;
+    }
+    record_error(*session, "mapped STEP project previews are unsupported by this engine build");
+    return ONESLICER_ERR_UNSUPPORTED;
 }
 
 EMSCRIPTEN_KEEPALIVE

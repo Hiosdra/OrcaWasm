@@ -101,6 +101,7 @@ target_link_options(slicer PRIVATE
 '_oneslicer_get_capabilities',\
 '_oneslicer_project_set_objects',\
 '_oneslicer_project_get_manifest',\
+'_oneslicer_project_get_preview',\
 '_oneslicer_project_prepare',\
 '_oneslicer_project_slice',\
 '_oneslicer_project_get_asset',\
