@@ -3,9 +3,9 @@
 # re-run that generator after editing the workflow rather than hand-editing this file.
 set -e
 export ORCA_VERSION="${ORCA_VERSION:-v2.4.2}"
-export OCCT_VERSION="${OCCT_VERSION:-7.8.1}"
-export EMSDK_VERSION="${EMSDK_VERSION:-3.1.74}"
-export ONETBB_VERSION="${ONETBB_VERSION:-v2021.13.2}"
+export OCCT_VERSION="${OCCT_VERSION:-7.9.3}"
+export EMSDK_VERSION="${EMSDK_VERSION:-6.0.11}"
+export ONETBB_VERSION="${ONETBB_VERSION:-v2021.13.4}"
 export EMSDK="${EMSDK:-/opt/emsdk}"
 export OUTPUT_NAME="${OUTPUT_NAME:-slicer-mt}"
 export BOOST_THREADING="${BOOST_THREADING:-multi}"
@@ -64,7 +64,7 @@ python3 patches/apply.py
 # ══════════════════════════════════════════════════════════
 (
 source "$EMSDK/emsdk_env.sh"
-BOOST_VERSION="1.83.0"
+BOOST_VERSION="1.90.0"
 BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
 # _v3 suffix: manually bumped, not tied to BOOST_VERSION — the
@@ -139,12 +139,12 @@ touch "${STAMP}"
 (
 source "$EMSDK/emsdk_env.sh"
 INSTALL="$(pwd)/deps-install"
-STAMP="${INSTALL}/.math_built_mt_native_eh_v1"
+STAMP="${INSTALL}/.math_built_mt_native_eh_v2"
 [[ -f "${STAMP}" ]] && echo "[math] stamp exists — skip" && exit 0
 
 GMP_VERSION=6.3.0
-MPFR_VERSION=4.2.1
-CGAL_VERSION=5.6.2
+MPFR_VERSION=4.2.2
+CGAL_VERSION=6.2
 DL=/tmp/math-dl
 mkdir -p "${DL}"
 
@@ -315,14 +315,14 @@ touch "${STAMP}"
 # ══════════════════════════════════════════════════════════
 (
 source "$EMSDK/emsdk_env.sh"
-OCCT_VERSION="7.8.1"
+OCCT_VERSION="7.9.3"
 OCCT_TAG="V${OCCT_VERSION//./_}"
 INSTALL="$(pwd)/deps-install"
-# _v4 suffix: manually bumped, not tied to OCCT_TAG — the WebAssembly
+# _v5 suffix: manually bumped, not tied to OCCT_TAG — the WebAssembly
 # EH patch below changes OCCT's build flags, not its pinned version,
 # so OCCT_TAG alone wouldn't invalidate a stale cached build (same
 # gotcha as the Boost stamp bump above: cache keys omit these flags).
-STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_native_eh_v4"
+STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_native_eh_v5"
 [[ -f "${STAMP}" ]] && echo "[occt] stamp exists — skip" && exit 0
 
 echo "[occt] downloading OCCT ${OCCT_VERSION}…"
@@ -334,7 +334,7 @@ curl -fL --retry 3 \
 echo "[occt] excluding ExpToCasExe host tool…"
 # ExpToCasExe is a developer-only code generator (regenerates STEP
 # EXPRESS schema sources, which OCCT already ships pre-generated).
-# Under Emscripten its versioned executable output (ExpToCasExe.js-7.8.1)
+# Under Emscripten its versioned executable output (ExpToCasExe.js-7.9.3)
 # breaks OCCT's install rule, which looks for "ExpToCasExe.wasm".
 # We don't need it, so drop it from BUILD_TOOLKITS before configure.
 python3 - <<'PYEOF'
@@ -550,4 +550,35 @@ ls -lh wasm-artifacts/
 # ══════════════════════════════════════════════════════════
 (
 node scripts/smoke-test.mjs --wasm-dir artifacts
+)
+
+# ══════════════════════════════════════════════════════════
+# one-wasm-slicer-api conformance
+# ══════════════════════════════════════════════════════════
+(
+node scripts/conformance.mjs --wasm-dir artifacts
+)
+
+# ══════════════════════════════════════════════════════════
+# TypeScript binding cancellation
+# ══════════════════════════════════════════════════════════
+(
+node scripts/binding-test.mjs --wasm-dir artifacts
+)
+
+# ══════════════════════════════════════════════════════════
+# Publish pull-request prerelease
+# ══════════════════════════════════════════════════════════
+(
+TAG="wasm-${ORCA_VERSION}-pr${PR_NUMBER}.${GITHUB_RUN_NUMBER}-multithreaded"
+printf 'Pull-request build of #%s at %s for testing before merge. Not a release: consumers keep using the newest -patchN release.\n' \
+  "$PR_NUMBER" "$HEAD_SHA" > prerelease-notes.md
+gh release create "$TAG" wasm-artifacts/* \
+  --prerelease \
+  --target "$HEAD_SHA" \
+  --title "PR #${PR_NUMBER} build ${GITHUB_RUN_NUMBER} for OrcaSlicer $ORCA_VERSION" \
+  --notes-file prerelease-notes.md \
+  --repo "$GITHUB_REPOSITORY"
+echo "Published prerelease: $TAG"
+
 )

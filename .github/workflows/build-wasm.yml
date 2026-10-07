@@ -110,11 +110,11 @@ jobs:
 
     env:
       ORCA_VERSION: ${{ github.event.inputs.orca_version || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v2.4.2' }}
-      OCCT_VERSION: "7.8.1"
+      OCCT_VERSION: "7.9.3"
       # Pinned (not "latest") for reproducible builds — matches the version
       # documented for local builds in the repository README.
-      EMSDK_VERSION: "3.1.74"
-      ONETBB_VERSION: "v2021.13.2"
+      EMSDK_VERSION: "6.0.11"
+      ONETBB_VERSION: "v2021.13.4"
       EMSDK: /opt/emsdk
       # OrcaWasm is built with Emscripten pthreads and real oneTBB.
       OUTPUT_NAME: slicer-mt
@@ -260,7 +260,7 @@ jobs:
       - name: Build WASM deps — Boost
         run: |
           source "$EMSDK/emsdk_env.sh"
-          BOOST_VERSION="1.83.0"
+          BOOST_VERSION="1.90.0"
           BOOST_UNDERSCORE="${BOOST_VERSION//./_}"
           INSTALL="$(pwd)/deps-install"
           # _v3 suffix: manually bumped, not tied to BOOST_VERSION — the
@@ -344,12 +344,12 @@ jobs:
         run: |
           source "$EMSDK/emsdk_env.sh"
           INSTALL="$(pwd)/deps-install"
-          STAMP="${INSTALL}/.math_built_mt_native_eh_v1"
+          STAMP="${INSTALL}/.math_built_mt_native_eh_v2"
           [[ -f "${STAMP}" ]] && echo "[math] stamp exists — skip" && exit 0
 
           GMP_VERSION=6.3.0
-          MPFR_VERSION=4.2.1
-          CGAL_VERSION=5.6.2
+          MPFR_VERSION=4.2.2
+          CGAL_VERSION=6.2
           DL=/tmp/math-dl
           mkdir -p "${DL}"
 
@@ -517,20 +517,20 @@ jobs:
           ls "${INSTALL}/lib/liblibnoise_static.a" && echo "  lib OK"
           touch "${STAMP}"
 
-      # ── OCCT 7.8.1 (STEP / IGES CAD kernel) ─────────────────────────────────
+      # ── OCCT 7.9.3 (STEP / IGES CAD kernel) ─────────────────────────────────
       # Builds the minimal STEP+IGES+tessellation subset of OCCT for WASM.
       # ~30-60 min first build; subsequent runs skip via stamp file.
       - name: Build WASM deps — OCCT
         run: |
           source "$EMSDK/emsdk_env.sh"
-          OCCT_VERSION="7.8.1"
+          OCCT_VERSION="7.9.3"
           OCCT_TAG="V${OCCT_VERSION//./_}"
           INSTALL="$(pwd)/deps-install"
-          # _v4 suffix: manually bumped, not tied to OCCT_TAG — the WebAssembly
+          # _v5 suffix: manually bumped, not tied to OCCT_TAG — the WebAssembly
           # EH patch below changes OCCT's build flags, not its pinned version,
           # so OCCT_TAG alone wouldn't invalidate a stale cached build (same
           # gotcha as the Boost stamp bump above: cache keys omit these flags).
-          STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_native_eh_v4"
+          STAMP="${INSTALL}/.occt_built_${OCCT_TAG}_native_eh_v5"
           [[ -f "${STAMP}" ]] && echo "[occt] stamp exists — skip" && exit 0
 
           echo "[occt] downloading OCCT ${OCCT_VERSION}…"
@@ -542,7 +542,7 @@ jobs:
           echo "[occt] excluding ExpToCasExe host tool…"
           # ExpToCasExe is a developer-only code generator (regenerates STEP
           # EXPRESS schema sources, which OCCT already ships pre-generated).
-          # Under Emscripten its versioned executable output (ExpToCasExe.js-7.8.1)
+          # Under Emscripten its versioned executable output (ExpToCasExe.js-7.9.3)
           # breaks OCCT's install rule, which looks for "ExpToCasExe.wasm".
           # We don't need it, so drop it from BUILD_TOOLKITS before configure.
           python3 - <<'PYEOF'

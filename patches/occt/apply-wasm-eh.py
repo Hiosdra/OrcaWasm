@@ -24,6 +24,43 @@ else()
 endif()
 """
 
+ORIGINAL_79 = """else()
+  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
+  set (CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -fexceptions")
+  if (NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    set (CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -fPIC")
+  else()
+   add_definitions (-D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE)
+  endif()
+  if (APPLE)
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
+    set (CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -Wno-deprecated-declarations")
+  endif()
+  add_definitions(-DOCC_CONVERT_SIGNALS)
+endif()
+"""
+
+PATCHED_79 = """elseif (EMSCRIPTEN)
+  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fwasm-exceptions -fPIC")
+  set (CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -sSUPPORT_LONGJMP=wasm -fPIC")
+else()
+  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
+  set (CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -fexceptions")
+  if (NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    set (CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -fPIC")
+  else()
+   add_definitions (-D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE)
+  endif()
+  if (APPLE)
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
+    set (CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -Wno-deprecated-declarations")
+  endif()
+  add_definitions(-DOCC_CONVERT_SIGNALS)
+endif()
+"""
+
 MARKER = 'set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fwasm-exceptions -fPIC")'
 
 
@@ -40,12 +77,16 @@ def main() -> int:
     if MARKER in contents:
         print(f"[occt-patch] WebAssembly EH flags already applied: {cmake_file}")
         return 0
-    if ORIGINAL not in contents:
+    if ORIGINAL in contents:
+        contents = contents.replace(ORIGINAL, PATCHED, 1)
+    elif ORIGINAL_79 in contents:
+        contents = contents.replace(ORIGINAL_79, PATCHED_79, 1)
+    else:
         raise SystemExit(
             f"[occt-patch] expected OCCT {cmake_file} compiler-flags block was not found"
         )
 
-    cmake_file.write_text(contents.replace(ORIGINAL, PATCHED, 1), encoding="utf-8")
+    cmake_file.write_text(contents, encoding="utf-8")
     print(f"[occt-patch] set Emscripten EH flags and disabled signal conversion: {cmake_file}")
     return 0
 
