@@ -259,6 +259,11 @@ patch("src/libslic3r/Format/STEP.hpp", [
         1,
     ),
     (
+        r'(#include "XCAFDoc_ShapeTool\.hxx")',
+        r'\1\n#include <Interface_InterfaceModel.hxx>\n#include <XSControl_TransferReader.hxx>\n#include <XSControl_WorkSession.hxx>',
+        1,
+    ),
+    (
         r'NamedSolid\(const TopoDS_Shape& s,\s*const std::string& n\) : solid\{ s \}, name\{ n \} \{\s*\}',
         'NamedSolid(const TopoDS_Shape& s, const std::string& n, std::vector<std::uint32_t> face_ids = {})\n'
         '        : solid{ s }, name{ n }, face_entity_ids{ std::move(face_ids) } {}',
@@ -279,6 +284,13 @@ patch("src/libslic3r/Format/STEP.hpp", [
         r'(std::vector<NamedSolid> m_name_solids;)',
         r'\1\n    std::vector<std::uint32_t> m_triangle_face_ids;\n'
         r'    std::vector<std::uint32_t> m_source_face_entity_ids;',
+        1,
+    ),
+    (
+        r'(Handle\(XCAFDoc_ShapeTool\) m_shape_tool;\s*std::vector<NamedSolid> m_name_solids;)',
+        r'\1\n    Handle(Interface_InterfaceModel) m_step_model;\n'
+        r'    Handle(XSControl_WorkSession) m_work_session;\n'
+        r'    Handle(XSControl_TransferReader) m_transfer_reader;',
         1,
     ),
 ])
@@ -339,8 +351,8 @@ patch("src/libslic3r/Format/STEP.cpp", [
         1,
     ),
     (
-        r'getNamedSolids\(TopLoc_Location\{\}, "", id, m_shape_tool, topLevelShapes\.Value\(iLabel\), namedSolids, isSplitCompound\);',
-        r'getNamedSolids(TopLoc_Location{}, "", id, m_shape_tool, topLevelShapes.Value(iLabel), transfer_reader, step_model, namedSolids);',
+        r'^\s*getNamedSolids\(TopLoc_Location\{\}, "", id, m_shape_tool, topLevelShapes\.Value\(iLabel\), namedSolids, isSplitCompound\);',
+        r'            getNamedSolids(TopLoc_Location{}, "", id, m_shape_tool, topLevelShapes.Value(iLabel), m_transfer_reader, m_step_model, namedSolids, isSplitCompound);',
         1,
     ),
     (
@@ -389,20 +401,20 @@ patch("src/libslic3r/Format/STEP.cpp", [
         r'        Standard_Integer topShapeLength = topLevelShapes\.Length\(\) \+ 1;\s*'
         r'        for \(Standard_Integer iLabel = 1; iLabel < topShapeLength; \+\+iLabel\) \{\s*'
         r'            if \(cb_cancel\) return;\s*'
-        r'            getNamedSolids\(TopLoc_Location\{\}, "", id, m_shape_tool, topLevelShapes\.Value\(iLabel\), transfer_reader, step_model, m_name_solids\);\s*'
+        r'            getNamedSolids\(TopLoc_Location\{\}, "", id, m_shape_tool, topLevelShapes\.Value\(iLabel\), m_name_solids\);\s*'
         r'        \}',
         '        m_shape_tool = XCAFDoc_DocumentTool::ShapeTool(m_doc->Main());\n'
         '        m_name_solids.clear();\n'
         '        m_source_face_entity_ids.clear();\n'
-        '        const Handle(Interface_InterfaceModel) step_model = reader.Reader().Model();\n'
-        '        const Handle(XSControl_WorkSession) work_session = reader.Reader().WS();\n'
-        '        Handle(XSControl_TransferReader) transfer_reader;\n'
-        '        if (!step_model.IsNull() && !work_session.IsNull() && !work_session->TransferReader().IsNull()) {\n'
-        '            transfer_reader = work_session->TransferReader();\n'
-        '            for (Standard_Integer entity_index = 1; entity_index <= step_model->NbEntities(); ++entity_index) {\n'
-        '                const Handle(Standard_Transient) entity = step_model->Value(entity_index);\n'
+        '        m_step_model = reader.Reader().Model();\n'
+        '        m_work_session = reader.Reader().WS();\n'
+        '        m_transfer_reader.Nullify();\n'
+        '        if (!m_step_model.IsNull() && !m_work_session.IsNull() && !m_work_session->TransferReader().IsNull()) {\n'
+        '            m_transfer_reader = m_work_session->TransferReader();\n'
+        '            for (Standard_Integer entity_index = 1; entity_index <= m_step_model->NbEntities(); ++entity_index) {\n'
+        '                const Handle(Standard_Transient) entity = m_step_model->Value(entity_index);\n'
         '                if (entity.IsNull() || (!entity->IsKind(STANDARD_TYPE(StepShape_AdvancedFace)) && !entity->IsKind(STANDARD_TYPE(StepShape_FaceSurface)))) continue;\n'
-        '                const Handle(TCollection_HAsciiString) source_label = step_model->StringLabel(entity);\n'
+        '                const Handle(TCollection_HAsciiString) source_label = m_step_model->StringLabel(entity);\n'
         '                const char* label_text = source_label.IsNull() ? nullptr : source_label->ToCString();\n'
         '                std::uint64_t entity_id = 0;\n'
         '                bool valid_entity_id = label_text != nullptr && label_text[0] == \'#\' && label_text[1] != 0;\n'
@@ -422,7 +434,7 @@ patch("src/libslic3r/Format/STEP.cpp", [
         '        Standard_Integer topShapeLength = topLevelShapes.Length() + 1;\n'
         '        for (Standard_Integer iLabel = 1; iLabel < topShapeLength; ++iLabel) {\n'
         '            if (cb_cancel) return;\n'
-        '            getNamedSolids(TopLoc_Location{}, "", id, m_shape_tool, topLevelShapes.Value(iLabel), transfer_reader, step_model, m_name_solids);\n'
+        '            getNamedSolids(TopLoc_Location{}, "", id, m_shape_tool, topLevelShapes.Value(iLabel), m_transfer_reader, m_step_model, m_name_solids);\n'
         '        }',
         1,
     ),
