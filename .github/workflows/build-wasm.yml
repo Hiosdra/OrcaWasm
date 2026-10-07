@@ -168,9 +168,11 @@ jobs:
       # ── System deps ─────────────────────────────────────────────────
       - name: Install build tools
         run: |
-          sudo apt-get update -qq
+          # Bound slow mirror responses so apt cannot hold up the whole WASM job.
+          APT_OPTIONS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          timeout 5m sudo apt-get "${APT_OPTIONS[@]}" update -qq
           # Minimal set — building headless WASM (no GUI, no system GTK/webkit needed)
-          sudo apt-get install -y \
+          timeout 5m sudo apt-get "${APT_OPTIONS[@]}" install -y \
             ninja-build python3 cmake pkg-config \
             m4 texinfo libssl-dev ccache
 
