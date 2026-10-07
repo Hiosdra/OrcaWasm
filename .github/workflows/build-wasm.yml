@@ -308,7 +308,6 @@ jobs:
             --with-nowide \
             --with-program_options \
             --with-regex \
-            --with-system \
             --with-thread \
             "${B2_DEFINES[@]}" \
             "${B2_EXTRA_CXXFLAGS}" \
@@ -317,8 +316,9 @@ jobs:
 
           echo "[boost] installed headers:"
           ls "${INSTALL}/include/boost/version.hpp" && echo "  boost/version.hpp OK"
-          echo "[boost] installed libs (sample):"
-          ls "${INSTALL}/lib/libboost_system"* 2>/dev/null | head -3 || echo "  no libboost_system found!"
+          echo "[boost] Boost.System is header-only; no libboost_system archive is required."
+          echo "[boost] installed compiled libs (sample):"
+          ls "${INSTALL}/lib/libboost_filesystem"* 2>/dev/null | head -3 || echo "  no libboost_filesystem found!"
           touch "${STAMP}"
 
       # ── GMP / MPFR / CGAL ────────────────────────────────────────────

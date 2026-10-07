@@ -71,6 +71,27 @@ set(Boost_LIBRARIES "")
 foreach(_comp IN LISTS Boost_FIND_COMPONENTS)
     string(TOUPPER "${_comp}" _COMP)
 
+    # Boost.System became header-only in 1.69. Boost 1.89 removed the
+    # compatibility stub library, so asking find_library() for it breaks
+    # otherwise valid installs (including our minimum supported 1.83+ range).
+    # Keep the component target OrcaSlicer expects, backed by Boost headers.
+    if(_comp STREQUAL "system" AND Boost_VERSION VERSION_GREATER_EQUAL "1.69.0")
+        set("Boost_${_comp}_FOUND" TRUE)
+        set("Boost_${_COMP}_FOUND" TRUE)
+        set("Boost_${_COMP}_LIBRARY" "Boost::system")
+        set("Boost_${_COMP}_LIBRARY_RELEASE" "Boost::system")
+
+        if(NOT TARGET Boost::system)
+            add_library(Boost::system INTERFACE IMPORTED GLOBAL)
+            set_target_properties(Boost::system PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${Boost_INCLUDE_DIR}"
+            )
+        endif()
+
+        list(APPEND Boost_LIBRARIES Boost::system)
+        continue()
+    endif()
+
     # Determine library filename
     if(DEFINED "_BMAP_${_comp}")
         set(_lib "${_BMAP_${_comp}}")
