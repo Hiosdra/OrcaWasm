@@ -394,8 +394,18 @@ async function sliceGcode(session) {
     assert(/^G[01]\b/m.test(gcode), 'G-code asset contains no G0/G1 moves');
     return { assetId: asset.id, gcode };
 }
+function canonicalizeJson(value) {
+    if (Array.isArray(value))
+        return value.map(canonicalizeJson);
+    if (value !== null && typeof value === 'object') {
+        return Object.fromEntries(Object.entries(value)
+            .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+            .map(([key, entry]) => [key, canonicalizeJson(entry)]));
+    }
+    return value;
+}
 function sameJson(left, right) {
-    return JSON.stringify(left) === JSON.stringify(right);
+    return JSON.stringify(canonicalizeJson(left)) === JSON.stringify(canonicalizeJson(right));
 }
 /** Run the core suite and every optional suite the engine advertises. */
 export async function runConformance(artifact, input) {
@@ -410,6 +420,9 @@ export async function runConformance(artifact, input) {
     });
     await recorder.check('artifact reports the exact API version', () => {
         assert(artifact.apiVersion === ONESLICER_API_VERSION, `artifact reports ${artifact.apiVersion}`);
+    });
+    await recorder.check('JSON object member order is ignored during structural comparison', () => {
+        assert(sameJson({ nested: { second: 2, first: 1 }, list: [1, 2] }, { list: [1, 2], nested: { first: 1, second: 2 } }), 'JSON member order changed the comparison result');
     });
     const loaded = await recorder.check('createEngine resolves', async () => {
         engine = await artifact.createEngine(input.engineOptions);
