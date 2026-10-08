@@ -1,6 +1,6 @@
 // Shared Node test harness for the OrcaSlicer WASM engine — used by
 // smoke-test.mjs. Centralizes the ABI-coupled pieces
-// (module loading + heap marshaling for API 0.6.0 C binding project operations)
+// (module loading + heap marshaling for API 0.7.0 C binding project operations)
 // so the C bridge's calling convention lives in ONE place instead of being
 // copy-pasted and drifting between scripts.
 //
@@ -157,8 +157,8 @@ export async function loadModule(wasmDir, engine) {
   })
 }
 
-// Load the same artifact through its one-wasm-slicer-api TypeScript binding:
-// the embedded glue exposes `OneWasmEngine`, which hosts use instead of the
+// Load the same artifact through its one-slicer-api TypeScript binding:
+// the embedded glue exposes `OneSlicerEngine`, which hosts use instead of the
 // heap-level exports above. Each call instantiates a fresh runtime.
 export async function loadEngineArtifact(wasmDir, engine) {
   const jsPath = resolve(wasmDir, `${engine}.js`)
@@ -168,7 +168,7 @@ export async function loadEngineArtifact(wasmDir, engine) {
   }
   const jsText = readFileSync(jsPath, 'utf8')
   const dataUrl = 'data:text/javascript;charset=utf-8,' +
-    encodeURIComponent(`${jsText}\nexport default OneWasmEngine;`)
+    encodeURIComponent(`${jsText}\nexport default OneSlicerEngine;`)
   const { default: artifact } = await import(dataUrl)
   const runtime = {
     wasmBinary: readFileSync(wasmPath),
@@ -202,7 +202,7 @@ export function free(module, ptr) {
 
 export function decodeError(module, session) {
   try {
-    const ptr = module._onewasm_last_error(session)
+    const ptr = module._oneslicer_last_error(session)
     return ptr ? module.UTF8ToString(ptr) : '(no message)'
   } catch {
     return '(failed to decode error)'
@@ -212,9 +212,9 @@ export function decodeError(module, session) {
 export function initSession(module, session, configJson) {
   const configBytes = new TextEncoder().encode(configJson)
   const configPtr = writeBytes(module, configBytes)
-  const rc = module._onewasm_init(session, configPtr, configBytes.length)
+  const rc = module._oneslicer_init(session, configPtr, configBytes.length)
   free(module, configPtr)
-  if (rc !== 0) throw new Error(`onewasm_init failed (${rc}): ${decodeError(module, session)}`)
+  if (rc !== 0) throw new Error(`oneslicer_init failed (${rc}): ${decodeError(module, session)}`)
 }
 
 export function applyProfileOnce(module, session, profile, format = 'orca.profile-json') {
@@ -223,10 +223,10 @@ export function applyProfileOnce(module, session, profile, format = 'orca.profil
   const formatPtr = writeBytes(module, formatBytes)
   const profilePtr = writeBytes(module, profileBytes)
   try {
-    const rc = module._onewasm_apply_profile(
+    const rc = module._oneslicer_apply_profile(
       session, formatPtr, formatBytes.length, profilePtr, profileBytes.length,
     )
-    if (rc !== 0) throw new Error(`onewasm_apply_profile failed (${rc}): ${decodeError(module, session)}`)
+    if (rc !== 0) throw new Error(`oneslicer_apply_profile failed (${rc}): ${decodeError(module, session)}`)
   } finally {
     free(module, profilePtr)
     free(module, formatPtr)
@@ -238,10 +238,10 @@ export function projectSetObjectsOnce(module, session, objectBlob, manifest) {
   const blobPtr = writeBytes(module, objectBlob)
   const manifestPtr = writeBytes(module, manifestBytes)
   try {
-    const rc = module._onewasm_project_set_objects(
+    const rc = module._oneslicer_project_set_objects(
       session, blobPtr, objectBlob.length, manifestPtr, manifestBytes.length,
     )
-    if (rc !== 0) throw new Error(`onewasm_project_set_objects failed (${rc}): ${decodeError(module, session)}`)
+    if (rc !== 0) throw new Error(`oneslicer_project_set_objects failed (${rc}): ${decodeError(module, session)}`)
   } finally {
     free(module, manifestPtr)
     free(module, blobPtr)
@@ -260,7 +260,7 @@ function readOwnedOutput(module, session, functionName, ...args) {
       try {
         return module.HEAPU8.slice(dataPtr, dataPtr + dataLen)
       } finally {
-        module._onewasm_free(dataPtr)
+        module._oneslicer_free(dataPtr)
       }
     } finally {
       module._free(outLenPtr)
@@ -271,7 +271,7 @@ function readOwnedOutput(module, session, functionName, ...args) {
 }
 
 export function projectGetManifestOnce(module, session) {
-  const bytes = readOwnedOutput(module, session, '_onewasm_project_get_manifest')
+  const bytes = readOwnedOutput(module, session, '_oneslicer_project_get_manifest')
   return JSON.parse(new TextDecoder().decode(bytes))
 }
 
@@ -280,7 +280,7 @@ export function projectPrepareOnce(module, session, request) {
   const requestPtr = writeBytes(module, requestBytes)
   try {
     const bytes = readOwnedOutput(
-      module, session, '_onewasm_project_prepare', requestPtr, requestBytes.length,
+      module, session, '_oneslicer_project_prepare', requestPtr, requestBytes.length,
     )
     return JSON.parse(new TextDecoder().decode(bytes))
   } finally {
@@ -293,7 +293,7 @@ export function projectSliceOnce(module, session, request) {
   const requestPtr = writeBytes(module, requestBytes)
   try {
     const bytes = readOwnedOutput(
-      module, session, '_onewasm_project_slice', requestPtr, requestBytes.length,
+      module, session, '_oneslicer_project_slice', requestPtr, requestBytes.length,
     )
     return JSON.parse(new TextDecoder().decode(bytes))
   } finally {
@@ -306,7 +306,7 @@ export function projectGetAssetOnce(module, session, assetId) {
   const assetPtr = writeBytes(module, assetBytes)
   try {
     return readOwnedOutput(
-      module, session, '_onewasm_project_get_asset', assetPtr, assetBytes.length,
+      module, session, '_oneslicer_project_get_asset', assetPtr, assetBytes.length,
     )
   } finally {
     free(module, assetPtr)
@@ -322,7 +322,7 @@ export function projectExportOnce(module, session, format, options) {
     const bytes = readOwnedOutput(
       module,
       session,
-      '_onewasm_project_export',
+      '_oneslicer_project_export',
       formatPtr,
       formatBytes.length,
       optionsPtr,

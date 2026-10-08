@@ -37,7 +37,7 @@ const config = {
 // enough to abort while the slice is running.
 const mesh = sphereStl(5, 40)
 const manifest = {
-  schemaVersion: '0.6.0',
+  schemaVersion: '0.7.0',
   plates: [{ id: 'plate-0', label: 'Plate 1', index: 0 }],
   meshes: [{ id: 'mesh-0', format: 'stl', dataRange: { offset: 0, length: mesh.length } }],
   objects: [{ id: 'object-0', meshId: 'mesh-0' }],
@@ -50,7 +50,7 @@ const manifest = {
   modifierVolumes: [],
 }
 const request = {
-  schemaVersion: '0.6.0',
+  schemaVersion: '0.7.0',
   plateSelection: 'selected',
   plateIds: ['plate-0'],
   includeGcode: true,
@@ -124,7 +124,7 @@ try {
       failure = error
     }
     if (!abortedAt) throw new Error('the slice finished before it could be aborted')
-    if (failure?.name !== 'OneWasmError' || failure.code !== 'CANCELLED') {
+    if (failure?.name !== 'OneSlicerError' || failure.code !== 'CANCELLED') {
       throw new Error(`expected CANCELLED, got ${failure ? `${failure.name} ${failure.code}: ${failure.message}` : 'success'}`)
     }
     const stopMs = performance.now() - abortedAt

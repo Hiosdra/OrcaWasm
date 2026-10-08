@@ -54,46 +54,49 @@ node scripts/gen-wsl-build-script.mjs
 
 ## Engine API
 
-The module implements exactly `one-wasm-slicer-api` 0.6.0 per engine release.
+The module implements exactly `one-slicer-api` 0.7.0 per engine release.
 It does not negotiate or claim compatibility with older API versions.
 
 Hosts use the **TypeScript binding**. `slicer-mt.js` embeds the reference
-Emscripten glue from the API release ([`wasm/onewasm/`](wasm/onewasm)) and
-exposes one `OneWasmEngine` object:
+Emscripten glue from the API release ([`wasm/oneslicer/`](wasm/oneslicer)) and
+exposes one `OneSlicerEngine` object:
 
 ```js
 // slicer-mt.js loaded as a classic script, or wrapped as a module with
-// `export default OneWasmEngine;`
-const engine = await OneWasmEngine.createEngine({ runtime: emscriptenModuleOverrides })
+// `export default OneSlicerEngine;`
+const engine = await OneSlicerEngine.createEngine({ runtime: emscriptenModuleOverrides })
 const session = await engine.createSession()
 await session.init(nativeConfigBytes)
 ```
 
 The engine itself implements the **C binding** declared by the vendored header
-[`bridge/onewasm_slicer_api.h`](bridge/onewasm_slicer_api.h), which tracks the
-private [`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
+[`bridge/oneslicer_api.h`](bridge/oneslicer_api.h), which tracks the
+private [`one-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
 specification. The glue is the only code that touches the heap:
 
 ```text
-onewasm_session_create / onewasm_session_destroy
-onewasm_init / onewasm_init_profile / onewasm_apply_profile / onewasm_set_progress_callback
-onewasm_cancel
-onewasm_project_set_objects / onewasm_project_get_manifest
-onewasm_project_prepare / onewasm_project_slice
-onewasm_project_get_asset / onewasm_project_export
-onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_three_mf_to_stl
-onewasm_get_capabilities
-onewasm_free / onewasm_last_error
+oneslicer_session_create / oneslicer_session_destroy
+oneslicer_init / oneslicer_init_profile / oneslicer_apply_profile / oneslicer_set_progress_callback
+oneslicer_cancel
+oneslicer_project_set_objects / oneslicer_project_get_manifest
+oneslicer_project_get_preview
+oneslicer_project_prepare / oneslicer_project_slice
+oneslicer_project_get_asset / oneslicer_project_export
+oneslicer_obj_to_stl / oneslicer_cad_to_stl / oneslicer_three_mf_to_stl
+oneslicer_get_capabilities
+oneslicer_free / oneslicer_last_error
 ```
 
-`onewasm_three_mf_to_stl` is optional `format.threeMfToStl` (geometry only). An Orca
+`oneslicer_three_mf_to_stl` is optional `format.threeMfToStl` (geometry only). An Orca
 project `.3mf` is loaded as a native profile with `initProfile("project.3mf", ...)`.
 
-To update the API, copy `js/glue/onewasm-emscripten-glue.js`,
-`js/glue/onewasm-conformance.mjs` and `include/onewasm_slicer_api.h` unmodified
-from the API release.
+To update the API, copy `js/glue/oneslicer-emscripten-glue.js` and
+`include/oneslicer_api.h` unmodified from the API release into
+`wasm/oneslicer/` and `bridge/`. The vendored conformance suite is based on
+`js/glue/oneslicer-conformance.mjs`; its `sameJson` helper canonicalizes object
+keys because JSON member order is not part of the API contract.
 
-## one-wasm-slicer-api compatibility
+## one-slicer-api compatibility
 
 The eight `requiredIn: "core"` features are `core.session`,
 `core.configuration`, `project.manifest`, `project.slice`,
@@ -102,12 +105,16 @@ The eight `requiredIn: "core"` features are `core.session`,
 The host must reject this engine if a required feature is absent or not
 `supported`.
 
-All other features are optional and are selected from `onewasm_get_capabilities`
+All other features are optional and are selected from `oneslicer_get_capabilities`
 at runtime. This build reports profile initialization/application, modifier
 volumes and native modifier preservation, prepare/arrange, multi-plate slicing,
-project export with slice artifacts and preservation, OBJ/STEP/3MF
-conversion, and cancellation as supported. Every API feature is therefore
-`supported`; callers still select optional features from the capability
+project export with slice artifacts and preservation, OBJ/STEP/3MF conversion,
+and cancellation as supported. OrcaWasm does not accept STEP as a project mesh:
+hosts should convert it with `format.stepToStl`, then send the resulting STL to
+project operations while retaining the original `.step` or `.stp` display name.
+Mapped STEP previews and project face attributes are reported as `unsupported`;
+`oneslicer_project_get_preview` remains exported by the C ABI and returns
+`UNSUPPORTED`. Hosts must read every optional status from the capability
 document and must not infer support from an exported C symbol.
 
 Cancellation also covers running operations in the TypeScript binding. The
@@ -115,13 +122,16 @@ reference glue calls the synchronous C ABI on the runtime's JS thread, where a
 host abort could only take effect before an operation starts. The artifact's
 `engine-binding.js` therefore runs `slice`, `prepare` and `export` on a pthread
 through the private `orcawasm_async_start`/`orcawasm_async_poll` exports: the
-JS thread stays responsive, delivers progress, and calls `onewasm_cancel` when
+JS thread stays responsive, delivers progress, and calls `oneslicer_cancel` when
 the signal aborts. The operation then rejects with `CANCELLED` and the session
-remains usable. C callers keep the synchronous ABI and call `onewasm_cancel`
+remains usable. C callers keep the synchronous ABI and call `oneslicer_cancel`
 from another thread. `scripts/binding-test.mjs` checks this in CI.
 
+Mapped previews and face attributes remain optional parts of the normative
+0.7.0 contract. This engine does not advertise or implement them.
+
 Every payload (project manifest, prepare/slice/export requests and results,
-slice statistics) uses `schemaVersion: "0.6.0"`, the API version, including
+slice statistics) uses `schemaVersion: "0.7.0"`, the API version, including
 ordinary projects with an empty `modifierVolumes` array. The bridge rejects
 any other `schemaVersion`.
 
@@ -142,7 +152,7 @@ An imported project is regenerated rather than passed through, so its opaque
 entries follow the requested preservation policy.
 
 The canonical contract and schemas live in the private
-[`one-wasm-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
+[`one-slicer-api`](https://github.com/Hiosdra/one-wasm-slicer-api)
 repository.
 
 ## Exception model and Memory64 decision
@@ -181,7 +191,7 @@ and the [WebAssembly Memory64 proposal](https://github.com/WebAssembly/memory64/
 
 The `Build WASM` workflow validates pull requests and builds the pthread-enabled
 engine on the default branch. Each successful build runs the real engine smoke
-test and the one-wasm-slicer-api conformance suite (`scripts/conformance.mjs`,
+test and the one-slicer-api conformance suite (`scripts/conformance.mjs`,
 through the embedded TypeScript binding) before publishing immutable GitHub
 Release assets:
 
@@ -192,7 +202,7 @@ wasm-v2.4.2-patchN-multithreaded
 The first build for an OrcaSlicer version uses the corresponding
 `wasm-vX.Y.Z-multithreaded` tag; later engine changes use immutable patch tags.
 
-The smoke test exercises API 0.6.0 support enforcers and blockers both with a
+The smoke test exercises API 0.7.0 support enforcers and blockers both with a
 minimal config and with the reduced selected-profile fixture at
 `scripts/fixtures/voron-0.4-profile-smoke.json`. The profile export does not
 include the active bed surface, so this test explicitly uses `Textured PEI

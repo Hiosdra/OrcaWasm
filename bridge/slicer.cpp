@@ -2,23 +2,23 @@
  * orca-wasm WASM bridge — clean-room implementation.
  *
  * Exports C-linkage symbols consumed by the JavaScript runtime:
- *   onewasm_session_create/destroy(session)
- *   onewasm_init/init_profile(session, native payload)
- *   onewasm_set_progress_callback(session, callback, userData)
- *   onewasm_cancel(session)
- *   onewasm_project_set_objects/get_manifest(session, project)
- *   onewasm_project_prepare/slice/get_asset(session, request)
- *   onewasm_project_export(session, native format, options)
- *   onewasm_obj_to_stl / onewasm_cad_to_stl(input, output)
- *   onewasm_three_mf_to_stl(input, output)                                → optional format.threeMfToStl
- *   onewasm_get_capabilities(outJson, outLen)
- *   onewasm_free(ptr)
- *   onewasm_last_error(session)                                   → null-terminated UTF-8 string
+ *   oneslicer_session_create/destroy(session)
+ *   oneslicer_init/init_profile(session, native payload)
+ *   oneslicer_set_progress_callback(session, callback, userData)
+ *   oneslicer_cancel(session)
+ *   oneslicer_project_set_objects/get_manifest(session, project)
+ *   oneslicer_project_prepare/slice/get_asset(session, request)
+ *   oneslicer_project_export(session, native format, options)
+ *   oneslicer_obj_to_stl / oneslicer_cad_to_stl(input, output)
+ *   oneslicer_three_mf_to_stl(input, output)                                → optional format.threeMfToStl
+ *   oneslicer_get_capabilities(outJson, outLen)
+ *   oneslicer_free(ptr)
+ *   oneslicer_last_error(session)                                   → null-terminated UTF-8 string
  *
- * onewasm_obj_to_stl / onewasm_cad_to_stl / onewasm_three_mf_to_stl are pure format conversions
+ * oneslicer_obj_to_stl / oneslicer_cad_to_stl / oneslicer_three_mf_to_stl are pure format conversions
  * — they never touch slicer config state, so they take no session handle.
  *
- * Error codes for the public session-bound operations follow one-wasm-slicer-api 0.6.0:
+ * Error codes for the public session-bound operations follow one-slicer-api 0.7.0:
  *   -1  invalid / uninitialized state (includes a null/invalid session handle)
  *   -2  JSON parse failure
  *   -3  STL write to MEMFS failed
@@ -31,13 +31,12 @@
  *   -11 active operation was cancelled
  *   -12 no optional result is available
  *
- * onewasm_three_mf_to_stl reuses the same -1/-3/-4/-5/-8/-9 meanings (input write /
+ * oneslicer_three_mf_to_stl reuses the same -1/-3/-4/-5/-8/-9 meanings (input write /
  * 3MF load / no geometry / STL export / exception), decoded via
- * onewasm_last_error(0) like onewasm_obj_to_stl / onewasm_cad_to_stl.
+ * oneslicer_last_error(0) like oneslicer_obj_to_stl / oneslicer_cad_to_stl.
  */
 
-#include "onewasm_slicer_api.h"
-#include "onewasm_slicer_legacy.h"
+#include "oneslicer_api.h"
 
 #include <algorithm>
 #include <array>
@@ -65,6 +64,11 @@
 #include <emscripten.h>
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
+
+enum {
+    PREPARE_AUTO_ORIENT = 1,
+    PREPARE_ARRANGE = 2,
+};
 
 // OrcaSlicer core
 // (note: an earlier attempt to cap oneTBB via tbb::global_control lived here;
@@ -139,12 +143,12 @@ struct OrcSession {
     // Opt-in override of the engine's mixed-nozzle-temperature guard, matching
     // desktop OrcaSlicer's "Remove mixed temperature restriction" preference.
     // Off by default (the guard exists to prevent nozzle clogging / damage);
-    // when set, the private legacy slice adapters call
+    // when set, the STL project-slice path calls
     // Print::set_check_multi_filaments_compatibility(false) before validate().
     // See issue #164.
     bool remove_mixed_temp_restriction = false;
     // Variable (adaptive) layer height, matching desktop OrcaSlicer's Adaptive
-    // tool: when on, the private legacy slice adapters compute a per-object layer
+    // tool: when on, the STL project-slice path computes a per-object layer
     // height profile from the mesh geometry (layer_height_profile_adaptive)
     // before slicing, so detailed regions get thinner layers and flat regions
     // thicker ones. Off by default (a fixed layer height is the engine default
@@ -157,9 +161,9 @@ struct OrcSession {
     // finer detail (thinner layers, smaller cusp error); higher = faster
     // (thicker layers).
     float adaptive_layer_height_quality = 0.5f;
-    onewasm_progress_callback_t progress_callback = nullptr;
+    oneslicer_progress_callback_t progress_callback = nullptr;
     void* progress_user_data = nullptr;
-    // `onewasm_cancel` is the one session operation allowed to run while a
+    // `oneslicer_cancel` is the one session operation allowed to run while a
     // slice is active. All other session operations remain host-serialized.
     std::mutex control_mutex;
     std::shared_ptr<struct ActiveSlice> active_slice;
@@ -170,6 +174,7 @@ struct OrcSession {
     nlohmann::json project_manifest;
     std::vector<std::uint8_t> project_object_blob;
     std::map<std::string, std::string> project_assets;
+    std::uint64_t project_preview_revision = 0;
     // The original native project is retained for a lossless clean export.
     // Once the neutral manifest is mutated, preservation=require must fail
     // instead of quietly dropping Orca-specific ZIP entries.
@@ -177,18 +182,29 @@ struct OrcSession {
     bool native_project_dirty = false;
     int progress_base = 0;
     int progress_span = 100;
-    // A project slice may call the legacy single-plate entry point several
+    // A project slice may prepare several logical plates in sequence
     // times. Keep cancellation intent across the small gaps between those
     // calls; the active native operation is still cancelled through
     // ActiveSlice when one exists.
     std::atomic<bool> project_cancel_requested{false};
 };
 
-struct ProjectMeshInput {
-    std::string id;
-    bool has_data_range = false;
+struct ProjectFaceAttributeInput {
+    std::string semantic;
+    std::string domain;
+    std::string format;
     std::uint32_t offset = 0;
     std::uint32_t length = 0;
+};
+
+struct ProjectMeshInput {
+    std::string id;
+    std::string format = "stl";
+    bool has_data_range = false;
+    bool has_face_attributes = false;
+    std::uint32_t offset = 0;
+    std::uint32_t length = 0;
+    std::vector<ProjectFaceAttributeInput> face_attributes;
 };
 
 struct ProjectObjectInput {
@@ -215,7 +231,7 @@ struct ProjectModifierVolumeInput {
 };
 
 struct ProjectManifestInput {
-    std::string schema_version = ONEWASM_API_VERSION_STRING;
+    std::string schema_version = ONESLICER_API_VERSION_STRING;
     std::vector<std::string> plate_ids;
     std::vector<ProjectMeshInput> meshes;
     std::vector<ProjectObjectInput> objects;
@@ -225,7 +241,7 @@ struct ProjectManifestInput {
 
 static nlohmann::json empty_project_manifest() {
     return nlohmann::json{
-        {"schemaVersion", ONEWASM_API_VERSION_STRING},
+        {"schemaVersion", ONESLICER_API_VERSION_STRING},
         {"plates", nlohmann::json::array()},
         {"meshes", nlohmann::json::array()},
         {"objects", nlohmann::json::array()},
@@ -348,7 +364,7 @@ struct ProgressWindow {
 // call is proxied synchronously to the main runtime thread, which services
 // the proxy queue while it blocks waiting for the slice.
 struct ProgressDelivery {
-    onewasm_progress_callback_t callback;
+    oneslicer_progress_callback_t callback;
     int percent;
     const char* stage;
     void* user_data;
@@ -439,10 +455,10 @@ static OrcSession* as_session(void* ptr) { return static_cast<OrcSession*>(ptr);
 static void record_error(OrcSession& s, const char* msg) { s.last_error = msg ? msg : "unknown error"; }
 static void record_error(OrcSession& s, const std::string& str) { s.last_error = str; }
 
-// onewasm_obj_to_stl / onewasm_cad_to_stl are pure format conversions with no config
+// oneslicer_obj_to_stl / oneslicer_cad_to_stl are pure format conversions with no config
 // state, so they don't need a session — but the JS caller still wants
-// onewasm_last_error() to work for them. Keep a small dedicated error slot
-// for these functions; onewasm_last_error(0) (the host's call
+// oneslicer_last_error() to work for them. Keep a small dedicated error slot
+// for these functions; oneslicer_last_error(0) (the host's call
 // pattern for conversion errors) falls back to it when no session is passed.
 static std::string g_conversion_last_error;
 static void record_error(const char* msg) { g_conversion_last_error = msg ? msg : "unknown error"; }
@@ -564,13 +580,13 @@ static bool parse_project_manifest(const uint8_t* manifest_data,
     }
     if (!root.is_object() || !root.contains("schemaVersion")
         || !root.at("schemaVersion").is_string()) {
-        error = "project manifest schemaVersion must be " ONEWASM_API_VERSION_STRING;
+        error = "project manifest schemaVersion must be " ONESLICER_API_VERSION_STRING;
         return false;
     }
     result.schema_version = root.at("schemaVersion").get<std::string>();
-    const bool has_modifier_volumes = result.schema_version == ONEWASM_API_VERSION_STRING;
+    const bool has_modifier_volumes = result.schema_version == ONESLICER_API_VERSION_STRING;
     if (!has_modifier_volumes) {
-        error = "project manifest schemaVersion must be " ONEWASM_API_VERSION_STRING;
+        error = "project manifest schemaVersion must be " ONESLICER_API_VERSION_STRING;
         return false;
     }
     if (has_modifier_volumes) {
@@ -625,14 +641,76 @@ static bool parse_project_manifest(const uint8_t* manifest_data,
             error = "project mesh must contain id and format";
             return false;
         }
-        if (!reject_unknown_keys(mesh, {"id", "format", "dataRange"}, "project mesh", error))
+        if (!reject_unknown_keys(mesh, {"id", "format", "dataRange", "faceAttributes"}, "project mesh", error))
             return false;
         ProjectMeshInput parsed;
         if (!valid_project_id(mesh.at("id"), parsed.id, "mesh.id", error))
             return false;
-        if (!mesh.at("format").is_string() || mesh.at("format").get<std::string>() != "stl") {
-            error = "project mesh format must be stl";
+        if (!mesh.at("format").is_string()) {
+            error = "project mesh format must be stl or step";
             return false;
+        }
+        parsed.format = mesh.at("format").get<std::string>();
+        if (parsed.format != "stl" && parsed.format != "step") {
+            error = "project mesh format must be stl or step";
+            return false;
+        }
+        if (mesh.contains("faceAttributes")) {
+            if (!mesh.at("faceAttributes").is_array()) {
+                error = "mesh.faceAttributes must be an array";
+                return false;
+            }
+            std::set<std::string> attribute_semantics;
+            for (const auto& attribute : mesh.at("faceAttributes")) {
+                if (!attribute.is_object()
+                    || !reject_unknown_keys(attribute, {"semantic", "domain", "format", "dataRange"},
+                                            "mesh.faceAttributes item", error)
+                    || !attribute.contains("semantic") || !attribute.at("semantic").is_string()
+                    || !attribute.contains("domain") || !attribute.at("domain").is_string()
+                    || !attribute.contains("format") || !attribute.at("format").is_string()
+                    || !attribute.contains("dataRange") || !attribute.at("dataRange").is_object()) {
+                    if (error.empty()) error = "mesh.faceAttributes items require semantic, domain, format, and dataRange";
+                    return false;
+                }
+                const std::string semantic = attribute.at("semantic").get<std::string>();
+                const std::string domain = attribute.at("domain").get<std::string>();
+                const std::string storage = attribute.at("format").get<std::string>();
+                if (semantic != "material-slot" && semantic != "seam" && semantic != "support"
+                    && semantic != "fuzzy-skin" && semantic != "ironing" && semantic != "brim") {
+                    error = "mesh.faceAttributes semantic is unknown";
+                    return false;
+                }
+                if (!attribute_semantics.insert(semantic).second) {
+                    error = "mesh.faceAttributes contains a duplicate semantic";
+                    return false;
+                }
+                if ((parsed.format == "stl" && domain != "triangle")
+                    || (parsed.format == "step" && domain != "brepFace")) {
+                    error = "mesh.faceAttributes domain does not match the mesh format";
+                    return false;
+                }
+                if (storage != "u8" && storage != "u16") {
+                    error = "mesh.faceAttributes format must be u8 or u16";
+                    return false;
+                }
+                const auto& range = attribute.at("dataRange");
+                if (!range.contains("offset") || !range.contains("length")
+                    || !reject_unknown_keys(range, {"offset", "length"}, "faceAttribute.dataRange", error)) {
+                    if (error.empty()) error = "faceAttribute.dataRange must contain offset and length";
+                    return false;
+                }
+                std::uint32_t offset = 0;
+                std::uint32_t length = 0;
+                if (!project_uint32(range.at("offset"), offset, "faceAttribute.dataRange.offset", error)
+                    || !project_uint32(range.at("length"), length, "faceAttribute.dataRange.length", error))
+                    return false;
+                if (length == 0 || static_cast<std::uint64_t>(offset) + length > object_blob_len) {
+                    error = "faceAttribute.dataRange is outside object_blob";
+                    return false;
+                }
+                parsed.face_attributes.push_back({semantic, domain, storage, offset, length});
+            }
+            parsed.has_face_attributes = !parsed.face_attributes.empty();
         }
         if (!mesh_ids.insert(parsed.id).second) {
             error = "project manifest contains a duplicate mesh id: " + parsed.id;
@@ -915,7 +993,7 @@ struct Loaded3mfResourcesGuard {
 // still pick their own record_error() overload (session-aware vs. the
 // conversion-functions' shared slot) and error code, since those differ
 // per call site — this only owns the mechanical fopen/fseek/malloc/fread
-// sequence that the private legacy 3MF writer and the geometry reader both need to read back the
+// sequence that the private 3MF writer and the geometry reader both need to read back the
 // file they just asked OrcaSlicer to produce.
 static char* read_file_to_buffer(const char* path, long* out_len, const char** out_err, bool* out_oom) {
     *out_oom = false;
@@ -1311,10 +1389,10 @@ static const ProjectObjectInput* find_project_object(const ProjectManifestInput&
     return found == manifest.objects.end() ? nullptr : &*found;
 }
 
-static bool project_matrix_to_legacy_transform(const std::array<double, 16>& values,
-                                               const OrcSession& session,
-                                               ObjectTransformInput& result,
-                                               std::string& error) {
+static bool project_matrix_to_prepare_transform(const std::array<double, 16>& values,
+                                                const OrcSession& session,
+                                                ObjectTransformInput& result,
+                                                std::string& error) {
     Slic3r::Transform3d matrix = Slic3r::Transform3d::Identity();
     for (int row = 0; row < 4; ++row) {
         for (int column = 0; column < 4; ++column)
@@ -1349,7 +1427,7 @@ static bool project_matrix_to_legacy_transform(const std::array<double, 16>& val
     return true;
 }
 
-static std::array<double, 16> legacy_transform_to_project_matrix(
+static std::array<double, 16> prepare_transform_to_project_matrix(
     const ObjectTransformInput& input, const OrcSession& session) {
     Slic3r::Geometry::Transformation transformation;
     transformation.set_scaling_factor(input.scale);
@@ -1705,7 +1783,7 @@ static bool append_native_model_project(
     }
 
     if (modifier_ordinal > 0)
-        manifest["schemaVersion"] = ONEWASM_API_VERSION_STRING;
+        manifest["schemaVersion"] = ONESLICER_API_VERSION_STRING;
 
     if (manifest["instances"].empty()) {
         manifest = empty_project_manifest();
@@ -1749,13 +1827,17 @@ static bool collect_project_plate_inputs(
         const auto begin = session.project_object_blob.begin() + mesh->offset;
         const auto end = begin + mesh->length;
         const auto start = static_cast<std::uint32_t>(blob.size());
+        if (mesh->format != "stl") {
+            error = "OrcaSlicer project preparation supports STL meshes only";
+            return false;
+        }
         blob.insert(blob.end(), begin, end);
         offsets.push_back(start);
         offsets.push_back(static_cast<std::uint32_t>(blob.size()));
         extruders.push_back(static_cast<std::int32_t>(object->extruder_id));
 
         ObjectTransformInput transform;
-        if (!project_matrix_to_legacy_transform(instance.matrix, session, transform, error))
+        if (!project_matrix_to_prepare_transform(instance.matrix, session, transform, error))
             return false;
         transforms.push_back(static_cast<float>(transform.scale.x()));
         transforms.push_back(static_cast<float>(transform.scale.y()));
@@ -1808,8 +1890,8 @@ static bool parse_project_export_options(
     }
     if (!options.is_object() || !options.contains("schemaVersion")
         || !options.at("schemaVersion").is_string()
-        || options.at("schemaVersion").get<std::string>() != ONEWASM_API_VERSION_STRING) {
-        error = "project export options schemaVersion must be " ONEWASM_API_VERSION_STRING;
+        || options.at("schemaVersion").get<std::string>() != ONESLICER_API_VERSION_STRING) {
+        error = "project export options schemaVersion must be " ONESLICER_API_VERSION_STRING;
         return false;
     }
     if (!reject_unknown_keys(
@@ -1907,15 +1989,15 @@ static bool build_project_export_mesh(
     return true;
 }
 
-// The project adapter is defined before the legacy slice entry points, while
-// these native-print helpers are shared with those entry points below.
+// The project adapter is defined before the plate-preparation implementation,
+// while these native-print helpers are shared with it below.
 static void zero_plate_origin(Slic3r::Print& print);
 static void set_is_bbl_printer(
     Slic3r::Print& print,
     const Slic3r::DynamicPrintConfig& config
 );
-static onewasm_status_t legacy_prepare_plate(
-    onewasm_session_t session_ptr,
+static oneslicer_status_t prepare_stl_plate(
+    oneslicer_session_t session_ptr,
     const uint8_t* all_stl, uint32_t all_stl_len,
     const uint32_t* offsets, uint32_t n_files,
     const float* transforms,
@@ -1934,6 +2016,13 @@ static void clamp_wipe_tower_to_bed(
     const Slic3r::Model& model,
     double bed_x,
     double bed_y
+);
+static oneslicer_status_t write_single_mesh_3mf(
+    oneslicer_session_t session,
+    const uint8_t* stl_data,
+    uint32_t stl_len,
+    uint8_t** out_3mf,
+    uint32_t* out_len
 );
 
 static bool validate_project_model_footprints(
@@ -1972,12 +2061,11 @@ static bool validate_project_model_footprints(
     return true;
 }
 
-// The released 0.2 multi-object entry point intentionally exposes the older
-// decomposed transform table. The 0.5 project manifest is different: its
-// matrix is the source-of-truth affine transform and may contain a valid
+// The host-facing prepare operation still returns decomposed transforms. The
+// project manifest instead treats its matrix as the source of truth and may
 // shear or a non-zero Z translation. Build the native model directly for the
-// project path so the common API does not inherit the legacy transform limit.
-static onewasm_status_t build_project_plate_model(
+// project path so the common API does not inherit the prepare transform limit.
+static oneslicer_status_t build_project_plate_model(
     OrcSession& session,
     const ProjectManifestInput& manifest,
     const std::string& plate_id,
@@ -1995,22 +2083,27 @@ static onewasm_status_t build_project_plate_model(
             ? find_project_mesh(manifest, object_input->mesh_id) : nullptr;
         if (!object_input || !mesh_input) {
             error = "project instance contains an unresolved object or mesh";
-            return ONEWASM_ERR_VALIDATION;
+            return ONESLICER_ERR_VALIDATION;
         }
         if (!mesh_input->has_data_range
             || static_cast<std::uint64_t>(mesh_input->offset) + mesh_input->length
                 > session.project_object_blob.size()) {
             error = "selected project uses engine-owned geometry; Orca project slicing needs a host-readable mesh asset";
-            return ONEWASM_ERR_UNSUPPORTED;
+            return ONESLICER_ERR_UNSUPPORTED;
         }
 
+        if (mesh_input->format != "stl") {
+            error = "OrcaSlicer project slicing supports STL meshes only";
+            return ONESLICER_ERR_UNSUPPORTED;
+        }
         const std::string path = "/tmp/ow-project-slice-"
-            + std::to_string(session.id) + "-" + std::to_string(instance_index++) + ".stl";
+            + std::to_string(session.id) + "-" + std::to_string(instance_index++)
+            + ".stl";
         TempFileGuard input_guard(path);
         FILE* file = std::fopen(path.c_str(), "wb");
         if (!file) {
-            error = "unable to stage project slice STL";
-            return ONEWASM_ERR_INPUT_IO;
+            error = "unable to stage project slice mesh";
+            return ONESLICER_ERR_INPUT_IO;
         }
         const std::size_t written = std::fwrite(
             session.project_object_blob.data() + mesh_input->offset,
@@ -2020,20 +2113,19 @@ static onewasm_status_t build_project_plate_model(
         );
         std::fclose(file);
         if (written != mesh_input->length) {
-            error = "unable to stage complete project slice STL";
-            return ONEWASM_ERR_INPUT_IO;
+            error = "unable to stage complete project slice mesh";
+            return ONESLICER_ERR_INPUT_IO;
         }
 
         const std::size_t first_object = model.objects.size();
         if (!load_staged_stl(path.c_str(), &model, object_input->id.c_str())) {
             error = "OrcaSlicer could not load project mesh " + mesh_input->id;
-            return ONEWASM_ERR_INPUT_FORMAT;
+            return ONESLICER_ERR_INPUT_FORMAT;
         }
         if (model.objects.size() == first_object) {
             error = "project mesh contains no printable objects: " + mesh_input->id;
-            return ONEWASM_ERR_EMPTY_INPUT;
+            return ONESLICER_ERR_EMPTY_INPUT;
         }
-
         Slic3r::Transform3d matrix = Slic3r::Transform3d::Identity();
         for (int row = 0; row < 4; ++row) {
             for (int column = 0; column < 4; ++column) {
@@ -2054,7 +2146,7 @@ static onewasm_status_t build_project_plate_model(
             auto* native_instance = object->add_instance();
             if (!native_instance) {
                 error = "OrcaSlicer could not allocate a project instance";
-                return ONEWASM_ERR_OUTPUT;
+                return ONESLICER_ERR_OUTPUT;
             }
             native_instance->set_transformation(transformation);
             if (object_input->extruder_id > 0)
@@ -2069,22 +2161,27 @@ static onewasm_status_t build_project_plate_model(
         const auto target = native_objects_by_id.find(modifier.object_id);
         if (!mesh_input || target == native_objects_by_id.end() || target->second.empty()) {
             error = "project modifier volume contains an unresolved mesh or target object";
-            return ONEWASM_ERR_VALIDATION;
+            return ONESLICER_ERR_VALIDATION;
         }
         if (!mesh_input->has_data_range
             || static_cast<std::uint64_t>(mesh_input->offset) + mesh_input->length
                 > session.project_object_blob.size()) {
             error = "project modifier volume requires a host-readable mesh asset";
-            return ONEWASM_ERR_UNSUPPORTED;
+            return ONESLICER_ERR_UNSUPPORTED;
         }
 
+        if (mesh_input->format != "stl") {
+            error = "OrcaSlicer project modifier volumes support STL meshes only";
+            return ONESLICER_ERR_UNSUPPORTED;
+        }
         const std::string path = "/tmp/ow-project-modifier-"
-            + std::to_string(session.id) + "-" + std::to_string(instance_index++) + ".stl";
+            + std::to_string(session.id) + "-" + std::to_string(instance_index++)
+            + ".stl";
         TempFileGuard input_guard(path);
         FILE* file = std::fopen(path.c_str(), "wb");
         if (!file) {
-            error = "unable to stage project modifier STL";
-            return ONEWASM_ERR_INPUT_IO;
+            error = "unable to stage project modifier mesh";
+            return ONESLICER_ERR_INPUT_IO;
         }
         const std::size_t written = std::fwrite(
             session.project_object_blob.data() + mesh_input->offset,
@@ -2094,15 +2191,15 @@ static onewasm_status_t build_project_plate_model(
         );
         std::fclose(file);
         if (written != mesh_input->length) {
-            error = "unable to stage complete project modifier STL";
-            return ONEWASM_ERR_INPUT_IO;
+            error = "unable to stage complete project modifier mesh";
+            return ONESLICER_ERR_INPUT_IO;
         }
 
         Slic3r::Model modifier_model;
         if (!load_staged_stl(path.c_str(), &modifier_model, modifier.id.c_str())
             || modifier_model.objects.empty()) {
             error = "OrcaSlicer could not load project modifier mesh " + mesh_input->id;
-            return ONEWASM_ERR_INPUT_FORMAT;
+            return ONESLICER_ERR_INPUT_FORMAT;
         }
         Slic3r::Transform3d modifier_matrix = Slic3r::Transform3d::Identity();
         for (int row = 0; row < 4; ++row) {
@@ -2128,7 +2225,7 @@ static onewasm_status_t build_project_plate_model(
                     auto* volume = target_object->add_volume(*source_volume);
                     if (!volume) {
                         error = "OrcaSlicer could not allocate a project modifier volume";
-                        return ONEWASM_ERR_OUTPUT;
+                        return ONESLICER_ERR_OUTPUT;
                     }
                     volume->name = modifier.id;
                     volume->set_type(volume_type);
@@ -2140,12 +2237,12 @@ static onewasm_status_t build_project_plate_model(
 
     if (model.objects.empty()) {
         error = "selected project plate contains no objects";
-        return ONEWASM_ERR_EMPTY_INPUT;
+        return ONESLICER_ERR_EMPTY_INPUT;
     }
-    return ONEWASM_OK;
+    return ONESLICER_OK;
 }
 
-static onewasm_status_t slice_project_model(
+static oneslicer_status_t slice_project_model(
     OrcSession& session,
     Slic3r::Model& model,
     ActiveSliceGuard& operation,
@@ -2156,7 +2253,7 @@ static onewasm_status_t slice_project_model(
         std::string footprint_error;
         if (!validate_project_model_footprints(session, model, footprint_error)) {
             record_error(session, footprint_error);
-            return ONEWASM_ERR_VALIDATION;
+            return ONESLICER_ERR_VALIDATION;
         }
         throw_if_cancelled(operation);
         clamp_wipe_tower_to_bed(
@@ -2181,7 +2278,7 @@ static onewasm_status_t slice_project_model(
         Slic3r::StringObjectException validation_error = print.validate(&warning);
         if (!validation_error.string.empty()) {
             record_error(session, validation_error.string);
-            return ONEWASM_ERR_VALIDATION;
+            return ONESLICER_ERR_VALIDATION;
         }
 
         try {
@@ -2190,10 +2287,10 @@ static onewasm_status_t slice_project_model(
             throw_if_cancelled(operation);
         } catch (const Slic3r::CanceledException&) {
             record_error(session, "slice cancelled");
-            return ONEWASM_ERR_CANCELLED;
+            return ONESLICER_ERR_CANCELLED;
         } catch (const Slic3r::SlicingError& exception) {
             record_error(session, exception.what());
-            return ONEWASM_ERR_SLICE;
+            return ONESLICER_ERR_SLICE;
         }
 
         TempFileGuard output_guard("/tmp/ow_out.gcode");
@@ -2208,43 +2305,43 @@ static onewasm_status_t slice_project_model(
         FILE* file = std::fopen("/tmp/ow_out.gcode", "rb");
         if (!file) {
             record_error(session, "gcode export produced no output");
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         }
         if (std::fseek(file, 0, SEEK_END) != 0) {
             std::fclose(file);
             record_error(session, "unable to seek G-code output");
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         }
         const long size = std::ftell(file);
         if (size < 0 || static_cast<unsigned long long>(size) > UINT32_MAX) {
             std::fclose(file);
             record_error(session, "G-code output exceeds the C ABI length limit");
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         }
         std::rewind(file);
         auto* buffer = static_cast<uint8_t*>(std::malloc(std::max<long>(1, size)));
         if (!buffer) {
             std::fclose(file);
             record_error(session, "out of memory");
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         }
         const std::size_t read = std::fread(buffer, 1, static_cast<std::size_t>(size), file);
         std::fclose(file);
         if (read != static_cast<std::size_t>(size)) {
             std::free(buffer);
             record_error(session, "unable to read complete G-code output");
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         }
         *out_gcode = buffer;
         *out_len = static_cast<uint32_t>(size);
         publish_slice_statistics(session, statistics_json);
-        return ONEWASM_OK;
+        return ONESLICER_OK;
     } catch (const Slic3r::CanceledException&) {
         record_error(session, "slice cancelled");
-        return ONEWASM_ERR_CANCELLED;
+        return ONESLICER_ERR_CANCELLED;
     } catch (const std::exception& exception) {
         record_error(session, exception.what());
-        return ONEWASM_ERR_INTERNAL;
+        return ONESLICER_ERR_INTERNAL;
     }
 }
 
@@ -2283,8 +2380,8 @@ static bool parse_project_slice_request(const uint8_t* request_data,
     }
     if (!request.is_object() || !request.contains("schemaVersion")
         || !request.at("schemaVersion").is_string()
-        || request.at("schemaVersion").get<std::string>() != ONEWASM_API_VERSION_STRING) {
-        error = "project slice request schemaVersion must be " ONEWASM_API_VERSION_STRING;
+        || request.at("schemaVersion").get<std::string>() != ONESLICER_API_VERSION_STRING) {
+        error = "project slice request schemaVersion must be " ONESLICER_API_VERSION_STRING;
         return false;
     }
     if (!reject_unknown_keys(
@@ -2566,7 +2663,7 @@ static std::string serialize_slice_statistics(const Slic3r::Print& print,
     map_volume_to_length(native.flush_per_filament, flush_length_mm);
 
     nlohmann::json result;
-    result["schemaVersion"] = ONEWASM_API_VERSION_STRING;
+    result["schemaVersion"] = ONESLICER_API_VERSION_STRING;
     result["timeSeconds"] = {
         {"normal", normal_index < native.modes.size() ? optional_non_negative(native.modes[normal_index].time) : nlohmann::json(nullptr)},
         {"silent", silent_index < native.modes.size() && native.modes[silent_index].time > 0.0f
@@ -2738,7 +2835,7 @@ extern "C" {
 
 /** Allocate a new engine session. Returns 0 (null) on allocation failure. */
 EMSCRIPTEN_KEEPALIVE
-onewasm_session_t onewasm_session_create() {
+oneslicer_session_t oneslicer_session_create() {
     try {
         std::unique_ptr<OrcSession> session(new (std::nothrow) OrcSession());
         if (!session)
@@ -2750,9 +2847,9 @@ onewasm_session_t onewasm_session_create() {
     }
 }
 
-/** Free a session created by onewasm_session_create(). Safe to call with null. */
+/** Free a session created by oneslicer_session_create(). Safe to call with null. */
 EMSCRIPTEN_KEEPALIVE
-void onewasm_session_destroy(onewasm_session_t session_ptr) {
+void oneslicer_session_destroy(oneslicer_session_t session_ptr) {
     delete as_session(session_ptr);
 }
 
@@ -2783,7 +2880,7 @@ static void ensure_nozzle_info_json() {
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_init(onewasm_session_t session_ptr, const uint8_t* config_data, uint32_t config_len) {
+oneslicer_status_t oneslicer_init(oneslicer_session_t session_ptr, const uint8_t* config_data, uint32_t config_len) {
     OrcSession* session = as_session(session_ptr);
     if (!session) return -1;
     session->last_error.clear();
@@ -2794,7 +2891,7 @@ onewasm_status_t onewasm_init(onewasm_session_t session_ptr, const uint8_t* conf
     ensure_nozzle_info_json();
     if (!config_data || config_len == 0) {
         record_error(*session, "config data is empty");
-        return ONEWASM_ERR_CONFIG;
+        return ONESLICER_ERR_CONFIG;
     }
     try {
         const char* json_data = reinterpret_cast<const char*>(config_data);
@@ -2885,33 +2982,33 @@ onewasm_status_t onewasm_init(onewasm_session_t session_ptr, const uint8_t* conf
         }
 
         session->initialized = true;
-        return ONEWASM_OK;
+        return ONESLICER_OK;
     } catch (const std::exception& e) {
         record_error(*session, e.what());
-        return ONEWASM_ERR_CONFIG;
+        return ONESLICER_ERR_CONFIG;
     }
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_apply_profile(
-    onewasm_session_t session_ptr,
+oneslicer_status_t oneslicer_apply_profile(
+    oneslicer_session_t session_ptr,
     const char* format_utf8,
     uint32_t format_len,
     const uint8_t* profile_data,
     uint32_t profile_len
 ) {
     OrcSession* session = as_session(session_ptr);
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
     if (!format_utf8 || format_len == 0 || !profile_data || profile_len == 0) {
         record_error(*session, "profile format or data is empty");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
 
     const std::string format(format_utf8, format_utf8 + format_len);
     if (format != "orca.profile-json" && format != "orca.native-json") {
         record_error(*session, "unsupported Orca profile fragment format: " + format);
-        return ONEWASM_ERR_UNSUPPORTED;
+        return ONESLICER_ERR_UNSUPPORTED;
     }
 
     nlohmann::json document;
@@ -2920,17 +3017,17 @@ onewasm_status_t onewasm_apply_profile(
         document = nlohmann::json::parse(json_data, json_data + profile_len);
     } catch (const std::exception& e) {
         record_error(*session, std::string("invalid Orca profile JSON: ") + e.what());
-        return ONEWASM_ERR_INPUT_FORMAT;
+        return ONESLICER_ERR_INPUT_FORMAT;
     }
     if (!document.is_object()) {
         record_error(*session, "Orca profile fragment must be a JSON object");
-        return ONEWASM_ERR_INPUT_FORMAT;
+        return ONESLICER_ERR_INPUT_FORMAT;
     }
 
     // Stage the patch before touching the active session. Individual native
     // Orca profile files are sparse patches, so omitted settings retain their
     // active value. An uninitialized session starts from the same Orca
-    // defaults as onewasm_init, without resetting project state on failure.
+    // defaults as oneslicer_init, without resetting project state on failure.
     try {
         Slic3r::DynamicPrintConfig candidate_config;
         double candidate_bed_cx = session->initialized ? session->bed_cx : 128.0;
@@ -3030,7 +3127,7 @@ onewasm_status_t onewasm_apply_profile(
                 ? json_array_to_config_string(key, value)
                 : json_val_to_string(value);
             if (!Slic3r::print_config_def.get(key)) continue;
-            // Unlike the legacy initializer, API 0.5 rejects an invalid value
+            // Unlike the older compatibility initializer, API 0.7 rejects an invalid value
             // for a known option so the staged patch can fail atomically.
             candidate_config.set_deserialize_strict(key, serialized);
         }
@@ -3046,26 +3143,26 @@ onewasm_status_t onewasm_apply_profile(
         session->project_cancel_requested.store(false, std::memory_order_release);
         clear_project_outputs(*session);
         session->initialized = true;
-        return ONEWASM_OK;
+        return ONESLICER_OK;
     } catch (const std::exception& e) {
         record_error(*session, std::string("failed to apply Orca profile fragment: ") + e.what());
-        return ONEWASM_ERR_CONFIG;
+        return ONESLICER_ERR_CONFIG;
     } catch (...) {
         record_error(*session, "failed to apply Orca profile fragment");
-        return ONEWASM_ERR_CONFIG;
+        return ONESLICER_ERR_CONFIG;
     }
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_init_profile(
-    onewasm_session_t session_ptr,
+oneslicer_status_t oneslicer_init_profile(
+    oneslicer_session_t session_ptr,
     const char* format_utf8,
     uint32_t format_len,
     const uint8_t* profile_data,
     uint32_t profile_len
 ) {
     OrcSession* session = as_session(session_ptr);
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
     session->initialized = false;
     session->last_statistics_json.clear();
@@ -3073,13 +3170,13 @@ onewasm_status_t onewasm_init_profile(
     reset_project(*session);
     if (!format_utf8 || format_len == 0 || !profile_data || profile_len == 0) {
         record_error(*session, "profile format or data is empty");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
 
     const std::string format(format_utf8, format_utf8 + format_len);
     if (format != "project.3mf") {
         record_error(*session, "unsupported OrcaSlicer profile format: " + format);
-        return ONEWASM_ERR_UNSUPPORTED;
+        return ONESLICER_ERR_UNSUPPORTED;
     }
 
     const char* tmp_in = "/tmp/ow_profile.3mf";
@@ -3088,13 +3185,13 @@ onewasm_status_t onewasm_init_profile(
         FILE* file = std::fopen(tmp_in, "wb");
         if (!file) {
             record_error(*session, "cannot open profile temp file for writing");
-            return ONEWASM_ERR_INPUT_IO;
+            return ONESLICER_ERR_INPUT_IO;
         }
         const std::size_t written = std::fwrite(profile_data, 1, profile_len, file);
         std::fclose(file);
         if (written != profile_len) {
             record_error(*session, "failed to write complete profile data to MEMFS");
-            return ONEWASM_ERR_INPUT_IO;
+            return ONESLICER_ERR_INPUT_IO;
         }
 
         Slic3r::Model model;
@@ -3117,12 +3214,12 @@ onewasm_status_t onewasm_init_profile(
         );
         if (!ok) {
             record_error(*session, "OrcaSlicer could not load the project profile");
-            return ONEWASM_ERR_INPUT_FORMAT;
+            return ONESLICER_ERR_INPUT_FORMAT;
         }
         session->config = Slic3r::DynamicPrintConfig();
         session->config.apply(g_defaults);
         session->config.apply(loaded_config);
-        // The project's printer replaces the bed from onewasm_init, matching
+        // The project's printer replaces the bed from oneslicer_init, matching
         // the printable_area convention of the JSON profile path.
         Slic3r::Vec2d bed_min, bed_max;
         std::size_t bed_points = 0;
@@ -3146,39 +3243,40 @@ onewasm_status_t onewasm_init_profile(
                 project_error
             )) {
             record_error(*session, project_error);
-            return ONEWASM_ERR_INPUT_FORMAT;
+            return ONESLICER_ERR_INPUT_FORMAT;
         }
         session->project_manifest = std::move(native_manifest);
         session->project_object_blob = std::move(native_object_blob);
+        ++session->project_preview_revision;
         session->native_project_blob.assign(profile_data, profile_data + profile_len);
         session->native_project_dirty = false;
         session->initialized = true;
-        return ONEWASM_OK;
+        return ONESLICER_OK;
     } catch (const std::exception& e) {
         record_error(*session, std::string("OrcaSlicer profile load failed: ") + e.what());
-        return ONEWASM_ERR_INTERNAL;
+        return ONESLICER_ERR_INTERNAL;
     }
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_set_progress_callback(
-    onewasm_session_t session_ptr,
-    onewasm_progress_callback_t callback,
+oneslicer_status_t oneslicer_set_progress_callback(
+    oneslicer_session_t session_ptr,
+    oneslicer_progress_callback_t callback,
     void* user_data
 ) {
     OrcSession* session = as_session(session_ptr);
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
     session->progress_callback = callback;
     session->progress_user_data = user_data;
-    return ONEWASM_OK;
+    return ONESLICER_OK;
 }
 
 /** Request native cancellation of the active operation without waiting. */
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_cancel(onewasm_session_t session_ptr) {
+oneslicer_status_t oneslicer_cancel(oneslicer_session_t session_ptr) {
     OrcSession* session = as_session(session_ptr);
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
 
     session->project_cancel_requested.store(true, std::memory_order_release);
 
@@ -3189,46 +3287,46 @@ onewasm_status_t onewasm_cancel(onewasm_session_t session_ptr) {
     }
     if (operation)
         operation->cancel();
-    return ONEWASM_OK;
+    return ONESLICER_OK;
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_get_capabilities(uint8_t** out_json, uint32_t* out_len) {
+oneslicer_status_t oneslicer_get_capabilities(uint8_t** out_json, uint32_t* out_len) {
     g_conversion_last_error.clear();
     if (out_json) *out_json = nullptr;
     if (out_len) *out_len = 0;
     if (!out_json || !out_len) {
         record_error("capability output pointers must not be null");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
 
     constexpr const char* threading_model = "pthreads";
     constexpr const char* requires_sab = "true";
     const std::string json = std::string(R"({
-  "api":{"name":"one-wasm-slicer-api","version":"0.6.0"},
+  "api":{"name":"one-slicer-api","version":"0.7.0"},
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},
-  "project":{"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
-  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
+  "project":{"meshFormats":["stl"],"faceAttributeSemantics":{"triangle":[],"brepFace":[]},"nativeProjectFormats":["project.3mf"],"preservationPolicies":["require","best-effort","portable"],"sliceArtifactExport":"supported"},
+  "features":{"core.session":"supported","core.configuration":"supported","config.fullProfile":"supported","config.profileApply":"supported","project.manifest":"supported","project.modifierVolumes":"supported","project.modifierVolumes.nativeProject":"supported","project.meshFormat.step":"unsupported","project.preview.stepFaces":"unsupported","project.faceAttributes":"unsupported","project.prepare":"supported","project.slice":"supported","project.slice.multiPlate":"supported","project.slice.assets":"supported","project.export":"supported","project.export.sliceArtifacts":"supported","project.export.preservation":"supported","format.objToStl":"supported","format.stepToStl":"supported","format.threeMfToStl":"supported","runtime.capabilities":"supported","runtime.progress":"supported","runtime.cancellation":"supported","runtime.errors":"supported"}
 })";
     if (json.size() > UINT32_MAX) {
         record_error("capability document is too large");
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     }
     auto* buffer = static_cast<uint8_t*>(std::malloc(std::max<std::size_t>(1, json.size())));
     if (!buffer) {
         record_error("out of memory");
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     }
     std::memcpy(buffer, json.data(), json.size());
     *out_json = buffer;
     *out_len = static_cast<uint32_t>(json.size());
-    return ONEWASM_OK;
+    return ONESLICER_OK;
 }
 
-static onewasm_status_t legacy_get_last_statistics(
-    onewasm_session_t session_ptr,
+static oneslicer_status_t copy_last_slice_statistics(
+    oneslicer_session_t session_ptr,
     uint8_t** out_json,
     uint32_t* out_len
 ) {
@@ -3236,47 +3334,46 @@ static onewasm_status_t legacy_get_last_statistics(
     if (out_json) *out_json = nullptr;
     if (out_len) *out_len = 0;
     if (!session || !out_json || !out_len)
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
 
     std::lock_guard<std::mutex> lock(session->control_mutex);
     if (!session->has_last_statistics) {
         session->last_error = "no statistics are available; run a successful slice first";
-        return ONEWASM_ERR_NO_DATA;
+        return ONESLICER_ERR_NO_DATA;
     }
     if (session->last_statistics_json.size() > UINT32_MAX) {
         session->last_error = "statistics document is too large";
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     }
     auto* buffer = static_cast<uint8_t*>(std::malloc(std::max<std::size_t>(1, session->last_statistics_json.size())));
     if (!buffer) {
         session->last_error = "out of memory";
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     }
     std::memcpy(buffer, session->last_statistics_json.data(), session->last_statistics_json.size());
     *out_json = buffer;
     *out_len = static_cast<uint32_t>(session->last_statistics_json.size());
-    return ONEWASM_OK;
+    return ONESLICER_OK;
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_project_set_objects(
-    onewasm_session_t session_ptr,
+oneslicer_status_t oneslicer_project_set_objects(
+    oneslicer_session_t session_ptr,
     const uint8_t* object_blob,
     uint32_t object_blob_len,
     const uint8_t* manifest_json,
     uint32_t manifest_len
 ) {
     OrcSession* session = as_session(session_ptr);
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
-    clear_project_outputs(*session);
     if (!session->initialized) {
-        record_error(*session, "call onewasm_init or onewasm_init_profile first");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        record_error(*session, "call oneslicer_init or oneslicer_init_profile first");
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
     if (!object_blob || object_blob_len == 0) {
         record_error(*session, "project object blob is empty");
-        return ONEWASM_ERR_EMPTY_INPUT;
+        return ONESLICER_ERR_EMPTY_INPUT;
     }
 
     ProjectManifestInput parsed;
@@ -3285,53 +3382,92 @@ onewasm_status_t onewasm_project_set_objects(
     if (!parse_project_manifest(manifest_json, manifest_len, object_blob_len, true,
                                 parsed, normalized, error)) {
         record_error(*session, error);
-        return ONEWASM_ERR_VALIDATION;
+        return ONESLICER_ERR_VALIDATION;
+    }
+
+    for (const auto& mesh : parsed.meshes) {
+        if (mesh.format == "step") {
+            record_error(*session, "OrcaSlicer does not support STEP project meshes; convert STEP with format.stepToStl and upload the STL mesh");
+            return ONESLICER_ERR_UNSUPPORTED;
+        }
+        if (mesh.has_face_attributes) {
+            record_error(*session, "OrcaSlicer does not implement project face attributes");
+            return ONESLICER_ERR_UNSUPPORTED;
+        }
     }
 
     try {
         std::vector<std::uint8_t> retained_blob(object_blob, object_blob + object_blob_len);
+        clear_project_outputs(*session);
         session->project_object_blob = std::move(retained_blob);
         session->project_manifest = std::move(normalized);
         session->native_project_blob.clear();
         session->native_project_dirty = false;
+        ++session->project_preview_revision;
         session->project_cancel_requested.store(false, std::memory_order_release);
-        return ONEWASM_OK;
+        return ONESLICER_OK;
     } catch (const std::bad_alloc&) {
         record_error(*session, "unable to retain the project object blob");
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     } catch (const std::exception& exception) {
         record_error(*session, std::string("project state update failed: ") + exception.what());
-        return ONEWASM_ERR_INTERNAL;
+        return ONESLICER_ERR_INTERNAL;
     }
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_project_get_manifest(
-    onewasm_session_t session_ptr,
+oneslicer_status_t oneslicer_project_get_manifest(
+    oneslicer_session_t session_ptr,
     uint8_t** out_json,
     uint32_t* out_len
 ) {
     OrcSession* session = as_session(session_ptr);
     if (out_json) *out_json = nullptr;
     if (out_len) *out_len = 0;
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
     if (!out_json || !out_len) {
         record_error(*session, "manifest output pointers must not be null");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
 
     const nlohmann::json manifest = session->project_manifest.is_null()
         ? empty_project_manifest() : session->project_manifest;
     const std::string output = manifest.dump();
     if (!set_project_output(output, out_json, out_len, session->last_error))
-        return ONEWASM_ERR_OUTPUT;
-    return ONEWASM_OK;
+        return ONESLICER_ERR_OUTPUT;
+    return ONESLICER_OK;
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_project_prepare(
-    onewasm_session_t session_ptr,
+oneslicer_status_t oneslicer_project_get_preview(
+    oneslicer_session_t session_ptr,
+    const char* mesh_id_utf8,
+    uint32_t mesh_id_len,
+    uint8_t** out_descriptor_json,
+    uint32_t* out_descriptor_len,
+    uint8_t** out_preview_blob,
+    uint32_t* out_preview_blob_len
+) {
+    if (out_descriptor_json) *out_descriptor_json = nullptr;
+    if (out_descriptor_len) *out_descriptor_len = 0;
+    if (out_preview_blob) *out_preview_blob = nullptr;
+    if (out_preview_blob_len) *out_preview_blob_len = 0;
+    OrcSession* session = as_session(session_ptr);
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
+    session->last_error.clear();
+    if (!mesh_id_utf8 || mesh_id_len == 0 || !out_descriptor_json || !out_descriptor_len
+        || !out_preview_blob || !out_preview_blob_len) {
+        record_error(*session, "mapped preview requires a mesh id and all output pointers");
+        return ONESLICER_ERR_INVALID_ARGUMENT;
+    }
+    record_error(*session, "OrcaSlicer does not implement mapped STEP previews");
+    return ONESLICER_ERR_UNSUPPORTED;
+}
+
+EMSCRIPTEN_KEEPALIVE
+oneslicer_status_t oneslicer_project_prepare(
+    oneslicer_session_t session_ptr,
     const uint8_t* request_json,
     uint32_t request_len,
     uint8_t** out_manifest_json,
@@ -3340,19 +3476,16 @@ onewasm_status_t onewasm_project_prepare(
     OrcSession* session = as_session(session_ptr);
     if (out_manifest_json) *out_manifest_json = nullptr;
     if (out_len) *out_len = 0;
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
     if (!session->initialized) {
-        record_error(*session, "call onewasm_init or onewasm_init_profile first");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        record_error(*session, "call oneslicer_init or oneslicer_init_profile first");
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
     if (!out_manifest_json || !out_len || !request_json || request_len == 0) {
         record_error(*session, "project prepare request and output pointers must not be empty");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
-
-    clear_project_outputs(*session);
-    session->project_cancel_requested.store(false, std::memory_order_release);
 
     nlohmann::json request;
     try {
@@ -3361,33 +3494,36 @@ onewasm_status_t onewasm_project_prepare(
     } catch (const std::exception& exception) {
         record_error(*session, std::string("project prepare request is not valid JSON: ")
             + exception.what());
-        return ONEWASM_ERR_VALIDATION;
+        return ONESLICER_ERR_VALIDATION;
     }
     if (!request.is_object() || !request.contains("schemaVersion")
         || !request.at("schemaVersion").is_string()
-        || request.at("schemaVersion").get<std::string>() != ONEWASM_API_VERSION_STRING) {
-        record_error(*session, "project prepare request schemaVersion must be " ONEWASM_API_VERSION_STRING);
-        return ONEWASM_ERR_VALIDATION;
+        || request.at("schemaVersion").get<std::string>() != ONESLICER_API_VERSION_STRING) {
+        record_error(*session, "project prepare request schemaVersion must be " ONESLICER_API_VERSION_STRING);
+        return ONESLICER_ERR_VALIDATION;
     }
     std::string request_error;
     if (!reject_unknown_keys(request, {"schemaVersion", "operation"},
                              "project prepare request", request_error)) {
         record_error(*session, request_error);
-        return ONEWASM_ERR_VALIDATION;
+        return ONESLICER_ERR_VALIDATION;
     }
     const std::string operation_name = request.value("operation", "");
     const int operation = operation_name == "auto-orient"
-        ? ONEWASM_PLATE_AUTO_ORIENT
-        : operation_name == "arrange" ? ONEWASM_PLATE_ARRANGE : 0;
+        ? PREPARE_AUTO_ORIENT
+        : operation_name == "arrange" ? PREPARE_ARRANGE : 0;
     if (operation == 0) {
         record_error(*session, "project prepare operation must be auto-orient or arrange");
-        return ONEWASM_ERR_VALIDATION;
+        return ONESLICER_ERR_VALIDATION;
     }
+
+    clear_project_outputs(*session);
+    session->project_cancel_requested.store(false, std::memory_order_release);
 
     const std::string manifest_text = session->project_manifest.dump();
     if (manifest_text.size() > UINT32_MAX) {
         record_error(*session, "project manifest exceeds the C ABI length limit");
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     }
     ProjectManifestInput manifest;
     nlohmann::json normalized;
@@ -3399,7 +3535,7 @@ onewasm_status_t onewasm_project_prepare(
             false,
             manifest, normalized, error)) {
         record_error(*session, error);
-        return ONEWASM_ERR_VALIDATION;
+        return ONESLICER_ERR_VALIDATION;
     }
 
     nlohmann::json updated = session->project_manifest;
@@ -3416,22 +3552,22 @@ onewasm_status_t onewasm_project_prepare(
             if (!collect_project_plate_inputs(
                     *session, manifest, plate_id, blob, offsets, extruders,
                     transforms, manifest_indices,
-                    operation == ONEWASM_PLATE_AUTO_ORIENT, error)) {
+                    operation == PREPARE_AUTO_ORIENT, error)) {
                 record_error(*session, error);
-                return ONEWASM_ERR_VALIDATION;
+                return ONESLICER_ERR_VALIDATION;
             }
             if (manifest_indices.size() > UINT32_MAX) {
                 record_error(*session, "project plate contains too many objects");
-                return ONEWASM_ERR_INPUT_FORMAT;
+                return ONESLICER_ERR_INPUT_FORMAT;
             }
 
             uint8_t* prepared_data = nullptr;
             uint32_t prepared_len = 0;
-            const auto status = legacy_prepare_plate(
+            const auto status = prepare_stl_plate(
                 session_ptr, blob.data(), static_cast<std::uint32_t>(blob.size()),
                 offsets.data(), static_cast<std::uint32_t>(manifest_indices.size()),
                 transforms.data(), operation, &prepared_data, &prepared_len);
-            if (status != ONEWASM_OK) {
+            if (status != ONESLICER_OK) {
                 std::free(prepared_data);
                 return status;
             }
@@ -3445,33 +3581,33 @@ onewasm_status_t onewasm_project_prepare(
                 std::free(prepared_data);
                 record_error(*session, std::string("OrcaSlicer returned invalid transforms: ")
                     + exception.what());
-                return ONEWASM_ERR_INTERNAL;
+                return ONESLICER_ERR_INTERNAL;
             }
             std::free(prepared_data);
             if (!prepared.is_array() || prepared.size() != manifest_indices.size()) {
                 record_error(*session, "OrcaSlicer returned an incomplete project transform list");
-                return ONEWASM_ERR_INTERNAL;
+                return ONESLICER_ERR_INTERNAL;
             }
 
             for (std::size_t index = 0; index < manifest_indices.size(); ++index) {
                 ObjectTransformInput transform;
                 if (!parse_prepared_transform(prepared[index], transform, error)) {
                     record_error(*session, error);
-                    return ONEWASM_ERR_INTERNAL;
+                    return ONESLICER_ERR_INTERNAL;
                 }
-                auto matrix = legacy_transform_to_project_matrix(transform, *session);
+                auto matrix = prepare_transform_to_project_matrix(transform, *session);
                 if (prepared[index].contains("sourceOriginCorrection")) {
                     const auto& correction = prepared[index].at("sourceOriginCorrection");
                     if (!correction.is_array() || correction.size() != 3) {
                         record_error(*session, "OrcaSlicer returned an invalid source-origin correction");
-                        return ONEWASM_ERR_INTERNAL;
+                        return ONESLICER_ERR_INTERNAL;
                     }
                     for (std::size_t axis = 0; axis < 3; ++axis) {
                         double value = 0.;
                         if (!project_number(correction[axis], value,
                                             "prepared source-origin correction", error)) {
                             record_error(*session, error);
-                            return ONEWASM_ERR_INTERNAL;
+                            return ONESLICER_ERR_INTERNAL;
                         }
                         matrix[axis * 4 + 3] += value;
                     }
@@ -3482,25 +3618,25 @@ onewasm_status_t onewasm_project_prepare(
         }
     } catch (const std::bad_alloc&) {
         record_error(*session, "unable to retain the prepared project manifest");
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     } catch (const std::exception& exception) {
         record_error(*session, std::string("OrcaSlicer project preparation failed: ")
             + exception.what());
-        return ONEWASM_ERR_INTERNAL;
+        return ONESLICER_ERR_INTERNAL;
     }
 
     const std::string output = updated.dump();
     if (!set_project_output(output, out_manifest_json, out_len, session->last_error))
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     session->project_manifest = std::move(updated);
     if (!session->native_project_blob.empty())
         session->native_project_dirty = true;
-    return ONEWASM_OK;
+    return ONESLICER_OK;
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_project_slice(
-    onewasm_session_t session_ptr,
+oneslicer_status_t oneslicer_project_slice(
+    oneslicer_session_t session_ptr,
     const uint8_t* request_json,
     uint32_t request_len,
     uint8_t** out_result_json,
@@ -3509,15 +3645,15 @@ onewasm_status_t onewasm_project_slice(
     OrcSession* session = as_session(session_ptr);
     if (out_result_json) *out_result_json = nullptr;
     if (out_len) *out_len = 0;
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
     if (!session->initialized) {
-        record_error(*session, "call onewasm_init or onewasm_init_profile first");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        record_error(*session, "call oneslicer_init or oneslicer_init_profile first");
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
     if (!out_result_json || !out_len) {
         record_error(*session, "slice result output pointers must not be null");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
 
     // A new project slice invalidates all assets from the previous operation,
@@ -3530,7 +3666,7 @@ onewasm_status_t onewasm_project_slice(
     if (manifest_text.size() > UINT32_MAX
         || session->project_object_blob.size() > UINT32_MAX) {
         record_error(*session, "project input exceeds the C ABI length limit");
-        return ONEWASM_ERR_INPUT_FORMAT;
+        return ONESLICER_ERR_INPUT_FORMAT;
     }
     ProjectManifestInput manifest;
     nlohmann::json normalized;
@@ -3542,24 +3678,24 @@ onewasm_status_t onewasm_project_slice(
             false,
             manifest, normalized, error)) {
         record_error(*session, error);
-        return ONEWASM_ERR_VALIDATION;
+        return ONESLICER_ERR_VALIDATION;
     }
 
     ProjectSliceRequest request;
     if (!parse_project_slice_request(request_json, request_len, manifest, request, error)) {
         record_error(*session, error);
-        return ONEWASM_ERR_VALIDATION;
+        return ONESLICER_ERR_VALIDATION;
     }
 
     ActiveSliceGuard operation(*session);
     if (!operation) {
         record_error(*session, "session already has an active operation");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
     ProjectOutputFailureGuard output_guard{*session};
     std::map<std::string, std::string> new_assets;
     nlohmann::json result = {
-        {"schemaVersion", ONEWASM_API_VERSION_STRING},
+        {"schemaVersion", ONESLICER_API_VERSION_STRING},
         {"plateResults", nlohmann::json::array()},
         {"warnings", nlohmann::json::array()},
     };
@@ -3568,7 +3704,7 @@ onewasm_status_t onewasm_project_slice(
         for (std::size_t plate_index = 0; plate_index < request.plate_ids.size(); ++plate_index) {
             if (session->project_cancel_requested.load(std::memory_order_acquire)) {
                 record_error(*session, "project slice cancelled");
-                return ONEWASM_ERR_CANCELLED;
+                return ONESLICER_ERR_CANCELLED;
             }
             const int base = static_cast<int>((100 * plate_index) / request.plate_ids.size());
             const int end = static_cast<int>((100 * (plate_index + 1)) / request.plate_ids.size());
@@ -3600,7 +3736,7 @@ onewasm_status_t onewasm_project_slice(
                 model,
                 error
             );
-            if (build_status != ONEWASM_OK) {
+            if (build_status != ONESLICER_OK) {
                 record_error(*session, error);
                 return build_status;
             }
@@ -3610,7 +3746,7 @@ onewasm_status_t onewasm_project_slice(
             const auto slice_status = slice_project_model(
                 *session, model, operation, &gcode_data, &gcode_len
             );
-            if (slice_status != ONEWASM_OK) {
+            if (slice_status != ONESLICER_OK) {
                 std::free(gcode_data);
                 return slice_status;
             }
@@ -3631,9 +3767,9 @@ onewasm_status_t onewasm_project_slice(
             if (request.include_statistics) {
                 uint8_t* statistics_data = nullptr;
                 uint32_t statistics_len = 0;
-                const auto statistics_status = legacy_get_last_statistics(
+                const auto statistics_status = copy_last_slice_statistics(
                     session_ptr, &statistics_data, &statistics_len);
-                if (statistics_status != ONEWASM_OK) {
+                if (statistics_status != ONESLICER_OK) {
                     std::free(statistics_data);
                     return statistics_status;
                 }
@@ -3644,31 +3780,31 @@ onewasm_status_t onewasm_project_slice(
                     std::free(statistics_data);
                     if (!statistics.is_object()) {
                         record_error(*session, "OrcaSlicer returned invalid slice statistics");
-                        return ONEWASM_ERR_INTERNAL;
+                        return ONESLICER_ERR_INTERNAL;
                     }
-                    statistics["schemaVersion"] = ONEWASM_API_VERSION_STRING;
+                    statistics["schemaVersion"] = ONESLICER_API_VERSION_STRING;
                     plate_result["statistics"] = std::move(statistics);
                 } catch (const std::exception& exception) {
                     std::free(statistics_data);
                     record_error(*session, std::string("OrcaSlicer returned invalid slice statistics: ")
                         + exception.what());
-                    return ONEWASM_ERR_INTERNAL;
+                    return ONESLICER_ERR_INTERNAL;
                 }
             }
             result["plateResults"].push_back(std::move(plate_result));
         }
         if (session->project_cancel_requested.load(std::memory_order_acquire)) {
             record_error(*session, "project slice cancelled");
-            return ONEWASM_ERR_CANCELLED;
+            return ONESLICER_ERR_CANCELLED;
         }
         emit_project_progress(*session, 100, "Finished project");
     } catch (const std::bad_alloc&) {
         record_error(*session, "unable to retain project slice results");
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     } catch (const std::exception& exception) {
         record_error(*session, std::string("OrcaSlicer project slice failed: ")
             + exception.what());
-        return ONEWASM_ERR_INTERNAL;
+        return ONESLICER_ERR_INTERNAL;
     }
 
     {
@@ -3677,14 +3813,14 @@ onewasm_status_t onewasm_project_slice(
     }
     const std::string result_text = result.dump();
     if (!set_project_output(result_text, out_result_json, out_len, session->last_error))
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     output_guard.committed = true;
-    return ONEWASM_OK;
+    return ONESLICER_OK;
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_project_get_asset(
-    onewasm_session_t session_ptr,
+oneslicer_status_t oneslicer_project_get_asset(
+    oneslicer_session_t session_ptr,
     const char* asset_id_utf8,
     uint32_t asset_id_len,
     uint8_t** out_data,
@@ -3693,11 +3829,11 @@ onewasm_status_t onewasm_project_get_asset(
     OrcSession* session = as_session(session_ptr);
     if (out_data) *out_data = nullptr;
     if (out_len) *out_len = 0;
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
     if (!asset_id_utf8 || asset_id_len == 0 || !out_data || !out_len) {
         record_error(*session, "project asset id and output pointers must not be empty");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
 
     const std::string asset_id(asset_id_utf8, asset_id_utf8 + asset_id_len);
@@ -3707,16 +3843,16 @@ onewasm_status_t onewasm_project_get_asset(
         const auto found = session->project_assets.find(asset_id);
         if (found == session->project_assets.end()) {
             record_error(*session, "project asset is not available: " + asset_id);
-            return ONEWASM_ERR_NO_DATA;
+            return ONESLICER_ERR_NO_DATA;
         }
         asset = found->second;
     }
     if (!set_project_output(asset, out_data, out_len, session->last_error))
-        return ONEWASM_ERR_OUTPUT;
-    return ONEWASM_OK;
+        return ONESLICER_ERR_OUTPUT;
+    return ONESLICER_OK;
 }
 
-static onewasm_status_t legacy_write_model_3mf(
+static oneslicer_status_t write_project_model_3mf(
     OrcSession& session,
     Slic3r::Model& model,
     uint8_t** out_3mf,
@@ -3727,7 +3863,7 @@ static onewasm_status_t legacy_write_model_3mf(
     if (out_3mf) *out_3mf = nullptr;
     if (out_len) *out_len = 0;
     if (!out_3mf || !out_len || model.objects.empty())
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
 
     try {
         const std::string path = "/tmp/ow_project_native_"
@@ -3744,7 +3880,7 @@ static onewasm_status_t legacy_write_model_3mf(
         }
         if (!Slic3r::store_bbs_3mf(store_params)) {
             record_error(session, "OrcaSlicer native project export failed");
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         }
 
         long size = 0;
@@ -3754,20 +3890,20 @@ static onewasm_status_t legacy_write_model_3mf(
         if (!bytes) {
             record_error(session, std::string{"unable to read native project export: "}
                 + (read_error ? read_error : "read failed"));
-            return out_of_memory ? ONEWASM_ERR_OUTPUT : ONEWASM_ERR_INPUT_IO;
+            return out_of_memory ? ONESLICER_ERR_OUTPUT : ONESLICER_ERR_INPUT_IO;
         }
         if (size <= 0 || static_cast<unsigned long long>(size) > UINT32_MAX) {
             std::free(bytes);
             record_error(session, "native 3MF output exceeds the C ABI length limit");
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         }
         *out_3mf = reinterpret_cast<std::uint8_t*>(bytes);
         *out_len = static_cast<uint32_t>(size);
-        return ONEWASM_OK;
+        return ONESLICER_OK;
     } catch (const std::exception& exception) {
         record_error(session, std::string{"OrcaSlicer native modifier project export failed: "}
             + exception.what());
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     }
 }
 
@@ -3814,7 +3950,7 @@ static bool prepare_native_modifier_model_for_export(
 // G-code of each sliced plate the way desktop Orca saves a sliced project:
 // Metadata/plate_N.gcode, its .md5, the plate's gcode_file reference and its
 // slice_info entry. Plates keep their identity instead of being flattened.
-static onewasm_status_t legacy_write_sliced_project_3mf(
+static oneslicer_status_t write_project_slice_artifacts_3mf(
     OrcSession& session,
     const ProjectManifestInput& manifest,
     const std::map<std::string, std::string>& gcode_by_plate,
@@ -3837,7 +3973,7 @@ static onewasm_status_t legacy_write_sliced_project_3mf(
         const std::size_t first_object = model.objects.size();
         if (project_plate_has_instances(manifest, plate_id)) {
             const auto status = build_project_plate_model(session, manifest, plate_id, model, error);
-            if (status != ONEWASM_OK)
+            if (status != ONESLICER_OK)
                 return status;
         }
 
@@ -3868,13 +4004,13 @@ static onewasm_status_t legacy_write_sliced_project_3mf(
             FILE* file = std::fopen(path.c_str(), "wb");
             if (!file) {
                 error = "unable to stage plate G-code for project export";
-                return ONEWASM_ERR_INPUT_IO;
+                return ONESLICER_ERR_INPUT_IO;
             }
             const std::size_t written = std::fwrite(gcode->second.data(), 1, gcode->second.size(), file);
             std::fclose(file);
             if (written != gcode->second.size()) {
                 error = "unable to stage complete plate G-code for project export";
-                return ONEWASM_ERR_INPUT_IO;
+                return ONESLICER_ERR_INPUT_IO;
             }
             plate->gcode_file = path;
             plate->is_sliced_valid = true;
@@ -3884,16 +4020,16 @@ static onewasm_status_t legacy_write_sliced_project_3mf(
     }
     if (model.objects.empty()) {
         error = "project contains no objects to export";
-        return ONEWASM_ERR_EMPTY_INPUT;
+        return ONESLICER_ERR_EMPTY_INPUT;
     }
     if (!manifest.modifier_volumes.empty() && !prepare_native_modifier_model_for_export(model, error))
-        return ONEWASM_ERR_VALIDATION;
-    return legacy_write_model_3mf(session, model, out_3mf, out_len, &plate_data_list, &config);
+        return ONESLICER_ERR_VALIDATION;
+    return write_project_model_3mf(session, model, out_3mf, out_len, &plate_data_list, &config);
 }
 
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_project_export(
-    onewasm_session_t session_ptr,
+oneslicer_status_t oneslicer_project_export(
+    oneslicer_session_t session_ptr,
     const char* format_utf8,
     uint32_t format_len,
     const uint8_t* options_json,
@@ -3904,15 +4040,15 @@ onewasm_status_t onewasm_project_export(
     OrcSession* session = as_session(session_ptr);
     if (out_result_json) *out_result_json = nullptr;
     if (out_len) *out_len = 0;
-    if (!session) return ONEWASM_ERR_INVALID_ARGUMENT;
+    if (!session) return ONESLICER_ERR_INVALID_ARGUMENT;
     session->last_error.clear();
     if (!session->initialized) {
-        record_error(*session, "call onewasm_init or onewasm_init_profile first");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        record_error(*session, "call oneslicer_init or oneslicer_init_profile first");
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
     if (!format_utf8 || format_len == 0 || !out_result_json || !out_len) {
         record_error(*session, "project export format and output pointers must not be empty");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
+        return ONESLICER_ERR_INVALID_ARGUMENT;
     }
     // Export publishes only its package, but it may embed the current slice
     // G-code, so take those assets before the previous outputs are cleared.
@@ -3928,18 +4064,18 @@ onewasm_status_t onewasm_project_export(
     const std::string format(format_utf8, format_utf8 + format_len);
     if (format != "project.3mf") {
         record_error(*session, "unsupported OrcaSlicer project export format: " + format);
-        return ONEWASM_ERR_UNSUPPORTED;
+        return ONESLICER_ERR_UNSUPPORTED;
     }
 
     ProjectExportOptions options;
     std::string error;
     if (!parse_project_export_options(options_json, options_len, options, error)) {
         record_error(*session, error);
-        return ONEWASM_ERR_VALIDATION;
+        return ONESLICER_ERR_VALIDATION;
     }
     if (options.include_slice_artifacts && gcode_by_plate.empty()) {
         record_error(*session, "includeSliceArtifacts requires a current slice result with G-code");
-        return ONEWASM_ERR_NO_DATA;
+        return ONESLICER_ERR_NO_DATA;
     }
 
     ProjectOutputFailureGuard output_guard{*session};
@@ -3963,7 +4099,7 @@ onewasm_status_t onewasm_project_export(
                 std::vector<std::string> source_entries;
                 if (!list_project_zip_entries(*session, session->native_project_blob, source_entries, error)) {
                     record_error(*session, error);
-                    return ONEWASM_ERR_INPUT_FORMAT;
+                    return ONESLICER_ERR_INPUT_FORMAT;
                 }
                 // These are the entries emitted by the headless
                 // private 3MF writer path. Do not classify every Metadata/*
@@ -4003,14 +4139,14 @@ onewasm_status_t onewasm_project_export(
                 }
                 if (options.preservation == "require" && !omitted_opaque_entries.empty()) {
                     record_error(*session, "project export cannot satisfy preservation=require; native opaque entries would be omitted");
-                    return ONEWASM_ERR_UNSUPPORTED;
+                    return ONESLICER_ERR_UNSUPPORTED;
                 }
             }
 
             const std::string manifest_text = session->project_manifest.dump();
             if (manifest_text.size() > UINT32_MAX || session->project_object_blob.size() > UINT32_MAX) {
                 record_error(*session, "project export input exceeds the C ABI length limit");
-                return ONEWASM_ERR_INPUT_FORMAT;
+                return ONESLICER_ERR_INPUT_FORMAT;
             }
             ProjectManifestInput manifest;
             nlohmann::json normalized;
@@ -4024,7 +4160,7 @@ onewasm_status_t onewasm_project_export(
                     error
                 )) {
                 record_error(*session, error);
-                return ONEWASM_ERR_VALIDATION;
+                return ONESLICER_ERR_VALIDATION;
             }
             if (options.include_slice_artifacts) {
                 for (const auto& plate_id : manifest.plate_ids) {
@@ -4037,7 +4173,7 @@ onewasm_status_t onewasm_project_export(
             } else if (manifest.plate_ids.size() > 1) {
                 if (options.preservation == "require") {
                     record_error(*session, "OrcaWasm portable project export cannot preserve multiple logical plates");
-                    return ONEWASM_ERR_UNSUPPORTED;
+                    return ONESLICER_ERR_UNSUPPORTED;
                 }
                 warnings.push_back({
                     {"code", "logical-plates-flattened"},
@@ -4055,12 +4191,12 @@ onewasm_status_t onewasm_project_export(
 
             uint8_t* exported_data = nullptr;
             uint32_t exported_len = 0;
-            onewasm_status_t export_status = ONEWASM_OK;
+            oneslicer_status_t export_status = ONESLICER_OK;
             if (options.include_slice_artifacts) {
-                export_status = legacy_write_sliced_project_3mf(
+                export_status = write_project_slice_artifacts_3mf(
                     *session, manifest, gcode_by_plate, &exported_data, &exported_len, error
                 );
-                if (export_status != ONEWASM_OK && !error.empty())
+                if (export_status != ONESLICER_OK && !error.empty())
                     record_error(*session, error);
             } else if (!manifest.modifier_volumes.empty()) {
                 Slic3r::Model native_model;
@@ -4068,30 +4204,30 @@ onewasm_status_t onewasm_project_export(
                     export_status = build_project_plate_model(
                         *session, manifest, plate_id, native_model, error
                     );
-                    if (export_status != ONEWASM_OK) {
+                    if (export_status != ONESLICER_OK) {
                         record_error(*session, error);
                         return export_status;
                     }
                 }
                 if (!prepare_native_modifier_model_for_export(native_model, error)) {
                     record_error(*session, error);
-                    return ONEWASM_ERR_VALIDATION;
+                    return ONESLICER_ERR_VALIDATION;
                 }
-                export_status = legacy_write_model_3mf(
+                export_status = write_project_model_3mf(
                     *session, native_model, &exported_data, &exported_len
                 );
             } else {
                 Slic3r::TriangleMesh mesh;
                 if (!build_project_export_mesh(*session, manifest, mesh, error)) {
                     record_error(*session, error);
-                    return ONEWASM_ERR_UNSUPPORTED;
+                    return ONESLICER_ERR_UNSUPPORTED;
                 }
                 const std::string stl_path = "/tmp/ow-project-export-"
                     + std::to_string(session->id) + ".stl";
                 TempFileGuard stl_guard(stl_path);
                 if (!Slic3r::store_stl(stl_path.c_str(), &mesh, true)) {
                     record_error(*session, "OrcaSlicer could not serialize the project export mesh");
-                    return ONEWASM_ERR_OUTPUT;
+                    return ONESLICER_ERR_OUTPUT;
                 }
                 long stl_size = 0;
                 const char* read_error = nullptr;
@@ -4102,10 +4238,10 @@ onewasm_status_t onewasm_project_export(
                 if (!stl_data) {
                     record_error(*session, std::string{"unable to read project export mesh: "}
                         + (read_error ? read_error : "read failed"));
-                    return out_of_memory ? ONEWASM_ERR_OUTPUT : ONEWASM_ERR_INPUT_IO;
+                    return out_of_memory ? ONESLICER_ERR_OUTPUT : ONESLICER_ERR_INPUT_IO;
                 }
-                export_status = legacy_write_3mf(
-                    reinterpret_cast<onewasm_session_t>(session),
+                export_status = write_single_mesh_3mf(
+                    reinterpret_cast<oneslicer_session_t>(session),
                     reinterpret_cast<const uint8_t*>(stl_data),
                     static_cast<uint32_t>(stl_size),
                     &exported_data,
@@ -4113,20 +4249,20 @@ onewasm_status_t onewasm_project_export(
                 );
                 std::free(stl_data);
             }
-            if (export_status != ONEWASM_OK) {
+            if (export_status != ONESLICER_OK) {
                 std::free(exported_data);
                 return export_status;
             }
             package.assign(reinterpret_cast<const char*>(exported_data), exported_len);
-            onewasm_free(exported_data);
+            oneslicer_free(exported_data);
         }
 
         if (package.empty() || package.size() > UINT32_MAX) {
             record_error(*session, "project export produced an invalid or oversized package");
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         }
         nlohmann::json result = {
-            {"schemaVersion", ONEWASM_API_VERSION_STRING},
+            {"schemaVersion", ONESLICER_API_VERSION_STRING},
             {"asset", {
                 {"id", "project:export"},
                 {"kind", "project"},
@@ -4141,15 +4277,15 @@ onewasm_status_t onewasm_project_export(
             session->project_assets["project:export"] = std::move(package);
         }
         if (!set_project_output(result.dump(), out_result_json, out_len, session->last_error))
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         output_guard.committed = true;
-        return ONEWASM_OK;
+        return ONESLICER_OK;
     } catch (const std::bad_alloc&) {
         record_error(*session, "unable to retain the project export package");
-        return ONEWASM_ERR_OUTPUT;
+        return ONESLICER_ERR_OUTPUT;
     } catch (const std::exception& exception) {
         record_error(*session, std::string{"OrcaSlicer project export failed: "} + exception.what());
-        return ONEWASM_ERR_INTERNAL;
+        return ONESLICER_ERR_INTERNAL;
     }
 }
 
@@ -4157,11 +4293,11 @@ onewasm_status_t onewasm_project_export(
 //
 // The C ABI is synchronous, so a project operation called from the runtime's
 // JS thread blocks it until the operation returns, and a host abort signal can
-// never reach onewasm_cancel while it runs. These private entry points run one
+// never reach oneslicer_cancel while it runs. These private entry points run one
 // project operation on a pthread instead: the JS thread returns to its event
 // loop, keeps servicing proxied work (progress callbacks, file system calls),
-// polls for completion and calls onewasm_cancel when the host aborts. They are
-// not part of one-wasm-slicer-api; wasm/onewasm/engine-binding.js uses them.
+// polls for completion and calls oneslicer_cancel when the host aborts. They are
+// not part of one-slicer-api; wasm/oneslicer/engine-binding.js uses them.
 
 enum OrcAsyncKind : int {
     ORC_ASYNC_SLICE = 0,
@@ -4171,10 +4307,10 @@ enum OrcAsyncKind : int {
 
 struct OrcAsyncOperation {
     int kind = ORC_ASYNC_SLICE;
-    onewasm_session_t session = nullptr;
+    oneslicer_session_t session = nullptr;
     std::string first;
     std::string second;
-    onewasm_status_t status = ONEWASM_ERR_INTERNAL;
+    oneslicer_status_t status = ONESLICER_ERR_INTERNAL;
     uint8_t* out = nullptr;
     uint32_t out_len = 0;
     std::atomic<int> done{0};
@@ -4185,13 +4321,13 @@ static void* run_async_operation(void* arg) {
     const auto* first = reinterpret_cast<const uint8_t*>(operation->first.data());
     const auto first_len = static_cast<uint32_t>(operation->first.size());
     if (operation->kind == ORC_ASYNC_SLICE) {
-        operation->status = onewasm_project_slice(
+        operation->status = oneslicer_project_slice(
             operation->session, first, first_len, &operation->out, &operation->out_len);
     } else if (operation->kind == ORC_ASYNC_PREPARE) {
-        operation->status = onewasm_project_prepare(
+        operation->status = oneslicer_project_prepare(
             operation->session, first, first_len, &operation->out, &operation->out_len);
     } else {
-        operation->status = onewasm_project_export(
+        operation->status = oneslicer_project_export(
             operation->session,
             operation->first.data(),
             first_len,
@@ -4212,7 +4348,7 @@ static void* run_async_operation(void* arg) {
 EMSCRIPTEN_KEEPALIVE
 void* orcawasm_async_start(
     int kind,
-    onewasm_session_t session,
+    oneslicer_session_t session,
     const uint8_t* first,
     uint32_t first_len,
     const uint8_t* second,
@@ -4251,13 +4387,13 @@ void* orcawasm_async_start(
 
 /**
  * Return 0 while the operation runs. Once it has finished, store its status
- * and owned output (release with onewasm_free), release the handle and
+ * and owned output (release with oneslicer_free), release the handle and
  * return 1.
  */
 EMSCRIPTEN_KEEPALIVE
 int orcawasm_async_poll(
     void* handle,
-    onewasm_status_t* out_status,
+    oneslicer_status_t* out_status,
     uint8_t** out_data,
     uint32_t* out_len
 ) {
@@ -4273,164 +4409,6 @@ int orcawasm_async_poll(
 }
 
 /**
- * Slice an STL file (raw binary, ASCII or binary format).
- * On success *out_gcode points to a malloc'd, null-terminated G-code string
- * and *out_len contains its byte length (excluding the null terminator).
- * Caller must free the buffer with onewasm_free().
- */
-static onewasm_status_t legacy_slice_stl(
-    onewasm_session_t session_ptr,
-    const uint8_t* stl_data,
-    uint32_t stl_len,
-    uint8_t** out_gcode,
-    uint32_t* out_len
-) {
-    OrcSession* session = as_session(session_ptr);
-    if (!session) return -1;
-    session->last_error.clear();
-    if (out_gcode) *out_gcode = nullptr;
-    if (out_len) *out_len = 0;
-    if (!session->initialized) { record_error(*session, "call onewasm_init first"); return -1; }
-    if (!stl_data || stl_len == 0 || !out_gcode || !out_len)
-        return -1;
-
-    ActiveSliceGuard operation(*session);
-    if (!operation) {
-        record_error(*session, "session already has an active operation");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
-    }
-
-    // Write raw STL bytes into Emscripten's MEMFS so OrcaSlicer can read it.
-    {
-        FILE* f = std::fopen("/tmp/ow_in.stl", "wb");
-        if (!f) { record_error(*session, "cannot open /tmp/ow_in.stl for writing"); return -3; }
-        std::fwrite(stl_data, 1, static_cast<std::size_t>(stl_len), f);
-        std::fclose(f);
-    }
-
-    try {
-        throw_if_cancelled(operation);
-        // ── load model ───────────────────────────────────────────────
-        Slic3r::Model model;
-        const bool stl_ok = load_staged_stl("/tmp/ow_in.stl", &model, "object");
-        std::remove("/tmp/ow_in.stl"); // MEMFS is RAM-backed; free it as soon as loaded
-        if (!stl_ok) {
-            record_error(*session, "STL load failed");
-            return -4;
-        }
-        if (model.objects.empty()) {
-            record_error(*session, "model contains no objects");
-            return -5;
-        }
-        throw_if_cancelled(operation);
-
-        // ── place model on bed ───────────────────────────────────────
-        // Center the mesh in X/Y, then offset to bed centre. Per-object
-        // transforms use the multi-object entry point in the common ABI.
-        for (auto* obj : model.objects) {
-            center_object_xy_only(obj);
-            if (obj->instances.empty()) {
-                auto* inst = obj->add_instance();
-                // Place at bed centre, derived from bed_size_x / bed_size_y in config.
-                inst->set_offset(Slic3r::Vec3d(session->bed_cx, session->bed_cy, 0.0));
-            }
-        }
-
-        // ── configure & slice ────────────────────────────────────────
-        Slic3r::Print print;
-        operation.attach(print);
-        ActivePrintGuard print_guard(operation);
-        print.apply(model, session->config);
-        zero_plate_origin(print);
-        set_is_bbl_printer(print, session->config);
-        // When the user opts in (issue #164), turn off the engine's
-        // mixed-nozzle-temperature guard so a single-nozzle AMS plate with
-        // filaments whose recommended ranges don't overlap (e.g. PLA + PETG)
-        // slices instead of failing validation. The incompatible-temperature
-        // case then surfaces through validate()'s `warning` out-param (below)
-        // rather than as a fatal error.
-        if (session->remove_mixed_temp_restriction)
-            print.set_check_multi_filaments_compatibility(false);
-        // Variable (adaptive) layer height (issue #138) — compute after apply()
-        // (slicing parameters are populated), before validate()/process().
-        if (session->adaptive_layer_height)
-            apply_adaptive_layer_height(print, session->adaptive_layer_height_quality);
-        attach_progress_callback(print, *session);
-
-        {
-            // Print::validate() returns a StringObjectException whose
-            // `string` member holds the error message ("" when valid). The
-            // `warning` out-param catches the non-fatal mixed-temperature
-            // notice raised once the guard above is disabled — without a
-            // non-null pointer to absorb it, validate() would still return
-            // that notice as a fatal error. It is intentionally ignored.
-            Slic3r::StringObjectException warning;
-            Slic3r::StringObjectException err = print.validate(&warning);
-            if (!err.string.empty()) { record_error(*session, err.string); return -6; }
-        }
-
-        try {
-            throw_if_cancelled(operation);
-            print.process();
-            throw_if_cancelled(operation);
-        } catch (const Slic3r::CanceledException&) {
-            record_error(*session, "slice cancelled");
-            return ONEWASM_ERR_CANCELLED;
-        } catch (const Slic3r::SlicingError& e) {
-            record_error(*session, e.what());
-            return -7;
-        }
-
-        // ── export G-code to MEMFS ───────────────────────────────────
-        // Guard covers the do_export() call too: if it throws partway through
-        // writing, the partial file is still removed on the way out.
-        TempFileGuard out_guard("/tmp/ow_out.gcode");
-        Slic3r::GCodeProcessorResult processor_result;
-        {
-            Slic3r::GCode gcode_gen;
-            gcode_gen.do_export(&print, "/tmp/ow_out.gcode", &processor_result, nullptr);
-        }
-        throw_if_cancelled(operation);
-        const std::string statistics_json = serialize_slice_statistics(print, processor_result);
-
-        // ── read result back ─────────────────────────────────────────
-        FILE* gf = std::fopen("/tmp/ow_out.gcode", "rb");
-        if (!gf) { record_error(*session, "gcode export produced no output"); return -8; }
-
-        std::fseek(gf, 0, SEEK_END);
-        long sz = std::ftell(gf);
-        std::rewind(gf);
-
-        char* buf = static_cast<char*>(std::malloc(static_cast<std::size_t>(sz) + 1));
-        if (!buf) {
-            std::fclose(gf);
-            record_error(*session, "out of memory");
-            return -9;
-        }
-        std::fread(buf, 1, static_cast<std::size_t>(sz), gf);
-        std::fclose(gf);
-        buf[sz] = '\0';
-
-        if (sz < 0 || static_cast<unsigned long long>(sz) > UINT32_MAX) {
-            std::free(buf);
-            record_error(*session, "G-code output exceeds the C ABI length limit");
-            return ONEWASM_ERR_OUTPUT;
-        }
-        *out_gcode = reinterpret_cast<uint8_t*>(buf);
-        *out_len   = static_cast<uint32_t>(sz);
-        publish_slice_statistics(*session, statistics_json);
-        return ONEWASM_OK;
-
-    } catch (const Slic3r::CanceledException&) {
-        record_error(*session, "slice cancelled");
-        return ONEWASM_ERR_CANCELLED;
-    } catch (const std::exception& e) {
-        record_error(*session, e.what());
-        return -9;
-    }
-}
-
-/**
  * Prepare the current plate without slicing it.
  *
  * operation 1 = auto-orient each object, operation 2 = arrange the plate.
@@ -4439,8 +4417,8 @@ static onewasm_status_t legacy_slice_stl(
  * means identity transforms. In the arrange operation finite input offsets
  * are pinned and NaN offsets remain movable.
  */
-static onewasm_status_t legacy_prepare_plate(
-    onewasm_session_t session_ptr,
+static oneslicer_status_t prepare_stl_plate(
+    oneslicer_session_t session_ptr,
     const uint8_t* all_stl, uint32_t all_stl_len,
     const uint32_t* offsets, uint32_t n_files,
     const float* transforms,
@@ -4452,9 +4430,10 @@ static onewasm_status_t legacy_prepare_plate(
     session->last_error.clear();
     if (out_transforms) *out_transforms = nullptr;
     if (out_len) *out_len = 0;
-    if (!session->initialized) { record_error(*session, "call onewasm_init first"); return -1; }
+    if (!session->initialized) { record_error(*session, "call oneslicer_init first"); return -1; }
     if (!all_stl || all_stl_len == 0 || !offsets || n_files == 0 ||
-        !out_transforms || !out_len || (operation != 1 && operation != 2)) {
+        !out_transforms || !out_len
+        || (operation != PREPARE_AUTO_ORIENT && operation != PREPARE_ARRANGE)) {
         record_error(*session, "invalid current-plate arguments");
         return -1;
     }
@@ -4531,7 +4510,7 @@ static onewasm_status_t legacy_prepare_plate(
 /**
  * Convert an OBJ file (raw bytes) to a binary STL.
  * On success *out_stl points to a malloc'd buffer containing the STL and
- * *out_len contains its byte length.  Caller must free with onewasm_free().
+ * *out_len contains its byte length.  Caller must free with oneslicer_free().
  *
  * Error codes:
  *   -3  could not write OBJ to MEMFS
@@ -4541,7 +4520,7 @@ static onewasm_status_t legacy_prepare_plate(
  *   -9  unexpected C++ exception
  */
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_obj_to_stl(
+oneslicer_status_t oneslicer_obj_to_stl(
     const uint8_t* obj_data,
     uint32_t obj_len,
     uint8_t** out_stl,
@@ -4642,262 +4621,6 @@ onewasm_status_t onewasm_obj_to_stl(
 }
 
 /**
- * Slice multiple STL files arranged on a single plate.
- *
- * all_stl      concatenation of all STL file bytes
- * offsets      uint32 pairs [start0, end0, start1, end1, …] — one per file
- * n_files      number of files (= offsets length / 2)
- * extruder_ids nullable int32 array of length n_files — 1-based "extruder"
- *              override per object (0 = inherit the config's default),
- *              forwarded to OrcaSlicer's per-object `extruder` config key
- *              (PrintConfig.cpp: coInt, min 0 = inherit; normalize_fdm()
- *              resolves it to the per-region *_filament_id fields). Names a
- *              *filament* slot, not a nozzle: whether two slots share one
- *              nozzle (AMS-style) or drive genuine T0/T1 tool changes is
- *              decided by `filament_map` in the config, which the host integration
- *              builds in withFilamentSlots() (host profile adapter). Real
- *              multi-nozzle profiles work here as of #160 — the crash this
- *              used to be gated against was our own array serialization, see
- *              json_array_to_config_string() above.
- *              Ignored (no-op) when null, so existing single-extruder callers
- *              are unaffected.
- * transforms   nullable float table of 11 values per file: scale xyz,
- *              rotation xyz (radians), mirror xyz, and X/Y offset in mm
- *              relative to bed centre. NaN X/Y delegates placement to arrange.
- *
- * Internal adapter used by the API 0.6.0 project implementation.
- */
-static onewasm_status_t legacy_slice_stl_multi(
-    onewasm_session_t session_ptr,
-    const uint8_t* all_stl, uint32_t all_stl_len,
-    const uint32_t* offsets, uint32_t n_files,
-    const int32_t* extruder_ids,
-    const float* transforms,
-    uint8_t** out_gcode, uint32_t* out_len)
-{
-    OrcSession* session = as_session(session_ptr);
-    if (!session) return -1;
-    session->last_error.clear();
-    if (out_gcode) *out_gcode = nullptr;
-    if (out_len) *out_len = 0;
-    if (!session->initialized) { record_error(*session, "call onewasm_init first"); return -1; }
-    if (!all_stl || all_stl_len == 0 || !offsets || n_files == 0 || !out_gcode || !out_len)
-        return -1;
-
-    ActiveSliceGuard operation(*session);
-    if (!operation) {
-        record_error(*session, "session already has an active operation");
-        return ONEWASM_ERR_INVALID_ARGUMENT;
-    }
-
-    const char* base = reinterpret_cast<const char*>(all_stl);
-
-    try {
-        throw_if_cancelled(operation);
-        Slic3r::Model model;
-
-        // ── load each STL segment into the shared model ───────────────────────
-        for (uint32_t i = 0; i < n_files; i++) {
-            const uint32_t start = offsets[i * 2];
-            const uint32_t end   = offsets[i * 2 + 1];
-            if (end <= start || end > all_stl_len) {
-                record_error(*session, "invalid offset table");
-                return -1;
-            }
-            const uint32_t len = end - start;
-            const std::string path = "/tmp/ow_multi_" + std::to_string(i) + ".stl";
-            {
-                FILE* f = std::fopen(path.c_str(), "wb");
-                if (!f) { record_error(*session, "cannot write temp STL"); return -3; }
-                std::fwrite(base + start, 1, static_cast<std::size_t>(len), f);
-                std::fclose(f);
-            }
-            const std::string name = "object_" + std::to_string(i);
-            const bool ok = load_staged_stl(path.c_str(), &model, name.c_str());
-            std::remove(path.c_str());
-            if (!ok) {
-                record_error(*session, "STL load failed for file " + std::to_string(i));
-                return -4;
-            }
-            throw_if_cancelled(operation);
-        }
-
-        if (model.objects.empty()) { record_error(*session, "no objects loaded"); return -5; }
-
-        // The transform table is parallel to input files. A malformed or
-        // unusual STL load must not make the transform loop read past that
-        // table if one file expands into multiple model objects.
-        if (transforms && model.objects.size() != static_cast<std::size_t>(n_files)) {
-            record_error(*session, "current-plate transforms require one printable object per STL file");
-            return -1;
-        }
-
-        // Per-object extruder override requires an exact 1:1 file→object
-        // correspondence (true for the common case of one watertight solid
-        // per STL). If any file expanded into more than one object, skip the
-        // mapping entirely rather than guess a wrong association.
-        const bool can_map_extruders =
-            extruder_ids != nullptr && model.objects.size() == static_cast<std::size_t>(n_files);
-
-        // ── centre each mesh; give each one an instance; optional extruder override ──
-        if (!transforms) {
-            // Keep the legacy path untouched when no transform table is sent.
-            for (std::size_t i = 0; i < model.objects.size(); i++) {
-                auto* obj = model.objects[i];
-                center_object_xy_only(obj);
-                if (obj->instances.empty())
-                    obj->add_instance();
-                if (can_map_extruders && extruder_ids[i] > 0) {
-                    obj->config.set("extruder", extruder_ids[i]);
-                }
-            }
-        } else {
-            std::vector<bool> pinned(model.objects.size(), false);
-            for (std::size_t i = 0; i < model.objects.size(); i++) {
-                ObjectTransformInput transform;
-                std::string transform_error;
-                if (!read_object_transform(transforms, i, transform, transform_error)) {
-                    record_error(*session, transform_error);
-                    return -1;
-                }
-                pinned[i] = transform.has_offset;
-                auto* obj = model.objects[i];
-                center_object_xy_only(obj);
-                add_transformed_instance(obj, *session, transform, false);
-                obj->ensure_on_bed();
-                if (can_map_extruders && extruder_ids[i] > 0)
-                    obj->config.set("extruder", extruder_ids[i]);
-            }
-            arrange_transformed_model(model, *session, &pinned);
-        }
-
-        // ── auto-arrange on the bed ───────────────────────────────────────
-        if (!transforms) {
-            // coord_t uses 1 µm resolution: 1 mm = 1,000,000 units.
-            // For circular beds the arrangement boundary is the largest axis-aligned
-            // square inscribed in the circle (half-side = radius / √2) so objects are
-            // never placed in the rectangle corners that fall outside the printable area.
-            const double half_w = (session->bed_shape == "circle")
-                ? session->bed_cx / std::sqrt(2.0)
-                : session->bed_cx;
-            const double half_h = (session->bed_shape == "circle")
-                ? session->bed_cy / std::sqrt(2.0)
-                : session->bed_cy;
-            const Slic3r::BoundingBox bed(
-                Slic3r::Point(
-                    static_cast<coord_t>((session->bed_cx - half_w) * 1e6),
-                    static_cast<coord_t>((session->bed_cy - half_h) * 1e6)
-                ),
-                Slic3r::Point(
-                    static_cast<coord_t>((session->bed_cx + half_w) * 1e6),
-                    static_cast<coord_t>((session->bed_cy + half_h) * 1e6)
-                )
-            );
-
-            Slic3r::ArrangeParams params;
-            params.min_obj_distance = static_cast<coord_t>(2.0 * 1e6); // 2 mm gap
-            params.parallel         = true;
-
-            // Objects that don't fit land at bed centre instead of throwing
-            Slic3r::arrange_objects(model, bed, params,
-                [session](Slic3r::arrangement::ArrangePolygon& ap) {
-                    ap.translation = Slic3r::Vec2crd(
-                        static_cast<coord_t>(session->bed_cx * 1e6),
-                        static_cast<coord_t>(session->bed_cy * 1e6)
-                    );
-                });
-        }
-
-        // ── configure & slice ─────────────────────────────────────────────
-        // Fit the prime tower onto the bed before applying the config — the
-        // model is loaded and arranged now, so its height is known (see
-        // clamp_wipe_tower_to_bed). bed_cx/cy are half-extents.
-        clamp_wipe_tower_to_bed(session->config, model, 2.0 * session->bed_cx, 2.0 * session->bed_cy);
-        Slic3r::Print print;
-        operation.attach(print);
-        ActivePrintGuard print_guard(operation);
-        print.apply(model, session->config);
-        zero_plate_origin(print);
-        set_is_bbl_printer(print, session->config);
-        // See the private single-object adapter: opt-in override of the mixed-nozzle-temperature guard
-        // for single-nozzle multi-material plates (issue #164).
-        if (session->remove_mixed_temp_restriction)
-            print.set_check_multi_filaments_compatibility(false);
-        // Variable (adaptive) layer height (issue #138); see the private single-object adapter. With a
-        // multi-object plate the engine requires all objects share the same
-        // layering when a prime tower is on (Print::validate), so an adaptive
-        // multi-material plate with a tower surfaces that as a -6 validation
-        // error rather than silently ignoring the setting.
-        if (session->adaptive_layer_height)
-            apply_adaptive_layer_height(print, session->adaptive_layer_height_quality);
-        attach_progress_callback(print, *session);
-
-        {
-            // `warning` absorbs the non-fatal mixed-temperature notice when the
-            // guard above is off; see the private single-object adapter for why the pointer is required.
-            Slic3r::StringObjectException warning;
-            Slic3r::StringObjectException err = print.validate(&warning);
-            if (!err.string.empty()) { record_error(*session, err.string); return -6; }
-        }
-
-        try {
-            throw_if_cancelled(operation);
-            print.process();
-            throw_if_cancelled(operation);
-        } catch (const Slic3r::CanceledException&) {
-            record_error(*session, "slice cancelled");
-            return ONEWASM_ERR_CANCELLED;
-        } catch (const Slic3r::SlicingError& e) {
-            record_error(*session, e.what());
-            return -7;
-        }
-
-        TempFileGuard out_guard("/tmp/ow_out.gcode");
-        Slic3r::GCodeProcessorResult processor_result;
-        {
-            Slic3r::GCode gcode_gen;
-            gcode_gen.do_export(&print, "/tmp/ow_out.gcode", &processor_result, nullptr);
-        }
-        throw_if_cancelled(operation);
-        const std::string statistics_json = serialize_slice_statistics(print, processor_result);
-
-        FILE* gf = std::fopen("/tmp/ow_out.gcode", "rb");
-        if (!gf) { record_error(*session, "gcode export produced no output"); return -8; }
-
-        std::fseek(gf, 0, SEEK_END);
-        long sz = std::ftell(gf);
-        std::rewind(gf);
-
-        char* buf = static_cast<char*>(std::malloc(static_cast<std::size_t>(sz) + 1));
-        if (!buf) {
-            std::fclose(gf);
-            record_error(*session, "out of memory");
-            return -9;
-        }
-        std::fread(buf, 1, static_cast<std::size_t>(sz), gf);
-        std::fclose(gf);
-        buf[sz] = '\0';
-
-        if (sz < 0 || static_cast<unsigned long long>(sz) > UINT32_MAX) {
-            std::free(buf);
-            record_error(*session, "G-code output exceeds the C ABI length limit");
-            return ONEWASM_ERR_OUTPUT;
-        }
-        *out_gcode = reinterpret_cast<uint8_t*>(buf);
-        *out_len   = static_cast<uint32_t>(sz);
-        publish_slice_statistics(*session, statistics_json);
-        return ONEWASM_OK;
-
-    } catch (const Slic3r::CanceledException&) {
-        record_error(*session, "slice cancelled");
-        return ONEWASM_ERR_CANCELLED;
-    } catch (const std::exception& e) {
-        record_error(*session, e.what());
-        return -9;
-    }
-}
-
-/**
  * Convert a STEP file to binary STL using OrcaSlicer's OCCT reader.
  *
  * Only STEP is supported: OrcaSlicer's load_step() uses STEPCAFControl_Reader,
@@ -4906,9 +4629,9 @@ static onewasm_status_t legacy_slice_stl_multi(
  * Arguments:
  *   cad_data / cad_len  — raw STEP file bytes
  *   out_stl / out_len   — on success: malloc'd binary STL buffer + byte length
- *                         Caller must free with onewasm_free().
+ *                         Caller must free with oneslicer_free().
  *
- * Error codes (same conventions as onewasm_obj_to_stl):
+ * Error codes (same conventions as oneslicer_obj_to_stl):
  *   -1  invalid arguments
  *   -3  could not write STEP data to MEMFS
  *   -4  STEP load failed (bad file / unsupported feature)
@@ -4917,7 +4640,7 @@ static onewasm_status_t legacy_slice_stl_multi(
  *   -9  unexpected C++ exception
  */
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_cad_to_stl(
+oneslicer_status_t oneslicer_cad_to_stl(
     const uint8_t* cad_data,
     uint32_t cad_len,
     uint8_t** out_stl,
@@ -5041,13 +4764,13 @@ onewasm_status_t onewasm_cad_to_stl(
  * On success *out_3mf points to a malloc'd buffer containing the .3mf (a ZIP
  * archive — contains embedded NUL bytes, so callers must use the returned
  * length, never a NUL-terminated string read). Caller must free with
- * onewasm_free().
+ * oneslicer_free().
  *
- * Internal adapter used by the API 0.6.0 project implementation; -8 means the 3MF export
+ * Internal single-mesh export used by the API 0.7 project implementation; -8 means the 3MF export
  * itself (store_bbs_3mf) failed rather than gcode export.
  */
-static onewasm_status_t legacy_write_3mf(
-    onewasm_session_t session_ptr,
+static oneslicer_status_t write_single_mesh_3mf(
+    oneslicer_session_t session_ptr,
     const uint8_t* stl_data,
     uint32_t stl_len,
     uint8_t** out_3mf,
@@ -5058,7 +4781,7 @@ static onewasm_status_t legacy_write_3mf(
     session->last_error.clear();
     if (out_3mf) *out_3mf = nullptr;
     if (out_len) *out_len = 0;
-    if (!session->initialized) { record_error(*session, "call onewasm_init first"); return -1; }
+    if (!session->initialized) { record_error(*session, "call oneslicer_init first"); return -1; }
     if (!stl_data || stl_len == 0 || !out_3mf || !out_len)
         return -1;
 
@@ -5090,7 +4813,7 @@ static onewasm_status_t legacy_write_3mf(
             return -5;
         }
 
-        // Same placement convention as the private single-object adapter, so the mesh lands back in
+        // Place the model using the same convention as project slicing, so the mesh lands back in
         // the same spot on re-import instead of at the model-space origin.
         for (auto* obj : model.objects) {
             center_object_xy_only(obj);
@@ -5138,11 +4861,11 @@ static onewasm_status_t legacy_write_3mf(
         if (sz < 0 || static_cast<unsigned long long>(sz) > UINT32_MAX) {
             std::free(buf);
             record_error(*session, "3MF output exceeds the C ABI length limit");
-            return ONEWASM_ERR_OUTPUT;
+            return ONESLICER_ERR_OUTPUT;
         }
         *out_3mf = reinterpret_cast<uint8_t*>(buf);
         *out_len = static_cast<uint32_t>(sz);
-        return ONEWASM_OK;
+        return ONESLICER_OK;
 
     } catch (const std::exception& e) {
         record_error(*session, e.what());
@@ -5156,7 +4879,7 @@ static onewasm_status_t legacy_write_3mf(
  * (host format adapter) — so this understands whatever OrcaSlicer itself
  * wrote (multi-object assemblies, per-object transforms) exactly the way
  * OrcaSlicer does, instead of re-deriving the 3MF core spec's transform math
- * in JS. A pure format conversion like onewasm_obj_to_stl / onewasm_cad_to_stl — no
+ * in JS. A pure format conversion like oneslicer_obj_to_stl / oneslicer_cad_to_stl — no
  * session/config state involved, so it takes none.
  *
  * On success *out_stl points to a malloc'd binary STL buffer — all objects'
@@ -5164,10 +4887,10 @@ static onewasm_status_t legacy_write_3mf(
  * ModelObject::mesh() (so position/rotation/scale in the file survive),
  * merged into one. Byte length is returned in *out_stl_len. Native project
  * settings are intentionally not converted to a common JSON envelope; pass
- * the original bytes to onewasm_init_profile(session, "project.3mf", ...)
+ * the original bytes to oneslicer_init_profile(session, "project.3mf", ...)
  * when the host wants to load them.
  *
- * Error codes: same convention as onewasm_obj_to_stl.
+ * Error codes: same convention as oneslicer_obj_to_stl.
  *   -3  could not write 3MF bytes to MEMFS
  *   -4  3MF load failed (bad archive / no recognizable model)
  *   -5  3MF contains no printable geometry
@@ -5175,7 +4898,7 @@ static onewasm_status_t legacy_write_3mf(
  *   -9  unexpected C++ exception
  */
 EMSCRIPTEN_KEEPALIVE
-onewasm_status_t onewasm_three_mf_to_stl(
+oneslicer_status_t oneslicer_three_mf_to_stl(
     const uint8_t* mf_data,
     uint32_t mf_len,
     uint8_t** out_stl,
@@ -5211,7 +4934,7 @@ onewasm_status_t onewasm_three_mf_to_stl(
         ModelBackupPathGuard backup_guard(model);
         Slic3r::DynamicPrintConfig config;
         // EnableSilent: substitute unknown/incompatible option values with
-        // defaults instead of throwing — mirrors onewasm_init's own "silently
+        // defaults instead of throwing — mirrors oneslicer_init's own "silently
         // skip unknown / incompatible keys" policy for the same reason (a
         // 3MF authored by a different OrcaSlicer/Bambu Studio version may
         // carry option values this pinned engine version doesn't recognize).
@@ -5243,7 +4966,7 @@ onewasm_status_t onewasm_three_mf_to_stl(
         }
 
         // ModelObject::mesh() bakes in every instance's + volume's transform
-        // (position/rotation/scale) — unlike onewasm_obj_to_stl/onewasm_cad_to_stl's
+        // (position/rotation/scale) — unlike oneslicer_obj_to_stl/oneslicer_cad_to_stl's
         // raw vol->mesh() merge, which is fine for OBJ/STEP (no separate
         // instance concept there) but would silently drop a 3MF's actual
         // placement if used here.
@@ -5281,7 +5004,7 @@ onewasm_status_t onewasm_three_mf_to_stl(
         }
         *out_stl = reinterpret_cast<uint8_t*>(stl_owner.release());
         *out_stl_len = static_cast<uint32_t>(stl_len);
-        return ONEWASM_OK;
+        return ONESLICER_OK;
 
     } catch (const std::exception& e) {
         record_error(e.what());
@@ -5291,23 +5014,23 @@ onewasm_status_t onewasm_three_mf_to_stl(
 
 /** Free a buffer returned by a bridge output operation. */
 EMSCRIPTEN_KEEPALIVE
-void onewasm_free(void* ptr) {
+void oneslicer_free(void* ptr) {
     std::free(ptr);
 }
 
 /**
  * Return the last error message as a null-terminated string.
- * The pointer is valid until the next onewasm_* call on the same session (or,
- * for a null session, the next onewasm_obj_to_stl / onewasm_cad_to_stl call).
+ * The pointer is valid until the next oneslicer_* call on the same session (or,
+ * for a null session, the next oneslicer_obj_to_stl / oneslicer_cad_to_stl call).
  *
  * Pass the session used for the failing session-bound operation
- * call. Pass 0/null after a failing onewasm_obj_to_stl / onewasm_cad_to_stl call
+ * call. Pass 0/null after a failing oneslicer_obj_to_stl / oneslicer_cad_to_stl call
  * (those take no session) — this is also why the parameter used to be
  * documented as "unused" and JS always passed literal 0: that call pattern
  * still works unchanged for conversion errors.
  */
 EMSCRIPTEN_KEEPALIVE
-const char* onewasm_last_error(onewasm_session_t session_ptr) {
+const char* oneslicer_last_error(oneslicer_session_t session_ptr) {
     OrcSession* session = as_session(session_ptr);
     return session ? session->last_error.c_str() : g_conversion_last_error.c_str();
 }

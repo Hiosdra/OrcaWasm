@@ -772,9 +772,9 @@ jobs:
       - name: Smoke test WASM module
         run: node scripts/smoke-test.mjs --wasm-dir artifacts
 
-      # The shared one-wasm-slicer-api contract, exercised only through the
-      # artifact's embedded TypeScript binding (OneWasmEngine) — the path hosts use.
-      - name: one-wasm-slicer-api conformance
+      # The shared one-slicer-api contract, exercised only through the
+      # artifact's embedded TypeScript binding (OneSlicerEngine) — the path hosts use.
+      - name: one-slicer-api conformance
         run: node scripts/conformance.mjs --wasm-dir artifacts
 
       # OrcaWasm binding behaviour beyond the shared suite: running project
