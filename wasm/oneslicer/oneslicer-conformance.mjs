@@ -345,7 +345,7 @@ const SELECTED_PLATE = {
     includeStatistics: true,
 };
 /** Schema versions every engine must reject: earlier markers and near misses. */
-const OTHER_SCHEMA_VERSIONS = ['0.3', '0.5', '0.5.1', '0.6', '0.6.0', '0.7.0', '0.7.0-pre.2'];
+const OTHER_SCHEMA_VERSIONS = ['0.3', '0.5', '0.5.1', '0.6', '0.6.0', '0.7.0-pre.1', '0.7.0-pre.2'];
 class Recorder {
     checks = [];
     async check(name, body) {
