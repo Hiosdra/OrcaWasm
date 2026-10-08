@@ -26,7 +26,7 @@ target_link_options(slicer PRIVATE
   -sENVIRONMENT=web,worker,node
   -sMODULARIZE=1
   -sEXPORT_NAME=OrcaModule
-  # one-slicer-api 0.7.0-pre.1 TypeScript binding: the vendored reference glue
+  # one-slicer-api 0.7.0 TypeScript binding: the vendored reference glue
   # (Apache-2.0, copied unmodified from the API release) and the line binding
   # it to OrcaModule. The artifact then exposes `OneSlicerEngine`, so hosts never
   # touch the heap. Both run outside the factory and stay valid in pthread
@@ -86,7 +86,7 @@ target_link_options(slicer PRIVATE
   # Dropping the ~200 MB preload removes slicer.data entirely.  FORCE_FILESYSTEM
   # keeps MEMFS available for the bridge's /tmp STL-in / G-code-out files.
   -sFORCE_FILESYSTEM=1
-  # Every C binding symbol of one-slicer-api 0.7.0-pre.1, consumed by the
+  # Every C binding symbol of one-slicer-api 0.7.0, consumed by the
   # embedded glue; oneslicer_three_mf_to_stl is optional format.threeMfToStl.
   # orcawasm_async_* are private: engine-binding.js runs project operations
   # on a pthread with them so a host abort can cancel a running operation.

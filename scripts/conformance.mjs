@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * one-slicer-api 0.7.0-pre.1 conformance run for the built artifact.
+ * one-slicer-api 0.7.0 conformance run for the built artifact.
  *
  * Loads slicer-mt.js only through its embedded TypeScript binding
  * (`OneSlicerEngine`) — the path every host uses — and runs the vendored,

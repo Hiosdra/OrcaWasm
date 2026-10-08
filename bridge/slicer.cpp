@@ -18,7 +18,7 @@
  * oneslicer_obj_to_stl / oneslicer_cad_to_stl / oneslicer_three_mf_to_stl are pure format conversions
  * — they never touch slicer config state, so they take no session handle.
  *
- * Error codes for the public session-bound operations follow one-slicer-api 0.7.0-pre.1:
+ * Error codes for the public session-bound operations follow one-slicer-api 0.7.0:
  *   -1  invalid / uninitialized state (includes a null/invalid session handle)
  *   -2  JSON parse failure
  *   -3  STL write to MEMFS failed
@@ -3303,7 +3303,7 @@ oneslicer_status_t oneslicer_get_capabilities(uint8_t** out_json, uint32_t* out_
     constexpr const char* threading_model = "pthreads";
     constexpr const char* requires_sab = "true";
     const std::string json = std::string(R"({
-  "api":{"name":"one-slicer-api","version":"0.7.0-pre.1"},
+  "api":{"name":"one-slicer-api","version":"0.7.0"},
   "engine":{"family":"OrcaSlicer","version":"2.4.2"},
   "runtime":{"threadingModel":")") + threading_model + R"(","supportedHosts":["web","worker","node"],"requiresSharedArrayBuffer":)" + requires_sab + R"(,"requiresCrossOriginIsolated":)" + requires_sab + R"(,"cancellationMode":"cooperative"},
   "configuration":{"initFormats":["orca.native-json"],"fullProfileFormats":["project.3mf"],"profileApplyFormats":["orca.profile-json","orca.native-json"]},

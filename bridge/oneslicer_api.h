@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /*
- * API 0.7.0-pre.1, C binding: the low-level binding of one-slicer-api. Hosts
+ * API 0.7.0, C binding: the low-level binding of one-slicer-api. Hosts
  * use the TypeScript binding; an Emscripten engine implementing this header
  * embeds the reference glue (js/glue) to provide it. See docs/binding-c.md.
  *
@@ -23,7 +23,7 @@ extern "C" {
 #define ONESLICER_API_VERSION_MAJOR 0
 #define ONESLICER_API_VERSION_MINOR 7
 #define ONESLICER_API_VERSION_PATCH 0
-#define ONESLICER_API_VERSION_STRING "0.7.0-pre.1"
+#define ONESLICER_API_VERSION_STRING "0.7.0"
 
 typedef void* oneslicer_session_t;
 typedef int32_t oneslicer_status_t;
@@ -110,8 +110,9 @@ oneslicer_status_t oneslicer_project_get_manifest(
     uint8_t** out_json,
     uint32_t* out_len
 );
-/* Optional project.preview.stepFaces. Every engine exports this symbol;
- * engines without mapped STEP previews return ONESLICER_ERR_UNSUPPORTED. */
+/* Optional project.preview.stepFaces; the JSON descriptor ranges point into
+ * one engine-owned preview blob. Both outputs must be released with
+ * oneslicer_free. Unsupported engines return ONESLICER_ERR_UNSUPPORTED. */
 oneslicer_status_t oneslicer_project_get_preview(
     oneslicer_session_t session,
     const char* mesh_id_utf8,

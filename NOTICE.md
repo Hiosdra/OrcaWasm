@@ -4,7 +4,7 @@
 
 `wasm/oneslicer/oneslicer-emscripten-glue.js` and
 `wasm/oneslicer/oneslicer-conformance.mjs` are copied unmodified from the
-one-slicer-api 0.7.0-pre.1 release. The glue is linked into `slicer-mt.js`.
+one-slicer-api 0.7.0 release. The glue is linked into `slicer-mt.js`.
 
 - License: Apache License 2.0
 - Copyright: one-slicer-api contributors

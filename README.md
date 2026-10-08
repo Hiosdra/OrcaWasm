@@ -54,7 +54,7 @@ node scripts/gen-wsl-build-script.mjs
 
 ## Engine API
 
-The module implements exactly `one-slicer-api` 0.7.0-pre.1 per engine release.
+The module implements exactly `one-slicer-api` 0.7.0 per engine release.
 It does not negotiate or claim compatibility with older API versions.
 
 Hosts use the **TypeScript binding**. `slicer-mt.js` embeds the reference
@@ -128,10 +128,10 @@ remains usable. C callers keep the synchronous ABI and call `oneslicer_cancel`
 from another thread. `scripts/binding-test.mjs` checks this in CI.
 
 Mapped previews and face attributes remain optional parts of the normative
-0.7.0-pre.1 contract. This engine does not advertise or implement them.
+0.7.0 contract. This engine does not advertise or implement them.
 
 Every payload (project manifest, prepare/slice/export requests and results,
-slice statistics) uses `schemaVersion: "0.7.0-pre.1"`, the API version, including
+slice statistics) uses `schemaVersion: "0.7.0"`, the API version, including
 ordinary projects with an empty `modifierVolumes` array. The bridge rejects
 any other `schemaVersion`.
 
@@ -202,7 +202,7 @@ wasm-v2.4.2-patchN-multithreaded
 The first build for an OrcaSlicer version uses the corresponding
 `wasm-vX.Y.Z-multithreaded` tag; later engine changes use immutable patch tags.
 
-The smoke test exercises API 0.7.0-pre.1 support enforcers and blockers both with a
+The smoke test exercises API 0.7.0 support enforcers and blockers both with a
 minimal config and with the reduced selected-profile fixture at
 `scripts/fixtures/voron-0.4-profile-smoke.json`. The profile export does not
 include the active bed surface, so this test explicitly uses `Textured PEI

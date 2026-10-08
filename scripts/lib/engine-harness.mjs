@@ -1,6 +1,6 @@
 // Shared Node test harness for the OrcaSlicer WASM engine — used by
 // smoke-test.mjs. Centralizes the ABI-coupled pieces
-// (module loading + heap marshaling for API 0.7.0-pre.1 C binding project operations)
+// (module loading + heap marshaling for API 0.7.0 C binding project operations)
 // so the C bridge's calling convention lives in ONE place instead of being
 // copy-pasted and drifting between scripts.
 //
