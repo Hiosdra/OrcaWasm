@@ -11,7 +11,11 @@ on:
         default: 'v2.4.2'
         required: true
   push:
-    tags: ['wasm-v*.*.*']
+    # Match engine-version tags, but exclude generated PR prereleases. Those
+    # are not OrcaSlicer source tags and are already built by pull_request.
+    tags:
+      - 'wasm-v*.*.*'
+      - '!wasm-v*-pr*'
     # Auto-publish a new patch release whenever a bridge/build-pipeline change
     # lands on master, instead of relying on someone remembering to trigger
     # workflow_dispatch — that gap (engine changed on master, nobody rebuilt
